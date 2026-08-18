@@ -1,0 +1,23 @@
+{
+  "name": "edgepilot",
+  "version": "0.1.4",
+  "description": "Local-first trading strategy workflows powered by NautilusTrader.",
+  "author": {
+    "name": "EdgePilot"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "EdgePilot",
+    "shortDescription": "Backtest and run trading strategies locally.",
+    "longDescription": "Use native NautilusTrader workflows for strategy discovery, market-data downloads, backtests, paper trading, exchange demo runs, and live trading from chat.",
+    "developerName": "EdgePilot",
+    "category": "Productivity",
+    "logo": "./assets/edgepilot-icon.png",
+    "capabilities": [],
+    "defaultPrompt": [
+      "List the available EdgePilot strategies.",
+      "Run the default strategy backtest.",
+      "Explain the settings for this strategy."
+    ]
+  }
+}

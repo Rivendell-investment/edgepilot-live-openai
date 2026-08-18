@@ -1,0 +1,4 @@
+interface:
+  display_name: "EdgePilot"
+  short_description: "Backtest and run trading strategies"
+  default_prompt: "Use $edgepilot to inspect a strategy, explain its defaults, and run a backtest."
