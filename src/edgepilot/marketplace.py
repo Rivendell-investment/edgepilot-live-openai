@@ -229,9 +229,13 @@ def _request(path: str, query: dict[str, str] | None = None, *, method: str = "G
         raise RuntimeError(f"Marketplace request failed ({exc.code}).") from exc
 
 
-def search(*, query: str = "", asset: str = "", venue: str = "", category: str = "", data_type: str = "", risk_profile: str = "", min_capacity_usd: float | None = None, sort: str = "published", locale: str = "") -> dict[str, Any]:
+def search(*, query: str = "", asset: str = "", venue: str = "", category: str = "", data_type: str = "", risk_profile: str = "", min_capacity_usd: float | None = None, sort: str = "published", locale: str = "", page: int = 1, page_size: int = 30) -> dict[str, Any]:
     normalized_risk_profile = RISK_PROFILE_ALIASES.get(risk_profile.strip().lower(), risk_profile.strip().lower())
-    payload = _request("/api/live/strategies", {"q": query, "asset": asset, "venue": venue, "category": category, "data_type": data_type, "risk_profile": normalized_risk_profile, "min_capacity_usd": "" if min_capacity_usd is None else str(min_capacity_usd), "sort": sort, "locale": locale})
+    if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+        raise ValueError("Marketplace page must be a positive integer")
+    if not isinstance(page_size, int) or isinstance(page_size, bool) or page_size < 1 or page_size > 100:
+        raise ValueError("Marketplace page size must be between 1 and 100")
+    payload = _request("/api/live/strategies", {"q": query, "asset": asset, "venue": venue, "category": category, "data_type": data_type, "risk_profile": normalized_risk_profile, "min_capacity_usd": "" if min_capacity_usd is None else str(min_capacity_usd), "sort": sort, "locale": locale, "page": str(page), "page_size": str(page_size)})
     try:
         return json.loads(payload)
     except json.JSONDecodeError as exc:

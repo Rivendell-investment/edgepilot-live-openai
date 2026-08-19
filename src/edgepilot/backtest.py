@@ -37,6 +37,56 @@ from edgepilot_backtest_core.runner import execute_local_backtest
 LOGGER = logging.getLogger("edgepilot.backtest")
 
 
+class CatalogDataRequiredError(RuntimeError):
+    """A saved preset requires market data that is not present locally."""
+
+    def __init__(self, catalog_path: Path, requirements: list[dict[str, Any]]):
+        self.catalog_path = catalog_path.resolve()
+        self.requirements = requirements
+        commands = [" ".join(item["command"]) for item in requirements]
+        super().__init__(
+            "DATA_REQUIRED: market data is not bundled with EdgePilot; catalog="
+            f"{self.catalog_path}; prepare the missing data with: " + " | ".join(commands),
+        )
+
+
+def missing_catalog_requirements(
+    catalog_path: Path,
+    markets: tuple[MarketRequest, ...],
+    start: datetime,
+    end: datetime,
+) -> list[dict[str, Any]]:
+    """Return bounded, serializable instructions for missing bar datasets."""
+    requirements: list[dict[str, Any]] = []
+    for market in markets:
+        if market.data_type != "bars":
+            continue
+        intervals = missing_bar_intervals(catalog_path, market.bar_type, start, end)
+        if not intervals:
+            continue
+        command_prefix = [
+            "edgepilot", "data", "pull", "--venue", market.venue,
+            "--instrument", market.instrument_id, "--data-type", "bars",
+            "--bar-type", market.bar_type,
+        ]
+        commands = [command_prefix + ["--start", interval_start.isoformat(), "--end", interval_end.isoformat()]
+                    for interval_start, interval_end in intervals]
+        requirements.append({
+            "instrument_id": market.instrument_id,
+            "bar_type": market.bar_type,
+            "venue": market.venue,
+            "data_type": market.data_type,
+            "start": intervals[0][0].isoformat(),
+            "end": intervals[-1][1].isoformat(),
+            "missing_intervals": len(intervals),
+            "intervals": [{"start": interval_start.isoformat(), "end": interval_end.isoformat()}
+                          for interval_start, interval_end in intervals],
+            "command": commands[0],
+            "commands": commands,
+        })
+    return requirements
+
+
 @dataclass(frozen=True)
 class BacktestRequest:
     strategy: StrategyDescriptor
@@ -70,6 +120,16 @@ def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
             )
     if any(market.data_type != "bars" for market in request.markets):
         raise ValueError("The backtest engine currently requires bar markets")
+
+    if not request.download:
+        requirements = missing_catalog_requirements(
+            request.catalog_path,
+            request.markets,
+            request.start,
+            request.end,
+        )
+        if requirements:
+            raise CatalogDataRequiredError(request.catalog_path, requirements)
 
     if request.download:
         for market in request.markets:

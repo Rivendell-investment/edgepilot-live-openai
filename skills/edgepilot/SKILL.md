@@ -143,12 +143,21 @@ to paste one into chat. Publishing remains administrator-only.
 
 Use the bundled code from this skill directory, but keep user-owned state outside the plugin cache.
 The user only needs to ask in chat; perform installation in the terminal for them. First detect the
-operating system and whether CPython 3.12 is available to bootstrap the installer script.
-If it is missing, install Python 3.12 with the platform's normal package manager:
+operating system and CPU architecture. EdgePilot Live's published runtime supports Apple Silicon
+Macs (`arm64`) and 64-bit Windows (`amd64`). It does not support Intel Macs or Linux. Do not install
+Python, uv, or any runtime file on an unsupported host.
+
+When a true Intel Mac is detected, explain in the user's current language that this Mac uses an
+Intel processor, EdgePilot does not support Intel Macs, supported Macs use Apple Silicon (M-series),
+and no runtime files were downloaded or changed. If an Apple Silicon Mac is running an x86_64
+process through Rosetta, explain that the machine is supported but the user must retry from a native
+arm64 Terminal and Python. Do not describe a Rosetta process as Intel hardware.
+
+After the platform check, detect whether CPython 3.12 is available to bootstrap the installer script.
+If it is missing, install a supported CPython with the platform's normal package manager:
 
 - macOS with Homebrew: `brew install python@3.12`;
 - Windows with WinGet: `winget install --exact --id Python.Python.3.12`;
-- Debian/Ubuntu: install Python 3.12 and its `venv` package from the configured package source.
 
 If the package manager is unavailable or requires a graphical installer, explain the single
 required installation step and resume after it completes. Never ask the user to install individual
@@ -157,7 +166,8 @@ Python libraries. Prefer the bundled cross-platform installer
 required by the hosted wheel (from `manifest.json`), creates a local venv, installs the
 **prebuilt** `nautilus_trader` wheel from the marketplace runtime host (or an explicit local
 wheel path for smoke tests), then installs the plugin editable. It does **not** vendor or
-compile Nautilus. EdgePilot Live and its prebuilt Nautilus wheel both use CPython 3.12.
+compile Nautilus. The hosted Live wheel currently uses CPython 3.12 on macOS and Windows; uv
+installs that exact version.
 The installer always builds a separate relocatable candidate environment, runs `pip check`,
 imports EdgePilot, its packaged backtest core, NautilusTrader, and the required Live adapters,
 and exercises the CLI before activation. It then swaps the candidate into the stable `.venv`
@@ -172,22 +182,65 @@ python3 <plugin-root>/skills/edgepilot/scripts/install_runtime.py <plugin-root>
 On Windows use `py -3` or `python` instead of `python3` when needed. The installer selects
 `%APPDATA%\\EdgePilot\\.venv` automatically.
 
+The hosted custom `nautilus_trader` wheel is required. Official PyPI `nautilus_trader` is a
+different build: later EdgePilot Live adapters, backtests, and imports will fail if you install
+it. Never `pip install nautilus_trader` / `nautilus-trader` from PyPI, GitHub, or any other
+public index, and never continue setup after a hosted-wheel download failure. If a public
+package is already in the venv, stop using that environment and rebuild with the hosted wheel.
+
 Wheel sources (first match wins):
 
-1. `--wheel` / `EDGEPILOT_NAUTILUS_WHEEL` — already-built local `.whl` (internal smoke test only);
-2. `--wheel-url` / `EDGEPILOT_NAUTILUS_WHEEL_URL`;
-3. `--wheel-base-url` / `EDGEPILOT_NAUTILUS_WHEEL_BASE_URL` / the default EdgePilot runtime
-   host: download
-   `{base}/manifest.json` and pick the matching platform wheel (preferred), otherwise try
-   known filename candidates; checksum comes from the manifest or `--sha256`;
-4. otherwise `pip` may satisfy `nautilus_trader==…` from PyPI via `pyproject.toml` (transition only).
+1. `--wheel` / `EDGEPILOT_NAUTILUS_WHEEL` — a local `.whl` already downloaded from the
+   EdgePilot host (recovery path) or an internal smoke-test file;
+2. `--wheel-url` / `EDGEPILOT_NAUTILUS_WHEEL_URL` — a credential-free HTTPS URL on the
+   EdgePilot host, with SHA-256;
+3. `--wheel-base-url` / `EDGEPILOT_NAUTILUS_WHEEL_BASE_URL` / the default host
+   `https://edge-pilot.rivendell.capital/runtime/nautilus_trader/<pinned-version>/`:
+   download `{base}/manifest.json`, require its same-origin content-addressed URL, byte size
+   and SHA-256, then pick the single matching platform wheel (currently **cp312** on
+   macOS arm64 and Windows amd64). A missing or invalid manifest fails installation;
+   never fall back to filename guessing or PyPI.
+
+There is no fourth source. If the hosted wheel cannot be obtained, stop.
+
+The runtime host is behind Cloudflare Bot Fight Mode on **every** OS. Default Python
+`urllib` sends `Python-urllib/3.x` and is rejected with HTTP 403 and body
+`error code: 1010`. This was confirmed for `manifest.json`, the macOS arm64 wheel, the
+Windows amd64 wheel, the Linux wheel, and the public catalog API. Treat 403/`1010` as a
+blocked User-Agent, not a missing file, and do not switch to PyPI. Default `curl`,
+`wget`, `Mozilla/5.0`, `EdgePilot-Installer/…`, and `python-requests` received 200/206
+on those same URLs. Always set an explicit browser-like UA:
+
+```bash
+# macOS / Linux
+curl -L --fail -A "Mozilla/5.0" -o nautilus_trader.whl "$WHEEL_URL"
+```
+
+```bat
+REM Windows (curl.exe ships with Windows 10+)
+curl.exe -L --fail -A "Mozilla/5.0" -o nautilus_trader.whl "%WHEEL_URL%"
+```
+
+Do not download with Python `urllib` unless you set that same `User-Agent`. If
+`install_runtime.py` fails with 403/`1010`, download the platform wheel named in
+`manifest.json` for this OS/arch with the command above, then rerun:
+
+```bash
+python3 <plugin-root>/skills/edgepilot/scripts/install_runtime.py <plugin-root> \
+  --wheel nautilus_trader.whl
+```
+
+```bat
+py -3 <plugin-root>\skills\edgepilot\scripts\install_runtime.py <plugin-root> --wheel nautilus_trader.whl
+```
 
 The wheel version must match the pinned `nautilus_trader==…` in `pyproject.toml`. The installer
 installs the custom wheel first, then resolves the plugin's remaining dependencies; pip therefore
 keeps the already-installed matching custom build instead of replacing it with the public package.
 
-Runtime wheel coverage may be Linux-only until macOS/Windows artifacts are published. If
-`manifest.json` has no match for the current OS, report that clearly instead of inventing a build.
+Select the hosted wheel for the current OS/arch from `manifest.json` and use that
+wheel's Python tag for the venv. If there is no match, report that clearly and stop.
+Do not invent a build or install the public package.
 
 Verify a fresh installation before doing anything else:
 
@@ -387,6 +440,12 @@ Read backtest defaults from the preset's `backtest` object. Use a rolling `days`
 user supplies exact `--start` and `--end` timestamps. The command downloads missing bars when
 `download` is enabled, runs native `BacktestNode`, and writes:
 
+When `download` is false, prepare the preset's full market and UTC time range first. A
+`DATA_REQUIRED` response reports the resolved catalog directory and an exact `edgepilot data pull`
+command for each missing market. Normal installs share data under `~/.edgepilot/catalog/` on
+macOS/Linux or `%APPDATA%\\EdgePilot\\catalog` on Windows. Only repository development with
+`EDGEPILOT_HOME="$PWD"` uses `$PWD/catalog/`. Market data never belongs in a plugin or strategy ZIP.
+
 - `run.json`: complete reproducible configuration plus headline metrics;
 - `metrics.json`: precomputed metrics for quick agent queries;
 - `fills.csv` and `positions.csv`: raw trading results;
@@ -491,4 +550,4 @@ running list; do not invent heartbeat or connection-state layers.
   `EDGEPILOT_SKIP_AUTH=1`; otherwise `strategies inspect`, `data pull`, and `backtest` block on
   device login and never start. Do not set `EDGEPILOT_SKIP_AUTH` for a normal user install. The
   flag does not grant Marketplace install or admin rights. Release backtests use
-  `MARKETPLACE_ADMIN_TOKEN`.
+  `SUPER_ADMIN_TOKEN`.

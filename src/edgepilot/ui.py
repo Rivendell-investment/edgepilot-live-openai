@@ -14,21 +14,23 @@ import sys
 import tempfile
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from edgepilot.discovery import resolve_adapter, resolve_strategy, strategies_root, strategy_names
+from edgepilot.discovery import discover_execution_adapters, resolve_adapter, resolve_strategy, strategies_root, strategy_names
 from edgepilot.environment import credential_requirements, load_env
 from edgepilot.marketplace import MarketplaceRequestError, install_package
+from edgepilot.models import MarketRequest
+from edgepilot.catalog import parse_time
 from edgepilot.paths import state_root
 from edgepilot.paths import find_run_directory
 from edgepilot.paths import iter_run_directories
 from edgepilot.paths import strategy_runs_path
-from edgepilot.presets import load_preset, preset_markets, preset_names, preset_strategy_values, preset_venues, resolve_strategy_parameters
+from edgepilot.presets import load_preset, preset_backtest_values, preset_markets, preset_names, preset_strategy_values, preset_venues, resolve_strategy_parameters
 from edgepilot.trading import request_emergency_stop, running_runs
 from edgepilot.app_logging import configure_logging
 from edgepilot.locale import SUPPORTED_LANGUAGES, normalize_supported_locale
@@ -37,7 +39,8 @@ from edgepilot import auth
 
 ASSETS = Path(__file__).with_name("ui_assets")
 STATE = state_root()
-CATALOG = STATE / "catalog" / "data"
+CATALOG_ROOT = STATE / "catalog"
+CATALOG = CATALOG_ROOT / "data"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = Lock()
 LOCAL_LOGINS: dict[str, dict[str, Any]] = {}
@@ -197,16 +200,17 @@ def _catalog_records() -> list[dict[str, Any]]:
 
 def _credential_venues() -> list[str]:
     """Return native venues the dashboard can configure without exposing keys."""
-    venues = {"BINANCE", "OKX"}
-    for strategy_name in strategy_names():
+    venues = []
+    for adapter in discover_execution_adapters():
         try:
-            strategy = resolve_strategy(strategy_name)
-            for preset_name in preset_names(strategy):
-                _, values = load_preset(strategy, preset_name)
-                venues.update(preset_venues(values))
-        except (ImportError, ValueError, TypeError, OSError):
-            continue
-    return sorted(venues)
+            if any(credential_requirements(adapter, mode) for mode in ("demo", "live")):
+                venues.append(adapter.name)
+        except (ImportError, ValueError, TypeError, AttributeError) as exc:
+            LOGGER.debug(
+                "credential adapter skipped",
+                extra={"event": "credentials.adapter.skipped", "params": {"adapter": adapter.name, "error": type(exc).__name__}},
+            )
+    return sorted(set(venues))
 
 
 def _credential_records() -> list[dict[str, Any]]:
@@ -605,8 +609,24 @@ def _start_backtest(payload: dict[str, Any]) -> str:
     preset = _safe_config_name(str(payload.get("preset", "")).strip())
     if preset not in preset_names(strategy):
         raise ValueError(f"unknown preset: {preset}")
+    _, values = load_preset(strategy, preset)
+    backtest = preset_backtest_values(values)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=min(int(backtest.get("days", 365)), 90))
+    if not bool(backtest.get("download", True)):
+        from edgepilot.backtest import CatalogDataRequiredError, missing_catalog_requirements
+
+        markets = tuple(MarketRequest(
+            instrument_id=str(item["instrument_id"]),
+            bar_type=str(item["bar_type"]),
+            venue=str(item["venue"]).upper(),
+            data_type=str(item.get("data_type", "bars")),
+        ) for item in preset_markets(values))
+        requirements = missing_catalog_requirements(CATALOG_ROOT, markets, start, end)
+        if requirements:
+            raise CatalogDataRequiredError(CATALOG_ROOT, requirements)
     command = [sys.executable, "-m", "edgepilot.cli", "backtest", strategy.name]
-    command.extend(["--preset", preset])
+    command.extend(["--preset", preset, "--start", start.isoformat(), "--end", end.isoformat()])
     return _start_job(kind="backtest", command=command)
 
 
@@ -621,10 +641,20 @@ def _start_data_pull(payload: dict[str, Any]) -> str:
     command = [sys.executable, "-m", "edgepilot.cli", "data", "pull", "--venue", venue, "--instrument", instrument, "--data-type", data_type]
     if data_type == "bars":
         command.extend(["--bar-type", str(payload.get("bar_type") or "1-HOUR-LAST-EXTERNAL")])
-    days = int(payload.get("days", 365))
-    if not 1 <= days <= 5000:
-        raise ValueError("days must be between 1 and 5000")
-    command.extend(["--days", str(days)])
+    start_text = str(payload.get("start", "")).strip()
+    end_text = str(payload.get("end", "")).strip()
+    if start_text or end_text:
+        if not start_text or not end_text:
+            raise ValueError("start and end must be provided together")
+        start = parse_time(start_text); end = parse_time(end_text)
+        if start >= end:
+            raise ValueError("start must be earlier than end")
+        command.extend(["--start", start.isoformat(), "--end", end.isoformat()])
+    else:
+        days = int(payload.get("days", 365))
+        if not 1 <= days <= 5000:
+            raise ValueError("days must be between 1 and 5000")
+        command.extend(["--days", str(days)])
     adapter_options = [str(option) for option in payload.get("adapter_set", [])]
     has_account_type = any(option.split("=", 1)[0].strip() == "account_type" for option in adapter_options)
     if venue == "BINANCE" and instrument.endswith("-PERP.BINANCE") and not has_account_type:
@@ -725,9 +755,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/marketplace/strategies":
                 from edgepilot.marketplace import search
                 query = parse_qs(parsed.query)
+                page = int(query.get("page", ["1"])[0])
+                page_size = int(query.get("page_size", ["30"])[0])
                 return _json(self, search(query=query.get("q", [""])[0], risk_profile=query.get("risk_profile", [""])[0],
                     min_capacity_usd=float(query["min_capacity_usd"][0]) if query.get("min_capacity_usd") else None,
-                    sort=query.get("sort", ["published"])[0], locale=query.get("locale", [""])[0]))
+                    sort=query.get("sort", ["published"])[0], locale=query.get("locale", [""])[0], page=page, page_size=page_size))
             if parsed.path == "/api/marketplace/history":
                 from edgepilot.marketplace import installation_history
                 return _json(self, installation_history())
@@ -807,7 +839,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     existing = next(((key, value) for key, value in LOCAL_LOGINS.items() if value.get("status") == "pending" and time.time() - value["created_at"] < 600), None)
                 if existing:
                     return _json(self, {"login_id": existing[0], **{key: value for key, value in existing[1].items() if key not in {"device", "created_at", "status"}}})
-                device = auth.start_login(); login_id = secrets.token_urlsafe(24)
+                device = auth.start_login(open_browser=False); login_id = secrets.token_urlsafe(24)
                 item = {"status": "pending", "created_at": time.time(), "device": device,
                     "verification_uri": device["verification_uri"], "verification_uri_complete": device["verification_uri_complete"],
                     "user_code": device["user_code"], "expires_in": device["expires_in"]}
@@ -818,6 +850,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         state = "authenticated" if result.get("authenticated") else "denied" if result.get("reason") == "ACCESS_DENIED" else "expired"
                         update = {"status": state, **({"credential_storage": result.get("credential_storage")} if state == "authenticated" else {})}
                     except auth.AuthError as exc:
+                        LOGGER.warning("dashboard login failed", extra={"event": "dashboard.auth.login_failed", "result": "failed",
+                                       "params": {"code": str(exc), "stage": exc.stage or "unknown", **exc.diagnostics}})
                         update = {"status": "failed", "reason": str(exc) if str(exc) in {"AUTH_SERVICE_UNAVAILABLE", "CREDENTIAL_STORE_ERROR"} else "PROTOCOL_ERROR"}
                     with LOCAL_LOGINS_LOCK:
                         if login_id in LOCAL_LOGINS: LOCAL_LOGINS[login_id].update(update, completed_at=time.time())
@@ -848,7 +882,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 from edgepilot.marketplace import recommend
                 return _json(self, recommend(payload))
             if self.path == "/api/backtests":
-                return _json(self, {"job_id": _start_backtest(payload)}, 202)
+                try:
+                    return _json(self, {"job_id": _start_backtest(payload)}, 202)
+                except Exception as exc:
+                    from edgepilot.backtest import CatalogDataRequiredError
+                    if isinstance(exc, CatalogDataRequiredError):
+                        return _error(self, "DATA_REQUIRED", "market data must be prepared before this backtest", 409,
+                                      catalog_path=str(exc.catalog_path), requirements=exc.requirements)
+                    raise
             strategy_config_match = re.fullmatch(r"/api/strategies/([^/]+)/configs/([^/]+)", self.path)
             if strategy_config_match:
                 if set(payload) != {"config"}:

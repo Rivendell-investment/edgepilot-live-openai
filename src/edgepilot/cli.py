@@ -12,6 +12,7 @@ import shutil
 import sys
 from time import monotonic
 
+from edgepilot import __version__
 from edgepilot.backtest import BacktestRequest
 from edgepilot.backtest import execute_backtest
 from edgepilot.catalog import parse_time
@@ -91,7 +92,7 @@ def _add_adapter_options(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="edgepilot", description="EdgePilot trading strategy CLI")
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.4")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     strategies = subparsers.add_parser("strategies", help="List strategies, presets, and settings")

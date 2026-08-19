@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "edgepilot"
-version = "0.1.4"
+dynamic = ["version"]
 description = "Agent-facing CLI for backtesting and running trading strategies"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.12,<3.15"
 dependencies = [
   "nautilus_trader==1.228.0",
   "matplotlib==3.10.8",
@@ -20,6 +20,10 @@ edgepilot = "edgepilot.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/edgepilot"]
+
+[tool.hatch.version]
+path = "src/edgepilot/VERSION"
+pattern = "^(?P<version>(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$"
 
 [tool.hatch.build.targets.wheel.force-include]
 "backtest_core_src/edgepilot_backtest_core" = "edgepilot_backtest_core"

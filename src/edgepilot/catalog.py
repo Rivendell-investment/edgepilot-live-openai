@@ -833,7 +833,11 @@ def missing_bar_intervals(
     start: datetime,
     end: datetime,
 ) -> list[tuple[datetime, datetime]]:
-    if not catalog_path.exists():
+    # A Nautilus parquet catalog is rooted at ``catalog_path`` and stores its
+    # datasets below ``data``.  The state root itself may already exist even on
+    # a fresh installation, so treating that directory as a usable catalog
+    # only defers the failure to ParquetDataCatalog with an opaque exception.
+    if not catalog_path.exists() or not (catalog_path / "data").is_dir():
         return [(start, end)]
     parsed_bar_type = BarType.from_str(bar_type)
     if parsed_bar_type.spec.is_time_aggregated():

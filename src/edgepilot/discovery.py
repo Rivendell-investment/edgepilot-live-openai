@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import importlib
 import importlib.util
 import inspect
+import logging
 from pathlib import Path
+import pkgutil
 import sys
 from types import UnionType
 from typing import Any
@@ -27,6 +29,9 @@ from edgepilot_backtest_core.discovery import resolve_strategy as _core_resolve_
 from edgepilot_backtest_core.discovery import strategy_names as _core_strategy_names
 
 from edgepilot.paths import state_root
+
+
+LOGGER = logging.getLogger("edgepilot.discovery")
 
 
 @dataclass(frozen=True)
@@ -195,6 +200,26 @@ def resolve_adapter(name: str) -> AdapterDescriptor:
         exec_config_path=_class_path(exec_config) if exec_config else None,
         exec_factory_path=_class_path(exec_factory) if exec_factory else None,
     )
+
+
+def discover_execution_adapters() -> list[AdapterDescriptor]:
+    """Return executable adapters provided by the installed NautilusTrader wheel."""
+    adapters_package = importlib.import_module("nautilus_trader.adapters")
+    discovered: list[AdapterDescriptor] = []
+    for module in sorted(pkgutil.iter_modules(adapters_package.__path__), key=lambda item: item.name):
+        if module.name.startswith("_"):
+            continue
+        try:
+            adapter = resolve_adapter(module.name)
+        except (ImportError, ModuleNotFoundError, ValueError, TypeError, AttributeError) as exc:
+            LOGGER.debug(
+                "native adapter skipped",
+                extra={"event": "adapter.discovery.skipped", "params": {"adapter": module.name, "error": type(exc).__name__}},
+            )
+            continue
+        if adapter.exec_config_path is not None and adapter.exec_factory_path is not None:
+            discovered.append(adapter)
+    return discovered
 
 
 def _coerce_native(value: Any, annotation: Any) -> Any:

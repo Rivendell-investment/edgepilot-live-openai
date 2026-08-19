@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import secrets
@@ -35,6 +36,7 @@ if (_origin_parts.scheme != "https" and not (_origin_parts.scheme == "http" and 
     raise RuntimeError("EDGEPILOT_MARKETPLACE_ORIGIN must be HTTPS or HTTP loopback origin")
 KEYRING_SERVICE = "edgepilot"
 PENDING_INSTALLATIONS = "pending_installations.json"
+LOGGER = logging.getLogger("edgepilot.auth")
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -56,11 +58,27 @@ def _keyring_user(user_id: object = None) -> str:
 
 
 class AuthError(RuntimeError):
-    def __init__(self, code: str, *, interval: int | None = None, status: int | None = None):
+    def __init__(self, code: str, *, interval: int | None = None, status: int | None = None,
+                 stage: str | None = None, diagnostics: dict[str, int | str] | None = None):
         super().__init__(code)
         self.code = code
         self.interval = interval
         self.status = status
+        self.stage = stage
+        self.diagnostics = diagnostics or {}
+
+
+def _credential_store_error(stage: str, exc: BaseException | None = None) -> AuthError:
+    diagnostics: dict[str, int | str] = {}
+    if exc is not None:
+        diagnostics["error_type"] = type(exc).__name__
+        returncode = getattr(exc, "returncode", None)
+        winerror = getattr(exc, "winerror", None)
+        if isinstance(returncode, int):
+            diagnostics["returncode"] = returncode
+        if isinstance(winerror, int):
+            diagnostics["winerror"] = winerror
+    return AuthError("CREDENTIAL_STORE_ERROR", stage=stage, diagnostics=diagnostics)
 
 
 def _auth_dir() -> Path:
@@ -78,7 +96,7 @@ def _auth_dir() -> Path:
         if stat.S_IMODE(path.stat().st_mode) != 0o700 or path.stat().st_uid != os.getuid():
             raise AuthError("CREDENTIAL_STORE_ERROR")
     else:
-        _secure_windows_acl(path, directory=True)
+        _secure_windows_acl(path, directory=True, stage="auth_dir_acl")
     return path
 
 
@@ -110,28 +128,32 @@ def _validate_requested_chain(path: Path) -> None:
 
 
 def _windows_sid() -> str:
-    result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5, check=True)
+    try:
+        result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _credential_store_error("windows_sid", exc) from exc
     match = __import__("re").search(r"S-1-[0-9-]+", result.stdout)
     if not match:
-        raise AuthError("CREDENTIAL_STORE_ERROR")
+        raise _credential_store_error("windows_sid")
     return match.group(0)
 
 
-def _secure_windows_acl(path: Path, *, directory: bool) -> None:
+def _secure_windows_acl(path: Path, *, directory: bool, stage: str = "windows_acl") -> None:
     if os.name != "nt":
         return
     sid = _windows_sid()
     grant = f"*{sid}:{'(OI)(CI)' if directory else ''}(F)"
     try:
         subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", grant], capture_output=True, timeout=10, check=True)
-        checked = subprocess.run(["icacls", str(path), "/verify"], capture_output=True, text=True, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError) as exc:
-        raise AuthError("CREDENTIAL_STORE_ERROR") from exc
-    if "failed processing 0 files" not in checked.stdout.lower():
-        raise AuthError("CREDENTIAL_STORE_ERROR")
+        raise _credential_store_error(f"{stage}_apply", exc) from exc
+    try:
+        subprocess.run(["icacls", str(path), "/verify"], capture_output=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _credential_store_error(f"{stage}_verify", exc) from exc
 
 
-def _validate_file(path: Path) -> None:
+def _validate_file(path: Path, *, acl_stage: str = "credential_acl") -> None:
     if not path.exists():
         return
     if _is_reparse(path) or not path.is_file():
@@ -139,7 +161,7 @@ def _validate_file(path: Path) -> None:
     if os.name != "nt" and (path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) != 0o600):
         raise AuthError("CREDENTIAL_STORE_ERROR")
     if os.name == "nt":
-        _secure_windows_acl(path, directory=False)
+        _secure_windows_acl(path, directory=False, stage=acl_stage)
 
 
 @contextmanager
@@ -150,16 +172,16 @@ def _credential_lock():
             descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
             if os.name == "nt":
-                _secure_windows_acl(lock_path, directory=False)
+                _secure_windows_acl(lock_path, directory=False, stage="lock_acl")
         except FileExistsError:
             pass
-    _validate_file(lock_path)
+    _validate_file(lock_path, acl_stage="lock_acl")
     with FileLock(str(lock_path)):
         if os.name != "nt" and lock_path.exists():
             lock_path.chmod(0o600)
-        _validate_file(lock_path)
+        _validate_file(lock_path, acl_stage="lock_acl")
         yield
-        _validate_file(lock_path)
+        _validate_file(lock_path, acl_stage="lock_acl")
 
 
 def _read_unlocked() -> dict[str, Any] | None:
@@ -192,7 +214,7 @@ def _atomic_json(path: Path, value: dict[str, Any] | list[Any]) -> None:
     try:
         if os.name == "nt":
             try:
-                _secure_windows_acl(temporary, directory=False)
+                _secure_windows_acl(temporary, directory=False, stage="credential_acl")
             except Exception:
                 os.close(descriptor)
                 raise
@@ -205,7 +227,7 @@ def _atomic_json(path: Path, value: dict[str, Any] | list[Any]) -> None:
         if os.name != "nt":
             path.chmod(0o600)
         else:
-            _secure_windows_acl(path, directory=False)
+            _secure_windows_acl(path, directory=False, stage="credential_acl")
         if os.name != "nt":
             directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -414,7 +436,9 @@ def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | No
         keyring.set_password(KEYRING_SERVICE, keyring_user, tokens["refresh_token"])
         record.update({"storage": "keyring", "keyring_user": keyring_user})
         stored_in_keyring = True
-    except (KeyringError, NoKeyringError):
+    except (KeyringError, NoKeyringError) as exc:
+        LOGGER.warning("credential keyring unavailable", extra={"event": "auth.credentials.keyring_fallback", "result": "fallback",
+                       "params": {"stage": "keyring_write", "error_type": type(exc).__name__}})
         record.update({"storage": "file", "refresh_token": tokens["refresh_token"]})
     try:
         _atomic_json(path, record)
@@ -429,7 +453,7 @@ def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | No
                 pass
         if isinstance(exc, AuthError):
             raise
-        raise AuthError("CREDENTIAL_STORE_ERROR") from exc
+        raise _credential_store_error("metadata_replace", exc) from exc
     if previous_keyring_user and previous_keyring_user != record.get("keyring_user"):
         try:
             keyring.delete_password(KEYRING_SERVICE, previous_keyring_user)
@@ -578,10 +602,10 @@ def authorize_backtest() -> None:
     """Authorize a backtest with an explicit admin token or the normal user session."""
     if skip_auth_enabled():
         return
-    if "MARKETPLACE_ADMIN_TOKEN" not in os.environ:
+    if "SUPER_ADMIN_TOKEN" not in os.environ:
         access_token(interactive=True)
         return
-    token = os.environ.get("MARKETPLACE_ADMIN_TOKEN", "")
+    token = os.environ.get("SUPER_ADMIN_TOKEN", "")
     try:
         decoded = base64.b64decode(token, validate=True)
     except (ValueError, TypeError) as exc:

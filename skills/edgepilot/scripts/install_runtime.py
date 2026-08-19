@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cross-platform EdgePilot runtime installer (macOS / Windows / Linux).
+"""EdgePilot runtime installer for the published macOS and Windows targets.
 
 This script does NOT vendor or compile NautilusTrader. Internal developers build
 wheels separately and upload them to the marketplace runtime host. Users (via
@@ -13,8 +13,10 @@ Wheel resolution (first match wins):
   1) --wheel / EDGEPILOT_NAUTILUS_WHEEL
   2) --wheel-url / EDGEPILOT_NAUTILUS_WHEEL_URL
   3) --wheel-base-url / EDGEPILOT_NAUTILUS_WHEEL_BASE_URL / DEFAULT_WHEEL_BASE_URL
-     then prefer {base}/manifest.json, else try platform filename candidates
-  4) otherwise let pyproject pull nautilus_trader from PyPI (transition only)
+     and require {base}/manifest.json with an immutable URL, byte size and SHA-256
+
+The hosted custom wheel is required on every published platform.
+Never fall back to PyPI nautilus_trader.
 
 Optional env:
   EDGEPILOT_VENV
@@ -36,12 +38,44 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 UV_VERSION = "0.11.18"
 DEFAULT_RUNTIME_PYTHON = "3.12"
+INTEL_MAC_UNSUPPORTED = (
+    "This Mac uses an Intel processor, which EdgePilot does not support. "
+    "Supported Mac computers use Apple Silicon (M-series, arm64). "
+    "No runtime files were downloaded or changed."
+)
+ROSETTA_UNSUPPORTED = (
+    "This is an Apple Silicon Mac, but the installer is running through Rosetta as x86_64. "
+    "Use a native arm64 Terminal and Python, then try again. "
+    "No runtime files were downloaded or changed."
+)
+# Cloudflare Bot Fight Mode returns 403 "error code: 1010" for Python-urllib/3.x
+# on macOS, Windows, and Linux.
+DOWNLOAD_USER_AGENT = (
+    "Mozilla/5.0 (compatible; EdgePilot-Installer/{version}; +https://edge-pilot.rivendell.capital)"
+)
+
+
+def _plugin_version() -> str:
+    version_path = Path(__file__).resolve().parents[3] / "src" / "edgepilot" / "VERSION"
+    try:
+        value = version_path.read_text(encoding="ascii")
+    except OSError as exc:
+        raise SystemExit(f"cannot read plugin version: {version_path}") from exc
+    if value.endswith("\n"):
+        value = value[:-1]
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
+        raise SystemExit(f"invalid plugin version: {value!r}")
+    return value
+
+
+DOWNLOAD_USER_AGENT = DOWNLOAD_USER_AGENT.format(version=_plugin_version())
 
 # Default marketplace runtime host. Expected layout:
 #   {base}/manifest.json
@@ -55,6 +89,7 @@ class WheelSelection:
     filename: str
     python_tag: str | None
     sha256: str | None
+    bytes: int | None = None
     local_path: Path | None = None
     url: str | None = None
 
@@ -86,6 +121,19 @@ def run(cmd: list[str], *, cwd: Path | None = None) -> None:
     subprocess.run(cmd, check=True, cwd=cwd)
 
 
+def macos_process_is_translated() -> bool:
+    try:
+        result = subprocess.run(
+            ["/usr/sbin/sysctl", "-in", "sysctl.proc_translated"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
 def platform_tuple() -> tuple[str, str]:
     system = platform.system().lower()
     machine = platform.machine().lower()
@@ -93,8 +141,13 @@ def platform_tuple() -> tuple[str, str]:
         arch = "x86_64" if machine in {"x86_64", "amd64"} else machine
         return "linux", arch
     if system == "darwin":
-        arch = "arm64" if machine in {"arm64", "aarch64"} else "x86_64"
-        return "darwin", arch
+        if machine in {"arm64", "aarch64"}:
+            return "darwin", "arm64"
+        if machine in {"x86_64", "amd64"}:
+            if macos_process_is_translated():
+                raise SystemExit(ROSETTA_UNSUPPORTED)
+            raise SystemExit(INTEL_MAC_UNSUPPORTED)
+        raise SystemExit(f"unsupported platform: {system}/{machine}")
     if system == "windows":
         arch = "amd64" if machine in {"amd64", "x86_64"} else machine
         return "windows", arch
@@ -149,27 +202,29 @@ def ensure_uv() -> str:
     return uv
 
 
+def wheel_python_version(wheel: WheelSelection | None) -> str | None:
+    if wheel is None:
+        return None
+    tag = wheel.python_tag or (python_tag_from_wheel_name(wheel.filename) if wheel.filename else None)
+    if not tag:
+        return None
+    return python_version_from_tag(tag)
+
+
 def resolve_runtime_python(
     *,
     wheel: WheelSelection | None,
     override: str | None,
 ) -> str:
-    if override and python_version_tuple(override) != (3, 12):
-        raise SystemExit(f"EdgePilot Live requires Python 3.12, found override {override}")
+    wheel_version = wheel_python_version(wheel)
     if override:
+        if wheel_version and python_version_tuple(override) != python_version_tuple(wheel_version):
+            raise SystemExit(
+                f"Python override {override} does not match hosted wheel {wheel_version}"
+            )
         return override
-    if wheel and wheel.python_tag:
-        version = python_version_from_tag(wheel.python_tag)
-        if python_version_tuple(version) != (3, 12):
-            raise SystemExit(f"EdgePilot Live requires a CPython 3.12 wheel, found {wheel.python_tag}")
-        return version
-    if wheel and wheel.filename:
-        tag = python_tag_from_wheel_name(wheel.filename)
-        if tag:
-            version = python_version_from_tag(tag)
-            if python_version_tuple(version) != (3, 12):
-                raise SystemExit(f"EdgePilot Live requires a CPython 3.12 wheel, found {tag}")
-            return version
+    if wheel_version:
+        return wheel_version
     return DEFAULT_RUNTIME_PYTHON
 
 
@@ -188,7 +243,8 @@ def ensure_venv(uv: str, venv: Path, python_version: str) -> Path:
 
     venv.parent.mkdir(parents=True, exist_ok=True)
     run([uv, "python", "install", python_version])
-    run([uv, "venv", "--relocatable", "--python", python_version, str(venv)])
+    # uv venv omits pip unless seeded; later steps call python -m pip.
+    run([uv, "venv", "--relocatable", "--seed", "--python", python_version, str(venv)])
     if not py.is_file():
         raise SystemExit(f"venv python missing: {py}")
     return py
@@ -202,76 +258,45 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def candidate_filenames(version: str, python_tag: str | None = None) -> list[str]:
-    os_name, arch = platform_tuple()
-    py = python_tag or "cp312"
-    if os_name == "linux":
-        tags = [
-            f"{py}-{py}-manylinux_2_43_{arch}",
-            f"{py}-{py}-manylinux_2_35_{arch}",
-            f"{py}-{py}-manylinux2014_{arch}",
-            f"{py}-{py}-linux_{arch}",
-        ]
-    elif os_name == "darwin":
-        tags = [
-            f"{py}-{py}-macosx_15_0_{arch}",
-            f"{py}-{py}-macosx_14_0_{arch}",
-            f"{py}-{py}-macosx_11_0_{arch}",
-        ]
-    else:
-        tags = [
-            f"{py}-{py}-win_{arch}",
-            f"{py}-{py}-win_amd64" if arch == "amd64" else f"{py}-{py}-win_{arch}",
-        ]
-    return [f"nautilus_trader-{version}-{tag}.whl" for tag in tags]
+def http_request(url: str, *, method: str = "GET") -> urllib.request.Request:
+    request = urllib.request.Request(url, method=method)
+    request.add_header("User-Agent", DOWNLOAD_USER_AGENT)
+    return request
 
 
-def http_get_json(url: str) -> dict[str, Any] | None:
+def http_get_json(url: str) -> dict[str, Any]:
     try:
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(http_request(url), timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise SystemExit(f"failed to read runtime manifest: {exc}") from exc
 
 
-def http_exists(url: str) -> bool:
-    request = urllib.request.Request(url, method="HEAD")
-    try:
-        with urllib.request.urlopen(request) as response:
-            return 200 <= getattr(response, "status", 200) < 300
-    except urllib.error.HTTPError as exc:
-        if exc.code in {403, 405}:
-            return True
-        return False
-    except (urllib.error.URLError, TimeoutError):
-        return False
-
-
-def select_from_manifest(manifest: dict[str, Any], version: str) -> WheelSelection | None:
+def select_from_manifest(manifest: dict[str, Any], version: str, manifest_url: str) -> WheelSelection:
     os_name, arch = platform_tuple()
+    if set(manifest) != {"package", "version", "wheels"} or manifest.get("package") != "nautilus_trader" or manifest.get("version") != version:
+        raise SystemExit("runtime manifest package/version/schema is invalid")
     wheels = manifest.get("wheels")
     if not isinstance(wheels, list):
-        return None
+        raise SystemExit("runtime manifest wheels must be a list")
 
     matches: list[dict[str, Any]] = []
     for item in wheels:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or set(item) != {"filename", "url", "bytes", "sha256", "python", "os", "arch"}:
+            raise SystemExit("runtime manifest wheel schema is invalid")
+        if item.get("os") != os_name:
             continue
-        if item.get("os") not in {None, os_name}:
-            continue
-        if item.get("arch") not in {None, arch}:
+        if item.get("arch") != arch:
             continue
         filename = item.get("filename")
         python_tag = item.get("python")
         if not isinstance(python_tag, str) or not python_tag:
             python_tag = python_tag_from_wheel_name(str(filename))
-        if python_tag != "cp312":
-            continue
         if isinstance(filename, str) and filename.endswith(".whl") and version in filename:
             matches.append(item)
 
     if not matches:
-        return None
+        raise SystemExit(f"manifest.json has no wheel for this platform ({os_name}/{arch})")
     if len(matches) > 1:
         names = ", ".join(str(item.get("filename")) for item in matches)
         raise SystemExit(
@@ -281,13 +306,20 @@ def select_from_manifest(manifest: dict[str, Any], version: str) -> WheelSelecti
 
     item = matches[0]
     filename = str(item["filename"])
-    python_tag = item.get("python")
-    if not isinstance(python_tag, str) or not python_tag:
-        python_tag = python_tag_from_wheel_name(filename)
+    python_tag = str(item["python"]); digest = item["sha256"]; byte_count = item["bytes"]; url = item["url"]
+    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)) or not isinstance(byte_count, int) or byte_count <= 0 or not isinstance(url, str):
+        raise SystemExit("runtime manifest wheel integrity fields are invalid")
+    parsed, manifest_origin = urllib.parse.urlsplit(url), urllib.parse.urlsplit(manifest_url)
+    if parsed.scheme != "https" or parsed.netloc != manifest_origin.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise SystemExit("runtime manifest wheel URL must be credential-free same-origin HTTPS")
+    if urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]) != filename or f"/{digest}/" not in parsed.path:
+        raise SystemExit("runtime manifest wheel URL is not content-addressed")
     return WheelSelection(
         filename=filename,
         python_tag=python_tag,
-        sha256=str(item["sha256"]) if item.get("sha256") else None,
+        sha256=str(digest),
+        bytes=byte_count,
+        url=url,
     )
 
 
@@ -297,72 +329,63 @@ def resolve_hosted_wheel(
     base_url: str | None,
     version: str,
     sha256: str | None,
-) -> WheelSelection | None:
+) -> WheelSelection:
     if explicit_url:
+        parsed = urllib.parse.urlsplit(explicit_url)
+        if parsed.scheme != "https" or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise SystemExit("--wheel-url must be credential-free HTTPS")
         filename = explicit_url.rstrip("/").rsplit("/", 1)[-1]
         return WheelSelection(
             filename=filename,
             python_tag=python_tag_from_wheel_name(filename),
             sha256=sha256,
+            bytes=None,
             url=explicit_url,
         )
 
     root = (base_url if base_url is not None else DEFAULT_WHEEL_BASE_URL).rstrip("/")
     if not root:
-        return None
-
-    manifest = http_get_json(f"{root}/manifest.json")
-    if manifest:
-        selected = select_from_manifest(manifest, version)
-        if selected:
-            return WheelSelection(
-                filename=selected.filename,
-                python_tag=selected.python_tag,
-                sha256=sha256 or selected.sha256,
-                url=f"{root}/{selected.filename}",
-            )
-        os_name, _ = platform_tuple()
-        raise SystemExit(
-            f"manifest.json has no wheel for this platform ({os_name}); "
-            "provide --wheel/--wheel-url",
-        )
-
-    for filename in candidate_filenames(version):
-        url = f"{root}/{filename}"
-        if http_exists(url):
-            return WheelSelection(
-                filename=filename,
-                python_tag=python_tag_from_wheel_name(filename),
-                sha256=sha256,
-                url=url,
-            )
-    tried = ", ".join(candidate_filenames(version))
-    raise SystemExit(f"no wheel found under {root}; tried: {tried}")
+        raise SystemExit("runtime wheel base URL is required")
+    manifest_url = f"{root}/manifest.json"
+    selected = select_from_manifest(http_get_json(manifest_url), version, manifest_url)
+    if sha256 and sha256.lower() != selected.sha256:
+        raise SystemExit("--sha256 conflicts with the runtime manifest")
+    return selected
 
 
-def download_wheel(url: str, dest: Path, expected_sha256: str | None) -> Path:
+def download_wheel(url: str, dest: Path, expected_sha256: str, expected_bytes: int | None) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file() and (expected_bytes is None or dest.stat().st_size == expected_bytes) and sha256_file(dest) == expected_sha256:
+        print(f"using verified cached wheel {dest}", flush=True)
+        return dest
     print(f"downloading {url}", flush=True)
     tmp = dest.with_suffix(dest.suffix + ".partial")
     try:
-        with urllib.request.urlopen(url) as response, tmp.open("wb") as handle:
+        with urllib.request.urlopen(http_request(url), timeout=300) as response, tmp.open("wb") as handle:
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 handle.write(chunk)
         tmp.replace(dest)
+    except urllib.error.HTTPError as exc:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        if exc.code == 403:
+            raise SystemExit(
+                "failed to download wheel: HTTP 403 (Cloudflare error code 1010). "
+                "Retry with curl -L --fail -A \"Mozilla/5.0\" (Windows: curl.exe) "
+                "then pass --wheel. Do not install nautilus_trader from PyPI."
+            ) from exc
+        raise SystemExit(f"failed to download wheel: {exc}") from exc
     except urllib.error.URLError as exc:
         if tmp.exists():
             tmp.unlink(missing_ok=True)
         raise SystemExit(f"failed to download wheel: {exc}") from exc
-    if expected_sha256:
-        actual = sha256_file(dest)
-        if actual.lower() != expected_sha256.lower():
-            dest.unlink(missing_ok=True)
-            raise SystemExit(
-                f"sha256 mismatch for {dest}\nexpected {expected_sha256}\nactual   {actual}",
-            )
+    actual = sha256_file(dest)
+    if (expected_bytes is not None and dest.stat().st_size != expected_bytes) or actual.lower() != expected_sha256.lower():
+        dest.unlink(missing_ok=True)
+        raise SystemExit(f"runtime wheel integrity mismatch for {dest}")
     return dest
 
 
@@ -379,10 +402,14 @@ def materialize_wheel(selection: WheelSelection, cache_dir: Path) -> Path:
     if selection.local_path is not None:
         if not selection.local_path.is_file():
             raise SystemExit(f"wheel not found: {selection.local_path}")
+        if selection.sha256 and sha256_file(selection.local_path).lower() != selection.sha256.lower():
+            raise SystemExit("local runtime wheel SHA-256 mismatch")
         return selection.local_path
     if not selection.url:
         raise SystemExit(f"wheel selection missing download URL: {selection.filename}")
-    return download_wheel(selection.url, cache_dir / selection.filename, selection.sha256)
+    if not selection.sha256:
+        raise SystemExit("hosted runtime wheel requires SHA-256")
+    return download_wheel(selection.url, cache_dir / selection.sha256 / selection.filename, selection.sha256, selection.bytes)
 
 
 def install_wheel(venv_py: Path, wheel: Path) -> None:
@@ -463,7 +490,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--python",
         default=os.environ.get("EDGEPILOT_PYTHON"),
-        help="Override runtime Python version for the venv (e.g. 3.12)",
+        help="Override runtime Python version; must match the hosted wheel tag",
     )
     parser.add_argument("--wheel", default=os.environ.get("EDGEPILOT_NAUTILUS_WHEEL"))
     parser.add_argument("--wheel-url", default=os.environ.get("EDGEPILOT_NAUTILUS_WHEEL_URL"))
@@ -482,6 +509,11 @@ def main(argv: list[str] | None = None) -> int:
     if not (plugin_root / "pyproject.toml").is_file():
         raise SystemExit(f"plugin root missing pyproject.toml: {plugin_root}")
 
+    # Reject unsupported Mac hardware before resolving a hosted or explicitly
+    # supplied wheel. This keeps the product boundary consistent and guarantees
+    # that the failure happens before network access or runtime-state writes.
+    platform_tuple()
+
     version = read_pinned_nautilus_version(plugin_root)
     wheel_selection: WheelSelection | None = None
 
@@ -491,6 +523,7 @@ def main(argv: list[str] | None = None) -> int:
             filename=wheel_path.name,
             python_tag=python_tag_from_wheel_name(wheel_path.name),
             sha256=args.sha256,
+            bytes=None,
             local_path=wheel_path,
         )
     else:
@@ -513,17 +546,9 @@ def main(argv: list[str] | None = None) -> int:
         venv_py = ensure_venv(uv, candidate, runtime_python)
         run([str(venv_py), "-m", "pip", "install", "--upgrade", "pip"])
 
-        if wheel_selection is not None:
-            cache = venv.parent / "cache" / "wheels"
-            wheel_path = materialize_wheel(wheel_selection, cache)
-            install_wheel(venv_py, wheel_path)
-        else:
-            print(
-                "warning: no prebuilt wheel configured; "
-                "pyproject may install nautilus_trader from PyPI",
-                file=sys.stderr,
-                flush=True,
-            )
+        cache = venv.parent / "cache" / "wheels"
+        wheel_path = materialize_wheel(wheel_selection, cache)
+        install_wheel(venv_py, wheel_path)
 
         install_plugin(venv_py, plugin_root)
         run([str(venv_py), "-m", "pip", "check"])
