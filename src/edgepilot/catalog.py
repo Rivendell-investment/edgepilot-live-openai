@@ -842,22 +842,21 @@ def missing_bar_intervals(
     parsed_bar_type = BarType.from_str(bar_type)
     if parsed_bar_type.spec.is_time_aggregated():
         interval = parsed_bar_type.spec.timedelta
-        first = start + interval
-        last = end - interval
-        if first > last:
+        step_ns = int(interval.total_seconds() * 1_000_000_000)
+        start_ns = int(start.timestamp() * 1_000_000_000)
+        end_ns = int(end.timestamp() * 1_000_000_000)
+        first_ns = ((start_ns + step_ns - 1) // step_ns) * step_ns
+        last_ns = ((end_ns - 1) // step_ns) * step_ns
+        if first_ns > last_ns:
             return []
 
         catalog = ParquetDataCatalog(str(catalog_path))
         present = {
             bar.ts_event
             for bar in catalog.bars(bar_types=[bar_type])
-            if first.timestamp() * 1_000_000_000
-            <= bar.ts_event
-            <= last.timestamp() * 1_000_000_000
+            if first_ns <= bar.ts_event <= last_ns
         }
-        step_ns = int(interval.total_seconds() * 1_000_000_000)
-        cursor_ns = int(first.timestamp() * 1_000_000_000)
-        last_ns = int(last.timestamp() * 1_000_000_000)
+        cursor_ns = first_ns
         gaps: list[tuple[datetime, datetime]] = []
         gap_start_ns: int | None = None
         while cursor_ns <= last_ns:

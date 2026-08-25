@@ -5,7 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from edgepilot_backtest_core.discovery import StrategyDescriptor
+from edgepilot_core.backtest.discovery import StrategyDescriptor
 
 
 @dataclass(frozen=True)

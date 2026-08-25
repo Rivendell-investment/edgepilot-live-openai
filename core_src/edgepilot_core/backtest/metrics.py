@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import datetime
 from typing import Any
 
 from nautilus_trader.backtest.engine import BacktestEngine
@@ -28,7 +29,22 @@ def _find(stats: dict[str, Any], *fragments: str) -> float:
     return 0.0
 
 
-def collect_metrics(engine: BacktestEngine, *, base_currency: str, starting_balance: float) -> dict[str, Any]:
+def annualized_return_pct(total_return_pct: float, start: datetime, end: datetime) -> float:
+    years = (end - start).total_seconds() / (365.2425 * 86_400)
+    if years <= 0:
+        raise ValueError("annualized return requires a positive period")
+    growth = 1.0 + total_return_pct / 100.0
+    return -100.0 if growth <= 0 else 100.0 * (growth ** (1.0 / years) - 1.0)
+
+
+def collect_metrics(
+    engine: BacktestEngine,
+    *,
+    base_currency: str,
+    starting_balance: float,
+    start: datetime,
+    end: datetime,
+) -> dict[str, Any]:
     analyzer = engine.portfolio.analyzer
     pnl_stats = analyzer.get_performance_stats_pnls(Currency.from_str(base_currency))
     return_stats = analyzer.get_performance_stats_returns()
@@ -36,8 +52,10 @@ def collect_metrics(engine: BacktestEngine, *, base_currency: str, starting_bala
     all_stats = {**general_stats, **pnl_stats, **return_stats}
     pnl = _find(pnl_stats, "pnl (total)", "total pnl")
     result = engine.get_result()
+    total_return_pct = 100.0 * pnl / starting_balance
     return {
-        "return_pct": 100.0 * pnl / starting_balance,
+        "return_pct": total_return_pct,
+        "annualized_return_pct": annualized_return_pct(total_return_pct, start, end),
         "realized_pnl": pnl,
         "max_drawdown_pct": 100.0 * abs(_find(all_stats, "max drawdown")),
         "sharpe": _find(all_stats, "sharpe ratio", "sharpe"),

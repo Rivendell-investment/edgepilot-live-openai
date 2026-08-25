@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import Any
 
 from nautilus_trader.common.config import resolve_path
 from nautilus_trader.config import ImportableStrategyConfig
+from nautilus_trader.config import LiveDataEngineConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
@@ -27,104 +27,23 @@ from edgepilot.environment import credential_options
 from edgepilot.environment import credential_requirements
 from edgepilot.paths import state_root
 from edgepilot.paths import strategy_runs_path
+from edgepilot.run_state import EMERGENCY_STOP_FILE
+from edgepilot.run_state import RUNTIME_FILE
+from edgepilot.run_state import register_running
+from edgepilot.run_state import request_emergency_stop
+from edgepilot.run_state import running_runs
+from edgepilot.run_state import unregister_running
 
 
 LOGGER = logging.getLogger("edgepilot.trading")
 
 
-RUNNING_FILE = "running.json"
-RUNTIME_FILE = "runtime.json"
-EMERGENCY_STOP_FILE = "emergency-stop.json"
 SANDBOX_EXEC_CONFIG = (
     "nautilus_trader.adapters.sandbox.config:SandboxExecutionClientConfig"
 )
 SANDBOX_EXEC_FACTORY = (
     "nautilus_trader.adapters.sandbox.factory:SandboxLiveExecClientFactory"
 )
-
-
-def load_run(runs_path: Path, run_id: str) -> dict[str, Any]:
-    path = runs_path / run_id / "run.json"
-    if not path.exists():
-        raise FileNotFoundError(f"Unknown run: {run_id}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def running_runs(runs_path: Path) -> dict[str, int]:
-    """Return currently running run IDs and remove stale PID entries."""
-    path = runs_path / RUNNING_FILE
-    if not path.exists():
-        return {}
-    try:
-        stored = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        stored = {}
-    active = {
-        str(run_id): int(pid)
-        for run_id, pid in stored.items()
-        if _pid_exists(int(pid))
-    }
-    if active != stored:
-        _write_running(path, active)
-    return active
-
-
-def register_running(runs_path: Path, run_id: str) -> None:
-    active = running_runs(runs_path)
-    if run_id in active:
-        raise RuntimeError(f"Run is already running: {run_id}")
-    active[run_id] = os.getpid()
-    _write_running(runs_path / RUNNING_FILE, active)
-
-
-def unregister_running(runs_path: Path, run_id: str) -> None:
-    active = running_runs(runs_path)
-    active.pop(run_id, None)
-    _write_running(runs_path / RUNNING_FILE, active)
-
-
-def request_emergency_stop(runs_path: Path, run_id: str) -> None:
-    """Ask a local node to stop gracefully without relying on OS signals."""
-    directory = runs_path / run_id
-    if not directory.is_dir():
-        raise FileNotFoundError(f"Unknown run: {run_id}")
-    (directory / EMERGENCY_STOP_FILE).write_text(
-        json.dumps({"requested_at": datetime.now(timezone.utc).isoformat()}),
-        encoding="utf-8",
-    )
-    LOGGER.warning("emergency stop requested", extra={"event": "trading.emergency_stop.requested", "run_id": run_id, "result": "success"})
-
-
-def _write_running(path: Path, active: dict[str, int]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(active, indent=2), encoding="utf-8")
-
-
-def _pid_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        import ctypes
-
-        process_query_limited_information = 0x1000
-        handle = ctypes.windll.kernel32.OpenProcess(
-            process_query_limited_information,
-            False,
-            pid,
-        )
-        if not handle:
-            return False
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return True
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
 
 
 def _frame_rows(frame: Any, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -224,7 +143,7 @@ def _write_runtime_snapshot(
     temporary.replace(target)
 
 
-def _mark_runtime_stopped(record: dict[str, Any]) -> None:
+def _mark_runtime_stopped(record: dict[str, Any], *, failed: bool = False) -> None:
     """Leave the last native snapshot visible, but accurately mark it stopped."""
     directory = strategy_runs_path(str(record["strategy"]["name"])) / record["run_id"]
     path = directory / RUNTIME_FILE
@@ -236,7 +155,7 @@ def _mark_runtime_stopped(record: dict[str, Any]) -> None:
     payload.update({
         "run_id": record["run_id"],
         "mode": payload.get("mode", record.get("mode")),
-        "status": "STOPPED",
+        "status": "FAILED" if failed else "STOPPED",
         "updated_at": datetime.now(timezone.utc).isoformat(),
     })
     directory.mkdir(parents=True, exist_ok=True)
@@ -396,6 +315,9 @@ def execute_trading(
         strategies=[strategy_config],
         data_clients=data_clients,
         exec_clients=exec_clients,
+        # Default (False) calls os._exit(1) on queue exceptions, bypassing Python's
+        # exception handler and leaving no traceable error in the job output.
+        data_engine=LiveDataEngineConfig(graceful_shutdown_on_exception=True),
         logging=LoggingConfig(
             log_level="INFO",
             log_level_file="DEBUG",
@@ -460,5 +382,5 @@ def execute_trading(
         emergency_request_path.unlink(missing_ok=True)
         signal.signal(signal.SIGTERM, previous_sigterm)
         node.dispose()
-        _mark_runtime_stopped(record)
+        _mark_runtime_stopped(record, failed=failed)
         LOGGER.info("trading node stopped", extra={"event": "trading.node.stopped", "run_id": record.get("run_id"), "result": "failed" if failed else "success", "params": {"mode": mode}})

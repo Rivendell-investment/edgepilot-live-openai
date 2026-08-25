@@ -7,40 +7,42 @@ description: Install, configure, backtest, and run trading strategies through Ed
 
 Use the bundled `edgepilot` CLI. Do not generate ad hoc node scripts or recreate Nautilus abstractions.
 
+## First-run strategy guidance
+
+On the first user-visible reply after EdgePilot Live is selected in a new ChatGPT conversation, start with a short welcome in the user's current language. Identify the product exactly as **EdgePilot Live** and explain that it can clarify a strategy preference, test strategies with historical data, and later run Paper, exchange Demo, or explicitly confirmed Live trading. In that same reply, explain that the bundled local Dashboard has started, is reachable only on this device, and normally stops when ChatGPT closes or the plugin is disabled; offer long-term background operation only as an explicit later choice. Do not call it EdgePilot Research and do not wait for `open_dashboard` before giving this lifecycle guidance.
+
+Treat `Help me choose an EdgePilot strategy` and equivalent recommendation requests as onboarding routes. Ask one unanswered V2 question at a time, in the user's language, and map only unambiguous answers to `profit_style`, `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`, and `universe`. After showing the completed preference summary and receiving confirmation, call the bundled `recommend_strategies` MCP tool with only `questionnaire_version: "2.0"`, those seven canonical answers, and `locale`. Using that tool is required when it is available because its structured result is bound to the ChatGPT recommendation-card UI. Do not replace the tool call with a direct HTTP request, CLI request, or a manually formatted ranking. If the tool is unavailable, disclose that the current surface cannot render the formal three-card result and offer catalog browsing instead.
+
+Preserve the returned `best_fit`, `safer`, and `more_aggressive` roles and exact versions. Keep the tool's concise text fallback useful, but do not repeat every card field as a long prose response when ChatGPT has rendered the cards. Historical results do not promise future performance.
+
 ## Local dashboard
 
-The chat and bundled `edgepilot` CLI remain the primary way to configure,
-backtest, and start strategies. Use the optional localhost dashboard when the
-user wants to inspect charts, configure a selected strategy visually, manage
-local exchange credentials, or monitor an active Demo/Live session. It reads
+The bundled local stdio MCP starts the localhost Dashboard automatically while
+this plugin is enabled in ChatGPT. Use `open_dashboard` to return its real
+loopback URL; never assume port 8787, scan ports, or start a second server. It reads
 the same persistent run records, timeseries, fills, positions, runtime
 snapshots, and PNG artifacts as the CLI; do not create a second backtest or
 execution implementation for the UI.
 
-Infer the language of the user's current dashboard-opening instruction and always put a
-URL-encoded language candidate in the returned/opened URL. Use canonical
-`en`, `ko`, `zh-CN`, or `zh-TW` when supported, the original BCP 47 candidate
-when recognizable but unsupported, and an empty `?lang=` when it cannot be
-determined. This explicit URL candidate represents the current instruction;
-the dashboard handles saved and browser-language fallbacks. When starting a
-new server, also pass the same candidate with `--language`.
+The default website follows the MCP/ChatGPT process lifetime. Explain:
+“EdgePilot Live 已自动启动本地网站（仅本机可访问）。关闭 ChatGPT 或停用 EdgePilot Live 后，网站会自动关闭。若希望退出 ChatGPT 后仍在本机后台运行并随系统启动，请回复：让 EdgePilot Live 长期运行。”
+Only after that exact product-specific request and explicit tool confirmation,
+use `enable_persistent_dashboard`; disclose
+`capital.rivendell.edgepilot.live.dashboard` (Windows: `\EdgePilot\Live Dashboard`).
+For “恢复 EdgePilot Live 随 Codex 运行”, confirm and use
+`disable_persistent_dashboard`. Never change the Research service.
 
-Run at most one dashboard for a given EdgePilot state directory. Before
-starting one, check whether `http://127.0.0.1:8787/api/runs` responds; if it
-does, reuse that dashboard and open `http://127.0.0.1:8787/?lang=<candidate>`.
-Otherwise start exactly one localhost-only server, for example:
-
-```bash
-edgepilot ui --host 127.0.0.1 --port 8787 --language zh-CN
-```
-
-Start that command in a persistent execution session and keep it running while the user
-completes browser authentication; do not treat opening the browser as completion. After the
+Keep the local MCP running while the user completes browser authentication; do not treat opening the browser as completion. After the
 hosted page reports success, run `edgepilot auth status` until it reports authenticated, expired,
 or the login deadline is reached, then report the result. Do not call the Dashboard's protected
-write endpoint without its same-origin CSRF context. If the localhost process exited, restart the same Dashboard
-on port 8787 and tell the user to retry login; never silently switch ports or start a second
-instance. The hosted success page cannot safely redirect to an arbitrary localhost URL.
+write endpoint without its same-origin CSRF context. If the localhost process exited, ask ChatGPT
+to retry the plugin MCP and use the newly reported URL. The hosted success page cannot safely
+redirect to an arbitrary localhost URL.
+
+The hosted EdgePilot account flow uses Google or an emailed verification code; it does not use an
+EdgePilot password. Start it with `edgepilot auth login`. There is no password-recovery command.
+The CLI refreshes its short-lived access token automatically and asks the user to sign in again
+only after 90 days without use or the 180-day absolute session limit.
 
 Never start Vite, Node.js, or a separate frontend process for an end user. The
 production dashboard is bundled into the plugin and served by this same Python
@@ -57,7 +59,10 @@ or `STOPPED`.
 
 The Marketplace tab is not a local run view. It searches EdgePilot's public
 cloud catalog by research terms, asset, venue, data type, and published
-backtest metric. No marketplace sign-in is required to search or install.
+backtest metric. This Live Marketplace client requires an EdgePilot account
+and `marketplace:install` permission. The separate Research client remains
+account-free and sends no token or machine identifier, although its strategy
+downloads are recorded with the full client IP by the cloud service.
 Its **Find the right strategy** popup is a three-step guide: select one of
 three risk profiles, select one of three USD allocation ranges, then review
 and install a single recommendation. It filters by the publisher's declared
@@ -68,6 +73,14 @@ Installing a package downloads its selected immutable version ZIP and extracts
 it safely into the local persistent `strategies/` directory; no marketplace,
 exchange, or cloud credential is stored in the plugin cache. Treat installed
 strategy code as code: inspect it before enabling it for a backtest or trading.
+Research and Live ZIP downloads share a UTC source-network allowance of 20 per
+day and 100 per month, keyed by IPv4 address or IPv6 `/64`. Live additionally
+consumes a signed-in account allowance with the same limits. Search, inspect,
+backtest, Paper, Demo, Live startup, and runtime-wheel downloads do not count.
+Do not retry a quota rejection or quota-service failure automatically: each
+new approved ZIP response consumes another download. Restore keeps completed
+items and stops after the first quota rejection. It skips an exact version
+already installed locally, so that preflight does not consume an allowance.
 The Marketplace lists one card per strategy and defaults to its newest
 published version. Select any published version explicitly to install or
 update that same local package. Updating replaces the package-owned
@@ -94,7 +107,7 @@ When a user asks for a strategy, own the complete CLI workflow. Do not ask
 them to navigate files or operate the dashboard unless they want its charts.
 
 1. **Search and recommend.** Search with the user's terms and relevant
-   filters, then compare published period, venue, assets, return, drawdown,
+   filters, then compare published period, venue, assets, annualized return, drawdown,
    Sharpe, data type, risk profile, capacity, and strategy description. `recommend` is an agent
    decision based on these real catalog fields, not a separate opaque command.
    Use `--sort return`, `--sort drawdown`, or `--sort sharpe` only as a
@@ -142,7 +155,11 @@ to paste one into chat. Publishing remains administrator-only.
 ## Set up
 
 Use the bundled code from this skill directory, but keep user-owned state outside the plugin cache.
-The user only needs to ask in chat; perform installation in the terminal for them. First detect the
+The bundled MCP, Dashboard, Marketplace login and three-card recommendation work before the native
+runtime is installed. Do not run this setup merely to show cards or open the local website. On the
+first backtest or other runtime-dependent CLI operation, the Dashboard obtains explicit consent,
+shows real wheel download progress, installs the runtime, and continues the original job. For a
+manual CLI setup or recovery, the user only needs to ask in chat; perform installation in the terminal for them. First detect the
 operating system and CPU architecture. EdgePilot Live's published runtime supports Apple Silicon
 Macs (`arm64`) and 64-bit Windows (`amd64`). It does not support Intel Macs or Linux. Do not install
 Python, uv, or any runtime file on an unsupported host.
@@ -194,22 +211,18 @@ Wheel sources (first match wins):
    EdgePilot host (recovery path) or an internal smoke-test file;
 2. `--wheel-url` / `EDGEPILOT_NAUTILUS_WHEEL_URL` — a credential-free HTTPS URL on the
    EdgePilot host, with SHA-256;
-3. `--wheel-base-url` / `EDGEPILOT_NAUTILUS_WHEEL_BASE_URL` / the default host
-   `https://edge-pilot.rivendell.capital/runtime/nautilus_trader/<pinned-version>/`:
-   download `{base}/manifest.json`, require its same-origin content-addressed URL, byte size
+3. `--wheel-base-url` / `EDGEPILOT_NAUTILUS_WHEEL_BASE_URL` / the default public R2 host
+   `https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/<pinned-version>/<release-date>/`:
+   download `{base}/manifest.json`, resolve the selected wheel filename in that directory, and require its byte size
    and SHA-256, then pick the single matching platform wheel (currently **cp312** on
    macOS arm64 and Windows amd64). A missing or invalid manifest fails installation;
    never fall back to filename guessing or PyPI.
 
 There is no fourth source. If the hosted wheel cannot be obtained, stop.
 
-The runtime host is behind Cloudflare Bot Fight Mode on **every** OS. Default Python
-`urllib` sends `Python-urllib/3.x` and is rejected with HTTP 403 and body
-`error code: 1010`. This was confirmed for `manifest.json`, the macOS arm64 wheel, the
-Windows amd64 wheel, the Linux wheel, and the public catalog API. Treat 403/`1010` as a
-blocked User-Agent, not a missing file, and do not switch to PyPI. Default `curl`,
-`wget`, `Mozilla/5.0`, `EdgePilot-Installer/…`, and `python-requests` received 200/206
-on those same URLs. Always set an explicit browser-like UA:
+The runtime files are downloaded directly from the public R2 URL. Keep an explicit
+browser-like User-Agent for consistent diagnostics, and never switch to PyPI after a
+download failure:
 
 ```bash
 # macOS / Linux
@@ -242,7 +255,7 @@ Select the hosted wheel for the current OS/arch from `manifest.json` and use tha
 wheel's Python tag for the venv. If there is no match, report that clearly and stop.
 Do not invent a build or install the public package.
 
-Verify a fresh installation before doing anything else:
+Verify a fresh installation before running any runtime-dependent CLI command:
 
 ```bash
 ~/.edgepilot/.venv/bin/edgepilot --help
@@ -315,7 +328,7 @@ strategies/STRATEGY_NAME/
 Every strategy owns its own run records; never create a global `runs/`
 directory. A packaged benchmark is a publisher-provided backtest record under
 that strategy's `runs/` folder. The dashboard uses these records to filter and
-sort installed strategies by return, drawdown, or Sharpe. It must be produced
+sort installed strategies by annualized return, drawdown, or Sharpe. It must be produced
 by the normal native backtest command and include its fills, positions,
 timeseries, and chart artifacts; never hardcode its metrics. Keep downloaded
 market data shared under `~/.edgepilot/catalog/`.
@@ -383,7 +396,6 @@ a dry run or backtest. Keep the strategy and backtest objects, with every market
         "liquidation_enabled": false
       }
     },
-    "download": true,
     "export_artifacts": true
   }
 }
@@ -437,12 +449,10 @@ Load `default` automatically when the strategy provides it. The selected preset 
 market legs and venue configurations; `--set` overrides native strategy fields only.
 
 Read backtest defaults from the preset's `backtest` object. Use a rolling `days` period unless the
-user supplies exact `--start` and `--end` timestamps. The command downloads missing bars when
-`download` is enabled, runs native `BacktestNode`, and writes:
-
-When `download` is false, prepare the preset's full market and UTC time range first. A
-`DATA_REQUIRED` response reports the resolved catalog directory and an exact `edgepilot data pull`
-command for each missing market. Normal installs share data under `~/.edgepilot/catalog/` on
+user supplies exact `--start` and `--end` timestamps. The command always downloads missing bars,
+then runs native `BacktestNode` and writes the artifacts below. Legacy presets may still contain
+`backtest.download`, but that field no longer disables automatic data preparation. Normal installs
+share data under `~/.edgepilot/catalog/` on
 macOS/Linux or `%APPDATA%\\EdgePilot\\catalog` on Windows. Only repository development with
 `EDGEPILOT_HOME="$PWD"` uses `$PWD/catalog/`. Market data never belongs in a plugin or strategy ZIP.
 
@@ -453,7 +463,7 @@ macOS/Linux or `%APPDATA%\\EdgePilot\\catalog` on Windows. Only repository devel
 - `backtest.png`: one indexed-price panel per market with entries/exits, plus portfolio PnL and
   equity panels.
 
-Report total return, realized PnL, maximum drawdown, Sharpe, Sortino, win rate, profit factor,
+Report annualized return, realized PnL, maximum drawdown, Sharpe, Sortino, win rate, profit factor,
 orders, and positions. State fees, data, and bar-execution assumptions. Never describe historical
 profit as guaranteed.
 

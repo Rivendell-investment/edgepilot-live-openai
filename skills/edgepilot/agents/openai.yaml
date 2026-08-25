@@ -1,4 +1,4 @@
 interface:
   display_name: "EdgePilot"
   short_description: "Backtest and run trading strategies"
-  default_prompt: "Use $edgepilot to inspect a strategy, explain its defaults, and run a backtest."
+  default_prompt: "Use $edgepilot in my language. On the first reply, introduce EdgePilot Live and explain that its local Dashboard runs only while ChatGPT is open unless I explicitly enable long-term background operation. For a formal recommendation, guide me through the existing V2 preferences and call recommend_strategies so ChatGPT can render the three cards."

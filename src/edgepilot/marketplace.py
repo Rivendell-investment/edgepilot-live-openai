@@ -19,9 +19,16 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-from edgepilot.discovery import strategies_root
 from edgepilot import auth
-from filelock import FileLock
+from edgepilot.file_lock import FileLock
+from edgepilot.paths import strategies_state_root
+
+
+def strategies_root() -> Path:
+    root = strategies_state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "__init__.py").touch(exist_ok=True)
+    return root
 
 
 MARKETPLACE_ORIGIN = os.environ.get("EDGEPILOT_MARKETPLACE_ORIGIN", "https://edge-pilot.rivendell.capital").rstrip("/")
@@ -39,6 +46,8 @@ RISK_PROFILE_ALIASES = {
 }
 MAX_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_EXPANDED_BYTES = 50 * 1024 * 1024
+MAX_ERROR_BYTES = 16 * 1024
+MAX_RETRY_AFTER = 2_678_400
 
 _RETRYABLE_MARKETPLACE_CODES = {
     "CATALOG_COVERAGE_INSUFFICIENT", "RATE_LIMITED", "SERVICE_UNAVAILABLE", "AUTH_SERVICE_UNAVAILABLE",
@@ -48,11 +57,26 @@ _RETRYABLE_MARKETPLACE_CODES = {
 class MarketplaceRequestError(RuntimeError):
     """A controlled remote error exposed only by opted-in Marketplace calls."""
 
-    def __init__(self, code: str, status: int | None, retryable: bool):
+    def __init__(self, code: str, status: int | None, retryable: bool, *,
+                 retry_after: int | None = None, limiting_scopes: list[str] | None = None,
+                 quotas: dict[str, dict[str, dict[str, Any]]] | None = None):
         super().__init__(code)
         self.code = code
         self.status = status
         self.retryable = retryable
+        self.retry_after = retry_after
+        self.limiting_scopes = list(limiting_scopes or [])
+        self.quotas = dict(quotas or {})
+
+    def public_details(self) -> dict[str, Any]:
+        details: dict[str, Any] = {"retryable": self.retryable}
+        if self.retry_after is not None:
+            details["retry_after"] = self.retry_after
+        if self.limiting_scopes:
+            details["limiting_scopes"] = self.limiting_scopes
+        if self.quotas:
+            details["quotas"] = self.quotas
+        return details
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -105,7 +129,7 @@ def preflight_install(name: str, version: str) -> None:
         raise ValueError("a different local strategy already uses this name")
     if previous.get("version") == version:
         raise ValueError("this Marketplace version is already installed")
-    from edgepilot.trading import running_runs
+    from edgepilot.run_state import running_runs
     active = running_runs(destination / "runs") if (destination / "runs").exists() else {}
     if active:
         raise ValueError("stop active runs before updating this strategy")
@@ -138,7 +162,7 @@ def _install_package_unlocked(name: str, version: str, archive: bytes) -> dict[s
             raise ValueError("a different local strategy already uses this name")
         if previous.get("version") == version:
             raise ValueError("this Marketplace version is already installed")
-        from edgepilot.trading import running_runs
+        from edgepilot.run_state import running_runs
         active = running_runs(destination / "runs") if (destination / "runs").exists() else {}
         if active:
             raise ValueError("stop active runs before updating this strategy")
@@ -166,7 +190,10 @@ def _install_package_unlocked(name: str, version: str, archive: bytes) -> dict[s
             shutil.rmtree(temporary)
         temporary.mkdir(parents=True)
         try:
-            for entry, relative in zip(entries, relative_paths, strict=True):
+            # The lightweight localhost MCP process can run on macOS' bundled
+            # Python 3.9 before the managed runtime is installed. ``strict``
+            # was only added to zip() in Python 3.10.
+            for entry, relative in zip(entries, relative_paths):
                 target = (temporary / relative).resolve()
                 if temporary.resolve() not in target.parents:
                     raise ValueError("marketplace package contains an unsafe path")
@@ -272,6 +299,88 @@ def recommend(questionnaire: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _retry_after(headers: Any) -> int | None:
+    raw = headers.get("Retry-After") if headers is not None else None
+    try:
+        value = int(raw or "")
+    except (TypeError, ValueError):
+        return None
+    return value if 1 <= value <= MAX_RETRY_AFTER else None
+
+
+def _quota_period(value: object, expected_limit: int) -> dict[str, Any] | None:
+    if not isinstance(value, dict) or set(value) != {"limit", "used", "resets_at"}:
+        return None
+    limit, used, resets_at = value.get("limit"), value.get("used"), value.get("resets_at")
+    if limit != expected_limit or not isinstance(used, int) or isinstance(used, bool) or not 0 <= used <= limit:
+        return None
+    if not isinstance(resets_at, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", resets_at):
+        return None
+    try:
+        datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return {"limit": limit, "used": used, "resets_at": resets_at}
+
+
+def _download_request_error(exc: HTTPError) -> MarketplaceRequestError:
+    retry_after = _retry_after(exc.headers)
+    try:
+        raw = exc.read(MAX_ERROR_BYTES + 1)
+    finally:
+        exc.close()
+    if len(raw) > MAX_ERROR_BYTES:
+        return MarketplaceRequestError("REMOTE_ERROR", exc.code, exc.code >= 500, retry_after=retry_after)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return MarketplaceRequestError("REMOTE_ERROR", exc.code, exc.code >= 500, retry_after=retry_after)
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict) or not isinstance(error.get("code"), str):
+        return MarketplaceRequestError("REMOTE_ERROR", exc.code, exc.code >= 500, retry_after=retry_after)
+    code = error["code"]
+    if code == "DOWNLOAD_QUOTA_EXCEEDED" and exc.code == 429 and retry_after is not None \
+            and error.get("retryable") is True:
+        scopes = error.get("limiting_scopes")
+        quotas = error.get("quotas")
+        if isinstance(scopes, list) and scopes and len(scopes) == len(set(scopes)) \
+                and all(scope in {"network", "live_user"} for scope in scopes) \
+                and isinstance(quotas, dict) and set(quotas) == {"network", "live_user"}:
+            parsed_quotas: dict[str, dict[str, dict[str, Any]]] = {}
+            for scope in ("network", "live_user"):
+                quota = quotas.get(scope)
+                if not isinstance(quota, dict) or set(quota) != {"daily", "monthly"}:
+                    break
+                daily = _quota_period(quota.get("daily"), 20)
+                monthly = _quota_period(quota.get("monthly"), 100)
+                if daily is None or monthly is None:
+                    break
+                parsed_quotas[scope] = {"daily": daily, "monthly": monthly}
+            exhausted = {scope for scope, quota in parsed_quotas.items()
+                         if quota["daily"]["used"] >= quota["daily"]["limit"]
+                         or quota["monthly"]["used"] >= quota["monthly"]["limit"]}
+            if len(parsed_quotas) == 2 and set(scopes) == exhausted:
+                return MarketplaceRequestError(code, 429, True, retry_after=retry_after,
+                                               limiting_scopes=scopes, quotas=parsed_quotas)
+        return MarketplaceRequestError("REMOTE_ERROR", 429, False, retry_after=retry_after)
+    if code == "DOWNLOAD_QUOTA_UNAVAILABLE":
+        if exc.code == 503 and error.get("retryable") is True:
+            return MarketplaceRequestError(code, 503, True, retry_after=retry_after)
+        return MarketplaceRequestError("REMOTE_ERROR", exc.code, exc.code >= 500, retry_after=retry_after)
+    allowed = {
+        "RATE_LIMITED": exc.code == 429,
+        "AUTH_REQUIRED": exc.code == 401,
+        "INVALID_TOKEN": exc.code == 401,
+        "INSUFFICIENT_SCOPE": exc.code == 403,
+    }
+    if allowed.get(code):
+        return MarketplaceRequestError(
+            code, exc.code, code == "RATE_LIMITED",
+            retry_after=retry_after,
+        )
+    return MarketplaceRequestError("REMOTE_ERROR", exc.code, exc.code >= 500, retry_after=retry_after)
+
+
 def _download(slug: str, version: str) -> bytes:
     """Stream an archive to disk and validate declared and actual integrity."""
     url = f"{MARKETPLACE_ORIGIN}/api/live/strategies/{slug}/{version}/download"
@@ -286,7 +395,10 @@ def _download(slug: str, version: str) -> bytes:
                 break
             except HTTPError as exc:
                 if exc.code == 401 and attempt == 0:
-                    token = auth.refresh_access_token()
+                    try:
+                        token = auth.refresh_access_token()
+                    finally:
+                        exc.close()
                     continue
                 raise
         else:
@@ -326,10 +438,9 @@ def _download(slug: str, version: str) -> bytes:
                 raise RuntimeError("Marketplace download SHA-256 does not match the published package.")
             return temporary_path.read_bytes()
     except HTTPError as exc:
-        message = exc.read().decode("utf-8", errors="replace").strip()
-        raise RuntimeError(message or f"Marketplace request failed ({exc.code}).") from exc
+        raise _download_request_error(exc) from exc
     except URLError as exc:
-        raise RuntimeError(f"Marketplace request failed: {exc.reason}") from exc
+        raise MarketplaceRequestError("SERVICE_UNAVAILABLE", None, True) from exc
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
@@ -402,6 +513,16 @@ def restore(*, strategy_slug: str = "") -> dict[str, Any]:
             continue
         try:
             download_and_install(slug, version)
+        except MarketplaceRequestError as exc:
+            if exc.code == "DOWNLOAD_QUOTA_EXCEEDED":
+                results.append({"strategy_slug": slug, "version": version, "status": "quota_exceeded"})
+                return {
+                    "restored": [item["strategy_slug"] for item in results if item["status"] == "restored"],
+                    "results": results,
+                    "quota_exceeded": {"code": exc.code, **exc.public_details()},
+                }
+            results.append({"strategy_slug": slug, "version": version, "status": "unavailable"})
+            continue
         except RuntimeError:
             results.append({"strategy_slug": slug, "version": version, "status": "unavailable"})
             continue

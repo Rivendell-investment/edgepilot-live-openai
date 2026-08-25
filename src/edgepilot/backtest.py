@@ -28,63 +28,13 @@ from edgepilot.models import VenueRequest
 from edgepilot.presets import public_adapter_options
 from edgepilot.presets import resolve_strategy_parameters
 from edgepilot.reporting import export_reports
-from edgepilot_backtest_core.models import BacktestRequest as CoreBacktestRequest
-from edgepilot_backtest_core.models import MarketRequest as CoreMarketRequest
-from edgepilot_backtest_core.models import VenueRequest as CoreVenueRequest
-from edgepilot_backtest_core.runner import execute_local_backtest
+from edgepilot_core.backtest.models import BacktestRequest as CoreBacktestRequest
+from edgepilot_core.backtest.models import MarketRequest as CoreMarketRequest
+from edgepilot_core.backtest.models import VenueRequest as CoreVenueRequest
+from edgepilot_core.backtest.runner import execute_local_backtest
 
 
 LOGGER = logging.getLogger("edgepilot.backtest")
-
-
-class CatalogDataRequiredError(RuntimeError):
-    """A saved preset requires market data that is not present locally."""
-
-    def __init__(self, catalog_path: Path, requirements: list[dict[str, Any]]):
-        self.catalog_path = catalog_path.resolve()
-        self.requirements = requirements
-        commands = [" ".join(item["command"]) for item in requirements]
-        super().__init__(
-            "DATA_REQUIRED: market data is not bundled with EdgePilot; catalog="
-            f"{self.catalog_path}; prepare the missing data with: " + " | ".join(commands),
-        )
-
-
-def missing_catalog_requirements(
-    catalog_path: Path,
-    markets: tuple[MarketRequest, ...],
-    start: datetime,
-    end: datetime,
-) -> list[dict[str, Any]]:
-    """Return bounded, serializable instructions for missing bar datasets."""
-    requirements: list[dict[str, Any]] = []
-    for market in markets:
-        if market.data_type != "bars":
-            continue
-        intervals = missing_bar_intervals(catalog_path, market.bar_type, start, end)
-        if not intervals:
-            continue
-        command_prefix = [
-            "edgepilot", "data", "pull", "--venue", market.venue,
-            "--instrument", market.instrument_id, "--data-type", "bars",
-            "--bar-type", market.bar_type,
-        ]
-        commands = [command_prefix + ["--start", interval_start.isoformat(), "--end", interval_end.isoformat()]
-                    for interval_start, interval_end in intervals]
-        requirements.append({
-            "instrument_id": market.instrument_id,
-            "bar_type": market.bar_type,
-            "venue": market.venue,
-            "data_type": market.data_type,
-            "start": intervals[0][0].isoformat(),
-            "end": intervals[-1][1].isoformat(),
-            "missing_intervals": len(intervals),
-            "intervals": [{"start": interval_start.isoformat(), "end": interval_end.isoformat()}
-                          for interval_start, interval_end in intervals],
-            "command": commands[0],
-            "commands": commands,
-        })
-    return requirements
 
 
 @dataclass(frozen=True)
@@ -97,7 +47,7 @@ class BacktestRequest:
     parameters: dict[str, Any]
     catalog_path: Path
     runs_path: Path
-    download: bool = True
+    download: bool = True  # Accepted for legacy callers; missing data is always downloaded.
     export_artifacts: bool = True
     preset_name: str | None = None
 
@@ -105,7 +55,7 @@ class BacktestRequest:
 def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
     started = monotonic()
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    LOGGER.info("backtest started", extra={"event": "backtest.started", "run_id": run_id, "params": {"strategy": request.strategy.name, "preset": request.preset_name, "start": request.start.isoformat(), "end": request.end.isoformat(), "markets": [market.__dict__ for market in request.markets], "download": request.download, "export_artifacts": request.export_artifacts}})
+    LOGGER.info("backtest started", extra={"event": "backtest.started", "run_id": run_id, "params": {"strategy": request.strategy.name, "preset": request.preset_name, "start": request.start.isoformat(), "end": request.end.isoformat(), "markets": [market.__dict__ for market in request.markets], "export_artifacts": request.export_artifacts}})
     if not request.markets:
         raise ValueError("A backtest requires at least one market")
     venue_by_name = {venue.adapter.name: venue for venue in request.venues}
@@ -121,25 +71,15 @@ def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
     if any(market.data_type != "bars" for market in request.markets):
         raise ValueError("The backtest engine currently requires bar markets")
 
-    if not request.download:
-        requirements = missing_catalog_requirements(
+    for market in request.markets:
+        venue = venue_by_name[market.venue.upper()]
+        for start, end in missing_bar_intervals(
             request.catalog_path,
-            request.markets,
+            market.bar_type,
             request.start,
             request.end,
-        )
-        if requirements:
-            raise CatalogDataRequiredError(request.catalog_path, requirements)
-
-    if request.download:
-        for market in request.markets:
-            venue = venue_by_name[market.venue.upper()]
-            for start, end in missing_bar_intervals(
-                request.catalog_path,
-                market.bar_type,
-                request.start,
-                request.end,
-            ):
+        ):
+            try:
                 pull_data(
                     catalog_path=request.catalog_path,
                     adapter=venue.adapter,
@@ -160,6 +100,11 @@ def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
                         ),
                     },
                 )
+            except Exception as exc:
+                raise RuntimeError(
+                    "Automatic market-data preparation failed for "
+                    f"{market.instrument_id} on {market.venue}: {exc}",
+                ) from exc
 
     core_request = CoreBacktestRequest(
         strategy=request.strategy,

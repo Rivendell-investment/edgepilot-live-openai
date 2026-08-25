@@ -6,44 +6,31 @@ from datetime import timedelta
 from datetime import timezone
 import json
 import hashlib
+import importlib
 import inspect as python_inspect
+import logging
 from pathlib import Path
 import shutil
 import sys
 from time import monotonic
+from typing import Any
+from typing import Callable
 
 from edgepilot import __version__
-from edgepilot.backtest import BacktestRequest
-from edgepilot.backtest import execute_backtest
-from edgepilot.catalog import parse_time
-from edgepilot.catalog import pull_data
-from edgepilot.discovery import resolve_adapter
-from edgepilot.discovery import resolve_strategy
-from edgepilot.discovery import strategies_root
-from edgepilot.discovery import strategy_names
-from edgepilot.environment import credential_requirements
-from edgepilot.environment import load_env
-from edgepilot.presets import load_preset
-from edgepilot.presets import preset_backtest_values
-from edgepilot.presets import preset_markets
-from edgepilot.presets import preset_names
-from edgepilot.presets import preset_strategy_values
-from edgepilot.presets import preset_venues
-from edgepilot.presets import public_adapter_options
-from edgepilot.presets import resolve_strategy_parameters
+from edgepilot.env_file import load_env
 from edgepilot.paths import find_run_directory
 from edgepilot.paths import iter_run_directories
 from edgepilot.paths import state_root
 from edgepilot.paths import strategy_runs_path
-from edgepilot.models import MarketRequest
 from edgepilot import marketplace
-from edgepilot.models import VenueRequest
-from edgepilot.trading import execute_trading
-from edgepilot.trading import load_run
-from edgepilot.trading import register_running
-from edgepilot.trading import request_emergency_stop
-from edgepilot.trading import running_runs
-from edgepilot.trading import unregister_running
+from edgepilot.run_state import load_run
+from edgepilot.run_state import load_execution
+from edgepilot.run_state import record_execution_result
+from edgepilot.run_state import register_running
+from edgepilot.run_state import request_emergency_stop
+from edgepilot.run_state import running_runs
+from edgepilot.run_state import run_status
+from edgepilot.run_state import unregister_running
 from edgepilot.values import parse_assignments
 from edgepilot.app_logging import configure_logging
 from edgepilot import auth
@@ -52,6 +39,34 @@ from edgepilot import auth
 UTC = timezone.utc
 STATE_ROOT = state_root()
 CATALOG = STATE_ROOT / "catalog"
+
+
+def _lazy_callable(module_name: str, attribute: str) -> Callable[..., Any]:
+    """Delay native imports until a command actually needs them."""
+    def invoke(*args: Any, **kwargs: Any) -> Any:
+        target = getattr(importlib.import_module(module_name), attribute)
+        return target(*args, **kwargs)
+
+    return invoke
+
+
+execute_backtest = _lazy_callable("edgepilot.backtest", "execute_backtest")
+parse_time = _lazy_callable("edgepilot.catalog", "parse_time")
+pull_data = _lazy_callable("edgepilot.catalog", "pull_data")
+resolve_adapter = _lazy_callable("edgepilot.discovery", "resolve_adapter")
+resolve_strategy = _lazy_callable("edgepilot.discovery", "resolve_strategy")
+strategies_root = _lazy_callable("edgepilot.discovery", "strategies_root")
+strategy_names = _lazy_callable("edgepilot.discovery", "strategy_names")
+credential_requirements = _lazy_callable("edgepilot.environment", "credential_requirements")
+load_preset = _lazy_callable("edgepilot.presets", "load_preset")
+preset_backtest_values = _lazy_callable("edgepilot.presets", "preset_backtest_values")
+preset_markets = _lazy_callable("edgepilot.presets", "preset_markets")
+preset_names = _lazy_callable("edgepilot.presets", "preset_names")
+preset_strategy_values = _lazy_callable("edgepilot.presets", "preset_strategy_values")
+preset_venues = _lazy_callable("edgepilot.presets", "preset_venues")
+public_adapter_options = _lazy_callable("edgepilot.presets", "public_adapter_options")
+resolve_strategy_parameters = _lazy_callable("edgepilot.presets", "resolve_strategy_parameters")
+execute_trading = _lazy_callable("edgepilot.trading", "execute_trading")
 
 
 def _period(args: argparse.Namespace, *, default_days: int = 365) -> tuple[datetime, datetime]:
@@ -193,8 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
     marketplace_parser.add_argument("--strategy", help="Strategy slug for restore or cloud-history clear")
     marketplace_parser.add_argument("--locale", default="", help="Marketplace response locale for search and inspect (for example zh-CN)")
 
-    auth_parser = subparsers.add_parser("auth", help="Log in, inspect, recover, or revoke the EdgePilot session")
-    auth_parser.add_argument("action", choices=["login", "status", "logout", "recover"])
+    auth_parser = subparsers.add_parser("auth", help="Log in, inspect, or revoke the EdgePilot session")
+    auth_parser.add_argument("action", choices=["login", "status", "logout"])
     auth_parser.add_argument("--all", action="store_true", help="Revoke all devices")
     auth_parser.add_argument("--local-only", action="store_true", help="Only remove local credentials")
 
@@ -278,7 +293,9 @@ def _data(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_markets(preset: dict) -> tuple[MarketRequest, ...]:
+def _run_markets(preset: dict) -> tuple[Any, ...]:
+    from edgepilot.models import MarketRequest
+
     return tuple(
         MarketRequest(
             instrument_id=str(item["instrument_id"]),
@@ -290,7 +307,9 @@ def _run_markets(preset: dict) -> tuple[MarketRequest, ...]:
     )
 
 
-def _run_venues(preset: dict) -> tuple[VenueRequest, ...]:
+def _run_venues(preset: dict) -> tuple[Any, ...]:
+    from edgepilot.models import VenueRequest
+
     venues = []
     reserved = {
         "starting_balance",
@@ -329,6 +348,8 @@ def _run_venues(preset: dict) -> tuple[VenueRequest, ...]:
 
 
 def _backtest(args: argparse.Namespace) -> int:
+    from edgepilot.backtest import BacktestRequest
+
     strategy = resolve_strategy(args.strategy, args.config_path)
     preset_name, preset = load_preset(strategy, args.preset)
     backtest_values = preset_backtest_values(preset)
@@ -347,7 +368,10 @@ def _backtest(args: argparse.Namespace) -> int:
             parameters=strategy_values,
             catalog_path=CATALOG,
             runs_path=strategy_runs_path(strategy.name),
-            download=bool(backtest_values.get("download", True)),
+            # Historical backtests always fill missing catalog data.  Keep
+            # accepting legacy presets which still contain backtest.download,
+            # but do not let that obsolete field disable data preparation.
+            download=True,
             export_artifacts=bool(backtest_values.get("export_artifacts", True)),
             preset_name=preset_name,
         ),
@@ -437,11 +461,23 @@ def _trade(args: argparse.Namespace, mode: str) -> int:
             print(f"Run: {run_id}")
         register_running(runs_path, run_id)
     try:
-        execute_trading(
-            record=record,
-            mode=mode,
-            dry_run=False,
-        )
+        try:
+            execute_trading(
+                record=record,
+                mode=mode,
+                dry_run=False,
+            )
+        except BaseException as exc:
+            try:
+                record_execution_result(runs_path, run_id, failed=exc)
+            except OSError:
+                logging.getLogger("edgepilot.cli").exception(
+                    "trading failure outcome could not be recorded",
+                    extra={"event": "trading.execution.persist_failed", "run_id": run_id, "result": "failed"},
+                )
+            raise
+        else:
+            record_execution_result(runs_path, run_id)
     finally:
         unregister_running(runs_path, run_id)
     return 0
@@ -461,7 +497,7 @@ def _runs(args: argparse.Namespace) -> int:
         for path in sorted(iter_run_directories(), reverse=True):
             record = load_run(path.parent, path.name)
             active = running_runs(path.parent)
-            status = "RUNNING" if path.name in active else ("COMPLETE" if record.get("mode") == "backtest" else "STOPPED")
+            status = run_status(path.parent, path.name, record.get("mode"), active=active)
             instruments = ",".join(market["instrument_id"] for market in record.get("markets", []))
             strategy = record["strategy"]["name"]
             result = record.get("metrics", {}).get("return_pct")
@@ -471,7 +507,8 @@ def _runs(args: argparse.Namespace) -> int:
     if args.action == "status":
         if args.run_id:
             directory = find_run_directory(args.run_id)
-            print("RUNNING" if args.run_id in running_runs(directory.parent) else "STOPPED")
+            record = load_run(directory.parent, args.run_id)
+            print(run_status(directory.parent, args.run_id, record.get("mode")))
         else:
             active = {
                 run_id: pid
@@ -492,7 +529,12 @@ def _runs(args: argparse.Namespace) -> int:
     if not args.run_id:
         raise ValueError("run ID is required for show")
     directory = find_run_directory(args.run_id)
-    print(json.dumps(load_run(directory.parent, args.run_id), indent=2))
+    record = load_run(directory.parent, args.run_id)
+    record["status"] = run_status(directory.parent, args.run_id, record.get("mode"))
+    execution = load_execution(directory.parent, args.run_id)
+    if execution:
+        record["execution"] = execution
+    print(json.dumps(record, indent=2))
     return 0
 
 
@@ -573,11 +615,6 @@ def _auth(args: argparse.Namespace) -> int:
     if args.action == "login":
         print(json.dumps(auth.login(), indent=2))
         return 0
-    if args.action == "recover":
-        import webbrowser
-        webbrowser.open(f"{auth.ORIGIN}/forgot-password")
-        print(json.dumps({"opened": f"{auth.ORIGIN}/forgot-password"}, indent=2))
-        return 0
     print(json.dumps(auth.logout(all_devices=bool(args.all), local_only=bool(args.local_only)), indent=2))
     return 0
 
@@ -637,6 +674,10 @@ def main(argv: list[str] | None = None) -> int:
             result = 0
         logger.info("command completed", extra={"event": "cli.command.completed", "result": "success", "duration_ms": round((monotonic() - started) * 1000), "params": safe_params})
         return result
+    except marketplace.MarketplaceRequestError as exc:
+        logger.exception("command failed", extra={"event": "cli.command.failed", "result": "failed", "duration_ms": round((monotonic() - started) * 1000), "params": safe_params})
+        print(json.dumps({"error": {"code": exc.code, **exc.public_details()}}, separators=(",", ":")), file=sys.stderr)
+        return 1
     except Exception as exc:
         logger.exception("command failed", extra={"event": "cli.command.failed", "result": "failed", "duration_ms": round((monotonic() - started) * 1000), "params": safe_params})
         print(f"error: {exc}", file=sys.stderr)

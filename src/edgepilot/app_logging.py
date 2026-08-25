@@ -204,3 +204,16 @@ def configure_logging(*, directory: Path | None = None, level: str | None = None
     _configured_path = target
     cleanup_logs(target)
     return logger
+
+
+def shutdown_logging() -> None:
+    """Flush, close, and detach EdgePilot-owned logging handlers."""
+    global _configured_path
+    logger = logging.getLogger("edgepilot")
+    for handler in list(logger.handlers):
+        try:
+            handler.flush()
+        finally:
+            handler.close()
+            logger.removeHandler(handler)
+    _configured_path = None

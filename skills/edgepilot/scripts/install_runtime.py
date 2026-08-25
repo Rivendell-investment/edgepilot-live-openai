@@ -13,7 +13,7 @@ Wheel resolution (first match wins):
   1) --wheel / EDGEPILOT_NAUTILUS_WHEEL
   2) --wheel-url / EDGEPILOT_NAUTILUS_WHEEL_URL
   3) --wheel-base-url / EDGEPILOT_NAUTILUS_WHEEL_BASE_URL / DEFAULT_WHEEL_BASE_URL
-     and require {base}/manifest.json with an immutable URL, byte size and SHA-256
+     and require {base}/manifest.json with a wheel filename, byte size and SHA-256
 
 The hosted custom wheel is required on every published platform.
 Never fall back to PyPI nautilus_trader.
@@ -35,13 +35,15 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
 import urllib.parse
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 UV_VERSION = "0.11.18"
 DEFAULT_RUNTIME_PYTHON = "3.12"
@@ -55,11 +57,16 @@ ROSETTA_UNSUPPORTED = (
     "Use a native arm64 Terminal and Python, then try again. "
     "No runtime files were downloaded or changed."
 )
-# Cloudflare Bot Fight Mode returns 403 "error code: 1010" for Python-urllib/3.x
-# on macOS, Windows, and Linux.
 DOWNLOAD_USER_AGENT = (
     "Mozilla/5.0 (compatible; EdgePilot-Installer/{version}; +https://edge-pilot.rivendell.capital)"
 )
+PROGRESS_CALLBACK: Callable[[str, str, int | None, int | None], None] | None = None
+
+
+def emit(stage: str, message: str, downloaded: int | None = None, total: int | None = None) -> None:
+    print(message, flush=True)
+    if PROGRESS_CALLBACK is not None:
+        PROGRESS_CALLBACK(stage, message, downloaded, total)
 
 
 def _plugin_version() -> str:
@@ -81,7 +88,7 @@ DOWNLOAD_USER_AGENT = DOWNLOAD_USER_AGENT.format(version=_plugin_version())
 #   {base}/manifest.json
 #   {base}/nautilus_trader-<ver>-<tag>.whl
 #   {base}/SHA256SUMS
-DEFAULT_WHEEL_BASE_URL = "https://edge-pilot.rivendell.capital/runtime/nautilus_trader/1.228.0"
+DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260822"
 
 
 @dataclass(frozen=True)
@@ -116,9 +123,13 @@ def venv_edgepilot(venv: Path) -> Path:
     return venv / "bin" / "edgepilot"
 
 
-def run(cmd: list[str], *, cwd: Path | None = None) -> None:
+def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     print("+", " ".join(cmd), flush=True)
-    subprocess.run(cmd, check=True, cwd=cwd)
+    result = subprocess.run(cmd, check=False, cwd=cwd, env=env, stderr=subprocess.PIPE, text=True)
+    if result.stderr:
+        print(result.stderr, end="", flush=True)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, stderr=result.stderr)
 
 
 def macos_process_is_translated() -> bool:
@@ -186,16 +197,107 @@ def read_python_version(python_bin: Path | str) -> tuple[int, int]:
     return int(major), int(minor)
 
 
+def uv_bin_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "EdgePilot" / "bin"
+    return Path.home() / ".edgepilot" / "bin"
+
+
+def uv_environment(venv: Path) -> dict[str, str]:
+    """Keep every uv-owned path inside the EdgePilot state directory."""
+    state = venv.parent
+    overrides = {
+        "UV_CACHE_DIR": str(state / "cache" / "uv"),
+        "UV_PYTHON_INSTALL_DIR": str(state / "python"),
+        "UV_PYTHON_BIN_DIR": str(state / "bin"),
+        "UV_TOOL_BIN_DIR": str(state / "tools"),
+    }
+    env = {**os.environ, **overrides}
+    print("uv environment overrides:", flush=True)
+    for k, v in overrides.items():
+        print(f"  {k}={v}", flush=True)
+    return env
+
+
+def _uv_download_target() -> str:
+    system, arch = platform_tuple()
+    if system == "darwin":
+        return "aarch64-apple-darwin"
+    if system == "linux":
+        if arch == "x86_64":
+            return "x86_64-unknown-linux-gnu"
+        if arch in ("arm64", "aarch64"):
+            return "aarch64-unknown-linux-gnu"
+        raise SystemExit(f"unsupported Linux arch for uv download: {arch}")
+    if system == "windows":
+        return "x86_64-pc-windows-msvc"
+    raise SystemExit(f"unsupported platform for uv download: {system}/{arch}")
+
+
+def _download_uv(dest: Path) -> None:
+    target = _uv_download_target()
+    executable = "uv.exe" if os.name == "nt" else "uv"
+    ext = "zip" if os.name == "nt" else "tar.gz"
+    url = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/uv-{target}.{ext}"
+    print(f"Downloading uv {UV_VERSION} from {url}", flush=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    archive_tmp = dest.with_suffix(".dl.tmp")
+    bin_tmp = dest.with_suffix(".bin.tmp")
+    try:
+        urllib.request.urlretrieve(url, archive_tmp)
+        if ext == "tar.gz":
+            with tarfile.open(archive_tmp) as tf:
+                member = next(
+                    m for m in tf.getmembers()
+                    if m.name == executable or m.name.endswith(f"/{executable}")
+                )
+                f = tf.extractfile(member)
+                if f is None:
+                    raise SystemExit("uv binary not found in archive")
+                bin_tmp.write_bytes(f.read())
+        else:
+            with zipfile.ZipFile(archive_tmp) as zf:
+                name = next(
+                    n for n in zf.namelist()
+                    if n == executable or n.endswith(f"/{executable}")
+                )
+                bin_tmp.write_bytes(zf.read(name))
+        bin_tmp.chmod(0o755)
+        result = subprocess.run([str(bin_tmp), "--version"], capture_output=True)
+        if result.returncode != 0:
+            raise SystemExit(f"uv binary verification failed (exit {result.returncode})")
+        os.replace(bin_tmp, dest)
+    finally:
+        archive_tmp.unlink(missing_ok=True)
+        bin_tmp.unlink(missing_ok=True)
+
+
 def find_uv() -> str | None:
-    return shutil.which("uv")
+    executable = "uv.exe" if os.name == "nt" else "uv"
+    cached = uv_bin_dir() / executable
+    print(f"find_uv: checking {cached}", flush=True)
+    if cached.is_file():
+        print(f"find_uv: using cached {cached}", flush=True)
+        return str(cached)
+    environment_uv = Path(sys.executable).parent / executable
+    print(f"find_uv: checking {environment_uv}", flush=True)
+    if environment_uv.is_file():
+        print(f"find_uv: using venv-local {environment_uv}", flush=True)
+        return str(environment_uv)
+    which_result = shutil.which("uv")
+    print(f"find_uv: PATH search -> {which_result!r}", flush=True)
+    return which_result
 
 
 def ensure_uv() -> str:
     uv = find_uv()
     if uv:
+        ver = subprocess.run([uv, "--version"], capture_output=True, text=True)
+        print(f"uv ready: {uv} ({ver.stdout.strip()})", flush=True)
         return uv
-    print(f"uv not found; installing uv=={UV_VERSION} via pip", flush=True)
-    run([sys.executable, "-m", "pip", "install", f"uv=={UV_VERSION}"])
+    dest = uv_bin_dir() / ("uv.exe" if os.name == "nt" else "uv")
+    _download_uv(dest)
     uv = find_uv()
     if not uv:
         raise SystemExit("uv installation failed; install uv manually")
@@ -228,9 +330,10 @@ def resolve_runtime_python(
     return DEFAULT_RUNTIME_PYTHON
 
 
-def ensure_venv(uv: str, venv: Path, python_version: str) -> Path:
+def ensure_venv(uv: str, venv: Path, python_version: str, *, env: dict[str, str] | None = None) -> Path:
     py = venv_python(venv)
     required = python_version_tuple(python_version)
+    print(f"ensure_venv: venv={venv} python={python_version}", flush=True)
     if py.is_file():
         existing = read_python_version(py)
         if existing != required:
@@ -239,12 +342,14 @@ def ensure_venv(uv: str, venv: Path, python_version: str) -> Path:
                 f"but runtime requires {python_version}; "
                 f"remove {venv} or pass --venv with a fresh path",
             )
+        print(f"ensure_venv: existing venv OK (Python {existing[0]}.{existing[1]})", flush=True)
         return py
 
     venv.parent.mkdir(parents=True, exist_ok=True)
-    run([uv, "python", "install", python_version])
-    # uv venv omits pip unless seeded; later steps call python -m pip.
-    run([uv, "venv", "--relocatable", "--seed", "--python", python_version, str(venv)])
+    run([uv, "python", "install", python_version], env=env)
+    # Keep pip available for operator diagnostics; installs use uv so generated
+    # entry points remain relocatable with the candidate environment.
+    run([uv, "venv", "--relocatable", "--seed", "--python", python_version, str(venv)], env=env)
     if not py.is_file():
         raise SystemExit(f"venv python missing: {py}")
     return py
@@ -282,8 +387,10 @@ def select_from_manifest(manifest: dict[str, Any], version: str, manifest_url: s
 
     matches: list[dict[str, Any]] = []
     for item in wheels:
-        if not isinstance(item, dict) or set(item) != {"filename", "url", "bytes", "sha256", "python", "os", "arch"}:
+        if not isinstance(item, dict) or set(item) != {"filename", "bytes", "sha256", "python", "os", "arch", "live"}:
             raise SystemExit("runtime manifest wheel schema is invalid")
+        if item.get("live") is not True:
+            continue
         if item.get("os") != os_name:
             continue
         if item.get("arch") != arch:
@@ -292,7 +399,7 @@ def select_from_manifest(manifest: dict[str, Any], version: str, manifest_url: s
         python_tag = item.get("python")
         if not isinstance(python_tag, str) or not python_tag:
             python_tag = python_tag_from_wheel_name(str(filename))
-        if isinstance(filename, str) and filename.endswith(".whl") and version in filename:
+        if isinstance(filename, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.whl", filename) and version in filename:
             matches.append(item)
 
     if not matches:
@@ -306,14 +413,13 @@ def select_from_manifest(manifest: dict[str, Any], version: str, manifest_url: s
 
     item = matches[0]
     filename = str(item["filename"])
-    python_tag = str(item["python"]); digest = item["sha256"]; byte_count = item["bytes"]; url = item["url"]
-    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)) or not isinstance(byte_count, int) or byte_count <= 0 or not isinstance(url, str):
+    python_tag = str(item["python"]); digest = item["sha256"]; byte_count = item["bytes"]
+    if not re.fullmatch(r"[0-9a-f]{64}", str(digest)) or not isinstance(byte_count, int) or byte_count <= 0:
         raise SystemExit("runtime manifest wheel integrity fields are invalid")
-    parsed, manifest_origin = urllib.parse.urlsplit(url), urllib.parse.urlsplit(manifest_url)
-    if parsed.scheme != "https" or parsed.netloc != manifest_origin.netloc or parsed.username or parsed.password or parsed.query or parsed.fragment:
-        raise SystemExit("runtime manifest wheel URL must be credential-free same-origin HTTPS")
-    if urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1]) != filename or f"/{digest}/" not in parsed.path:
-        raise SystemExit("runtime manifest wheel URL is not content-addressed")
+    manifest = urllib.parse.urlsplit(manifest_url)
+    if manifest.scheme != "https" or not manifest.netloc or manifest.username or manifest.password or manifest.query or manifest.fragment:
+        raise SystemExit("runtime manifest URL must be credential-free HTTPS")
+    url = urllib.parse.urljoin(manifest_url, urllib.parse.quote(filename, safe=""))
     return WheelSelection(
         filename=filename,
         python_tag=python_tag,
@@ -358,15 +464,18 @@ def download_wheel(url: str, dest: Path, expected_sha256: str, expected_bytes: i
     if dest.is_file() and (expected_bytes is None or dest.stat().st_size == expected_bytes) and sha256_file(dest) == expected_sha256:
         print(f"using verified cached wheel {dest}", flush=True)
         return dest
-    print(f"downloading {url}", flush=True)
+    emit("downloading", f"Downloading {url}", 0, expected_bytes)
     tmp = dest.with_suffix(dest.suffix + ".partial")
     try:
         with urllib.request.urlopen(http_request(url), timeout=300) as response, tmp.open("wb") as handle:
+            downloaded = 0
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 handle.write(chunk)
+                downloaded += len(chunk)
+                emit("downloading", "Downloading locked EdgePilot runtime", downloaded, expected_bytes)
         tmp.replace(dest)
     except urllib.error.HTTPError as exc:
         if tmp.exists():
@@ -412,20 +521,43 @@ def materialize_wheel(selection: WheelSelection, cache_dir: Path) -> Path:
     return download_wheel(selection.url, cache_dir / selection.sha256 / selection.filename, selection.sha256, selection.bytes)
 
 
-def install_wheel(venv_py: Path, wheel: Path) -> None:
+def pending_download_bytes(selection: WheelSelection, cache_dir: Path) -> int | None:
+    """Return network bytes needed now, excluding local and verified cached wheels."""
+    if selection.local_path is not None:
+        return 0
+    if selection.bytes is None or not selection.sha256:
+        return None
+    cached = cache_dir / selection.sha256 / selection.filename
+    if cached.is_file() and cached.stat().st_size == selection.bytes and sha256_file(cached) == selection.sha256:
+        return 0
+    return selection.bytes
+
+
+def install_wheel(uv: str, venv_py: Path, wheel: Path, *, env: dict[str, str] | None = None) -> None:
     print(f"installing nautilus_trader from {wheel}", flush=True)
-    run([str(venv_py), "-m", "pip", "install", "--force-reinstall", "--no-deps", str(wheel)])
+    run([uv, "pip", "install", "--python", str(venv_py), "--force-reinstall", "--no-deps", str(wheel)], env=env)
 
 
-def install_plugin(venv_py: Path, plugin_root: Path) -> None:
+def install_plugin(uv: str, venv_py: Path, plugin_root: Path, *, env: dict[str, str] | None = None) -> None:
     print(f"installing EdgePilot from {plugin_root}", flush=True)
-    core = plugin_root / "backtest_core_src"
-    if not (core / "edgepilot_backtest_core" / "__init__.py").is_file():
-        raise SystemExit(f"bundled backtest core missing: {core}")
     # The custom Nautilus wheel is already installed at the exact version pinned by
     # pyproject.toml, so dependency resolution keeps it and installs the remaining
     # Nautilus and EdgePilot dependencies into a fresh user runtime.
-    run([str(venv_py), "-m", "pip", "install", "-e", str(plugin_root)])
+    bundled_core = plugin_root / "core_src" / "edgepilot_core" / "__init__.py"
+    if bundled_core.is_file():
+        run([uv, "pip", "install", "--python", str(venv_py), "-e", str(plugin_root)], env=env)
+        return
+
+    repository_core = plugin_root.parent / "edgepilot-core"
+    repository_package = repository_core / "src" / "edgepilot_core" / "__init__.py"
+    if repository_package.is_file():
+        run([uv, "pip", "install", "--python", str(venv_py), "-e", str(plugin_root)], env=env)
+        return
+
+    raise SystemExit(
+        "shared core missing: checked bundled "
+        f"{bundled_core.parent} and repository {repository_package.parent}"
+    )
 
 
 def runtime_state_path(venv: Path) -> Path:
@@ -469,7 +601,7 @@ def activate_candidate(candidate: Path, active: Path) -> Path | None:
 
 def verify(venv_py: Path, venv: Path) -> None:
     code = (
-        "import edgepilot, edgepilot_backtest_core, nautilus_trader; "
+        "import edgepilot, edgepilot_core, nautilus_trader; "
         "import nautilus_trader.adapters.bitget, nautilus_trader.adapters.gateio; "
         "print(f'edgepilot={edgepilot.__file__}'); "
         "print(f'nautilus_trader={nautilus_trader.__file__}'); "
@@ -512,6 +644,7 @@ def main(argv: list[str] | None = None) -> int:
     # Reject unsupported Mac hardware before resolving a hosted or explicitly
     # supplied wheel. This keeps the product boundary consistent and guarantees
     # that the failure happens before network access or runtime-state writes.
+    emit("preparing", "Checking platform, runtime version, and installation path")
     platform_tuple()
 
     version = read_pinned_nautilus_version(plugin_root)
@@ -535,25 +668,30 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     runtime_python = resolve_runtime_python(wheel=wheel_selection, override=args.python)
-    print(f"runtime python: {runtime_python}", flush=True)
-
     uv = ensure_uv()
     venv = (args.venv or default_venv_dir()).expanduser().resolve()
+    uv_env = uv_environment(venv)
+    cache = venv.parent / "cache" / "wheels"
+    download_total = pending_download_bytes(wheel_selection, cache)
+    emit("preparing", f"Runtime Python: {runtime_python}", 0, download_total)
     candidate = venv.with_name(f".{venv.name}.candidate-{os.getpid()}")
     if candidate.exists():
         shutil.rmtree(candidate)
     try:
-        venv_py = ensure_venv(uv, candidate, runtime_python)
-        run([str(venv_py), "-m", "pip", "install", "--upgrade", "pip"])
+        emit("installing", "Creating the isolated EdgePilot runtime", 0, download_total)
+        venv_py = ensure_venv(uv, candidate, runtime_python, env=uv_env)
 
-        cache = venv.parent / "cache" / "wheels"
         wheel_path = materialize_wheel(wheel_selection, cache)
-        install_wheel(venv_py, wheel_path)
+        downloaded = download_total if download_total is not None else None
+        emit("verifying", "Verifying the runtime wheel", downloaded, download_total)
+        install_wheel(uv, venv_py, wheel_path, env=uv_env)
 
-        install_plugin(venv_py, plugin_root)
-        run([str(venv_py), "-m", "pip", "check"])
+        emit("installing", "Installing EdgePilot and locked runtime dependencies", downloaded, download_total)
+        install_plugin(uv, venv_py, plugin_root, env=uv_env)
+        run([uv, "pip", "check", "--python", str(venv_py)], env=uv_env)
         verify(venv_py, candidate)
         activate_candidate(candidate, venv)
+        emit("ready", "EdgePilot runtime is ready", downloaded, download_total)
     finally:
         if candidate.exists():
             shutil.rmtree(candidate)

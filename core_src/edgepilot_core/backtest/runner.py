@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 import json
-from pathlib import Path
 import os
+from pathlib import Path
 import shutil
+import subprocess
 from typing import Any, Callable
 
 from nautilus_trader.analysis import MaxDrawdown
@@ -15,9 +16,9 @@ from nautilus_trader.config import ImportableStrategyConfig, LoggingConfig
 from nautilus_trader.model.data import Bar
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
-from edgepilot_backtest_core.metrics import collect_metrics
-from edgepilot_backtest_core.models import BacktestRequest, MarketRequest, VenueRequest
-from edgepilot_backtest_core.presets import public_adapter_options, resolve_strategy_parameters
+from edgepilot_core.backtest.metrics import collect_metrics
+from edgepilot_core.backtest.models import BacktestRequest, MarketRequest, VenueRequest
+from edgepilot_core.backtest.presets import public_adapter_options, resolve_strategy_parameters
 
 
 ReportExporter = Callable[..., None]
@@ -106,6 +107,7 @@ def execute_local_backtest(
         metrics = collect_metrics(
             engine, base_currency=request.venues[0].base_currency,
             starting_balance=starting_balance,
+            start=request.start, end=request.end,
         )
         record = _run_record(request, run_id, parameters, fees, metrics)
         (run_dir / "run.json").write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
@@ -134,9 +136,10 @@ def _prepare_fee_override_catalog(
 ) -> None:
     """Build a tiny writable catalog for fee overrides without copying bar data.
 
-    Only known read-only kinds (``bar``) are symlinked. Every other ``data/*``
-    entry is copied so ``_resolve_instrument_fees`` cannot write through to the
-    shared catalog when the instrument layout is unfamiliar.
+    Known read-only directory kinds (``bar``) are symlinked on POSIX and joined
+    on Windows. Every other ``data/*`` entry is copied so
+    ``_resolve_instrument_fees`` cannot write through to the shared catalog when
+    the instrument layout is unfamiliar.
     """
     if target.exists():
         shutil.rmtree(target)
@@ -149,14 +152,11 @@ def _prepare_fee_override_catalog(
 
     for child in src_data.iterdir():
         dest = dst_data / child.name
-        if child.name in _READ_ONLY_DATA_KINDS and os.name != "nt":
-            dest.symlink_to(child.resolve())
-            continue
         if child.name in _READ_ONLY_DATA_KINDS:
-            if child.is_dir():
-                shutil.copytree(child, dest, symlinks=False)
+            if os.name == "nt" and child.is_dir():
+                _create_windows_junction(child.resolve(), dest)
             else:
-                shutil.copy2(child, dest, follow_symlinks=True)
+                dest.symlink_to(child.resolve(), target_is_directory=child.is_dir())
             continue
         _copy_writable_data_kind(child, dest, instrument_ids)
 
@@ -168,6 +168,20 @@ def _prepare_fee_override_catalog(
             shutil.copytree(child, dest, symlinks=False)
         elif child.is_file() or child.is_symlink():
             shutil.copy2(child, dest, follow_symlinks=True)
+
+
+def _create_windows_junction(source: Path, target: Path) -> None:
+    """Create a directory junction without requiring symlink privileges."""
+    try:
+        subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(target), str(source)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        detail = getattr(exc, "stderr", None) or str(exc)
+        raise RuntimeError(f"Could not create bar catalog junction {target}: {detail.strip()}") from exc
 
 
 def _copy_writable_data_kind(src: Path, dest: Path, instrument_ids: set[str]) -> None:

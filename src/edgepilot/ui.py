@@ -11,30 +11,37 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import secrets
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from edgepilot.discovery import discover_execution_adapters, resolve_adapter, resolve_strategy, strategies_root, strategy_names
-from edgepilot.environment import credential_requirements, load_env
+from edgepilot.dashboard_common import ConfigConflictError
+from edgepilot.dashboard_common import safe_config_name
+from edgepilot.dashboard_common import safe_directory
+from edgepilot.env_file import load_env
 from edgepilot.marketplace import MarketplaceRequestError, install_package
-from edgepilot.models import MarketRequest
-from edgepilot.catalog import parse_time
 from edgepilot.paths import state_root
 from edgepilot.paths import find_run_directory
 from edgepilot.paths import iter_run_directories
 from edgepilot.paths import strategy_runs_path
-from edgepilot.presets import load_preset, preset_backtest_values, preset_markets, preset_names, preset_strategy_values, preset_venues, resolve_strategy_parameters
-from edgepilot.trading import request_emergency_stop, running_runs
+from edgepilot.paths import strategies_state_root
+from edgepilot.run_state import request_emergency_stop
+from edgepilot.run_state import load_execution
+from edgepilot.run_state import running_runs
+from edgepilot.run_state import run_status
 from edgepilot.app_logging import configure_logging
 from edgepilot.locale import SUPPORTED_LANGUAGES, normalize_supported_locale
 from edgepilot import auth
+
+
+def parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed).astimezone(timezone.utc)
 
 
 ASSETS = Path(__file__).with_name("ui_assets")
@@ -43,17 +50,7 @@ CATALOG_ROOT = STATE / "catalog"
 CATALOG = CATALOG_ROOT / "data"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = Lock()
-LOCAL_LOGINS: dict[str, dict[str, Any]] = {}
-LOCAL_LOGINS_LOCK = Lock()
-
-
-def _prune_local_logins(now: float | None = None) -> None:
-    current = time.time() if now is None else now
-    with LOCAL_LOGINS_LOCK:
-        expired = [key for key, item in LOCAL_LOGINS.items() if current - item["created_at"] > 660 or
-                   item.get("completed_at") and current - item["completed_at"] > 60]
-        for key in expired:
-            LOCAL_LOGINS.pop(key, None)
+RUNTIME_INSTALL_LOCK = Lock()
 
 # The dashboard process launches child CLI commands, so it needs the same
 # local-only environment values as the CLI itself. Values never leave this
@@ -62,8 +59,69 @@ load_env(STATE / ".env")
 LOGGER = configure_logging()
 
 
-class ConfigConflictError(ValueError):
-    """Raised when a user configuration would overwrite protected state."""
+def _run_login_worker(started: dict[str, Any]) -> None:
+    def poll() -> None:
+        try:
+            auth.poll_login(started)
+        except auth.AuthError as exc:
+            LOGGER.warning("dashboard login failed", extra={"event": "dashboard.auth.login_failed", "result": "failed",
+                           "params": {"code": str(exc), "stage": exc.stage or "unknown", **exc.diagnostics}})
+
+    Thread(target=poll, daemon=True).start()
+
+
+def _plugin_environment() -> dict[str, str]:
+    from edgepilot.runtime import plugin_root
+    root = plugin_root()
+    core = root / "core_src"
+    if not core.is_dir():
+        core = root.parent / "edgepilot-core" / "src"
+    environment = dict(os.environ)
+    python_path = [str(root / "src"), str(core)]
+    if environment.get("PYTHONPATH"):
+        python_path.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(python_path)
+    return environment
+
+
+def _runtime_dashboard_call(operation: str, payload: dict[str, Any]) -> Any:
+    """Execute Nautilus-dependent Dashboard work in the locked runtime."""
+    from edgepilot.runtime import active_runtime_python
+
+    completed = subprocess.run(
+        [str(active_runtime_python()), "-m", "edgepilot.dashboard_worker"],
+        input=json.dumps({"operation": operation, "payload": payload}, separators=(",", ":")),
+        cwd=STATE,
+        env=_plugin_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    try:
+        response = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        LOGGER.error(
+            "Dashboard runtime worker returned invalid output",
+            extra={"event": "dashboard.runtime_worker.failed", "result": "failed", "params": {"operation": operation, "returncode": completed.returncode}},
+        )
+        raise RuntimeError("Dashboard runtime worker returned an invalid response") from error
+    if completed.returncode != 0 or not isinstance(response, dict) or response.get("ok") is not True:
+        failure = response.get("error") if isinstance(response, dict) else None
+        error_type = failure.get("type") if isinstance(failure, dict) else None
+        message = failure.get("message") if isinstance(failure, dict) else None
+        message = str(message or "Dashboard runtime operation failed")
+        if error_type == "FileNotFoundError":
+            raise FileNotFoundError(message)
+        if error_type == "ConfigConflictError":
+            raise ConfigConflictError(message)
+        if error_type in {"ValueError", "TypeError", "ModuleNotFoundError"}:
+            raise ValueError(message)
+        raise RuntimeError(message)
+    return response.get("result")
 
 
 def _json(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
@@ -89,6 +147,8 @@ _MARKETPLACE_ERROR_RESPONSES = {
     "INSUFFICIENT_SCOPE": (403, "permission to use recommendations is required"),
     "CATALOG_COVERAGE_INSUFFICIENT": (409, "the strategy catalog cannot provide three compatible recommendations"),
     "RATE_LIMITED": (429, "too many recommendation requests; try again later"),
+    "DOWNLOAD_QUOTA_EXCEEDED": (429, "strategy download quota exceeded"),
+    "DOWNLOAD_QUOTA_UNAVAILABLE": (503, "strategy download quota service is unavailable"),
     "SERVICE_UNAVAILABLE": (503, "the recommendation service is unavailable"),
     "AUTH_SERVICE_UNAVAILABLE": (503, "the authentication service is unavailable"),
 }
@@ -97,11 +157,16 @@ _MARKETPLACE_ERROR_RESPONSES = {
 def _marketplace_request_error(handler: BaseHTTPRequestHandler, exc: MarketplaceRequestError) -> None:
     status, message = _MARKETPLACE_ERROR_RESPONSES.get(exc.code, (500, "the recommendation request failed"))
     code = exc.code if exc.code in _MARKETPLACE_ERROR_RESPONSES else "INTERNAL_ERROR"
-    _error(handler, code, message, status, retryable=exc.retryable)
+    _error(handler, code, message, status, **exc.public_details())
 
 
 def _dashboard_config(language: str | None) -> dict[str, Any]:
-    return {"language": normalize_supported_locale(language), "supported_languages": list(SUPPORTED_LANGUAGES)}
+    from edgepilot.runtime import runtime_install_info, runtime_status
+    runtime = runtime_status()
+    if not runtime.get("installed"):
+        try: runtime.update(runtime_install_info())
+        except Exception as error: runtime["unavailable_reason"] = str(error)
+    return {"language": normalize_supported_locale(language), "supported_languages": list(SUPPORTED_LANGUAGES), "runtime": runtime}
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -114,10 +179,19 @@ def _read_json(path: Path, default: Any) -> Any:
 def _run_records() -> list[dict[str, Any]]:
     records = []
     for path in sorted(iter_run_directories(), reverse=True):
-        record = _read_json(path / "run.json", {})
+        record = _read_json(path / "run.json", None)
+        if not isinstance(record, dict):
+            LOGGER.warning(
+                "invalid local run skipped",
+                extra={"event": "dashboard.run.invalid", "result": "skipped", "params": {"run_id": path.name}},
+            )
+            continue
         record["run_id"] = path.name
         active = running_runs(path.parent)
-        record["status"] = "RUNNING" if path.name in active else ("COMPLETE" if record.get("mode") == "backtest" else "STOPPED")
+        record["status"] = run_status(path.parent, path.name, record.get("mode"), active=active)
+        execution = load_execution(path.parent, path.name)
+        if execution:
+            record["execution"] = execution
         records.append(record)
     return records
 
@@ -168,15 +242,22 @@ def _strategy_content(package: Path, internal_name: str, locale: str) -> dict[st
 
 def _strategy_records(locale: str = "en") -> list[dict[str, Any]]:
     """Describe strategy packages without exposing implementation paths."""
-    return [
-        ({
-            "name": name,
-            "presets": preset_names(resolve_strategy(name)),
-            "source": "marketplace" if (strategies_root() / name / ".marketplace.json").exists() else "local",
-            "marketplace": _read_json(strategies_root() / name / ".marketplace.json", None),
-        } | _strategy_content(strategies_root() / name, name, locale))
-        for name in strategy_names()
-    ]
+    root = strategies_state_root()
+    if not root.is_dir(): return []
+    records = []
+    for package in sorted(root.iterdir()):
+        if not package.is_dir() or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", package.name): continue
+        try:
+            marketplace = _read_json(package / ".marketplace.json", None)
+            presets = sorted(path.stem for path in (package / "configs").glob("*.json")) if (package / "configs").is_dir() else []
+            records.append({"name": package.name, "presets": presets, "source": "marketplace" if marketplace else "local",
+                            "marketplace": marketplace} | _strategy_content(package, package.name, locale))
+        except OSError:
+            LOGGER.warning(
+                "unreadable local strategy skipped",
+                extra={"event": "dashboard.strategy.invalid", "result": "skipped", "params": {"strategy": package.name}},
+            )
+    return records
 
 
 def _catalog_records() -> list[dict[str, Any]]:
@@ -198,84 +279,13 @@ def _catalog_records() -> list[dict[str, Any]]:
     return records
 
 
-def _credential_venues() -> list[str]:
-    """Return native venues the dashboard can configure without exposing keys."""
-    venues = []
-    for adapter in discover_execution_adapters():
-        try:
-            if any(credential_requirements(adapter, mode) for mode in ("demo", "live")):
-                venues.append(adapter.name)
-        except (ImportError, ValueError, TypeError, AttributeError) as exc:
-            LOGGER.debug(
-                "credential adapter skipped",
-                extra={"event": "credentials.adapter.skipped", "params": {"adapter": adapter.name, "error": type(exc).__name__}},
-            )
-    return sorted(set(venues))
-
-
-def _credential_records() -> list[dict[str, Any]]:
-    records = []
-    for venue in _credential_venues():
-        try:
-            adapter = resolve_adapter(venue)
-        except (ImportError, ValueError):
-            continue
-        records.append({
-            "venue": adapter.name,
-            "modes": {
-                mode: credential_requirements(adapter, mode)
-                for mode in ("paper", "demo", "live")
-            },
-        })
-    return records
-
-
-def _save_credentials(payload: dict[str, Any]) -> dict[str, Any]:
-    venue = str(payload.get("venue", "")).strip().upper()
-    mode = str(payload.get("mode", "")).strip().lower()
-    submitted = payload.get("values", {})
-    if venue not in _credential_venues() or mode not in {"paper", "demo", "live"}:
-        raise ValueError("unknown venue or credential mode")
-    if not isinstance(submitted, dict):
-        raise ValueError("credential values must be an object")
-    adapter = resolve_adapter(venue)
-    requirements = credential_requirements(adapter, mode)
-    permitted = {item["field"]: item["environment_variable"] for item in requirements}
-    updates: dict[str, str] = {}
-    for field, value in submitted.items():
-        if field not in permitted:
-            raise ValueError(f"unsupported credential field: {field}")
-        if not isinstance(value, str):
-            raise ValueError("credential values must be text")
-        if "\n" in value or "\r" in value:
-            raise ValueError("credential values cannot contain new lines")
-        if value:
-            updates[permitted[field]] = value
-    if not updates:
-        raise ValueError("enter at least one credential value to save")
-    env_path = STATE / ".env"
-    existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-    retained = [
-        line for line in existing
-        if not any(line.lstrip().removeprefix("export ").lstrip().startswith(f"{name}=") for name in updates)
-    ]
-    retained.extend(f"{name}={value}" for name, value in updates.items())
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(retained).rstrip() + "\n", encoding="utf-8")
-    try:
-        env_path.chmod(0o600)
-    except OSError:
-        pass
-    os.environ.update(updates)
-    return {"venue": adapter.name, "mode": mode, "saved_fields": sorted(submitted)}
-
-
 def _job_view(job: dict[str, Any]) -> dict[str, Any]:
     """Return only serializable, safe job fields to the browser."""
     return {key: value for key, value in job.items() if not key.startswith("_")}
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+_NAUTILUS_ERROR_RE = re.compile(r"^\[ERROR\]\s+\S+:\s+(.+)$")
 
 
 def _strip_ansi(text: str) -> str:
@@ -285,16 +295,55 @@ def _strip_ansi(text: str) -> str:
 
 def _job_error(output: str, returncode: int) -> str:
     """Extract the CLI's user-facing error without exposing arbitrary logs."""
+    nautilus_error: str | None = None
     for line in reversed(_strip_ansi(output).splitlines()):
         message = line.strip()
         if message.lower().startswith("error:"):
             detail = message.split(":", 1)[1].strip()
             if detail:
                 return detail
+        if nautilus_error is None:
+            m = _NAUTILUS_ERROR_RE.match(message)
+            if m:
+                nautilus_error = m.group(1).strip()
+    if nautilus_error:
+        return nautilus_error
     return f"Process exited with code {returncode}"
 
 
-def _start_job(*, kind: str, command: list[str]) -> str:
+def _job_run_id(output: str) -> str | None:
+    """Extract the run identifier emitted by both JSON and trading commands."""
+    match = re.search(r'"run_id"\s*:\s*"([^"\r\n]+)"', output)
+    if match:
+        return match.group(1)
+    match = re.search(r"(?m)^Run:\s*([^\s]+)\s*$", _strip_ansi(output))
+    return match.group(1) if match else None
+
+
+def _prestart_failure_message(phase: str) -> str:
+    if phase == "runtime_prepare":
+        return "运行环境安装失败，可安全重试；推荐和历史结果不受影响。"
+    if phase == "command_resolution":
+        return "策略或配置解析失败，请检查所选策略和配置后重试。"
+    return "任务进程启动失败，请检查本地运行环境后重试。"
+
+
+def _execution_failure_message(kind: str) -> str:
+    if kind == "backtest":
+        return "回测执行失败；可查看任务输出后重试。"
+    if kind == "data":
+        return "数据下载失败；可查看任务输出后重试。"
+    return "交易任务执行失败；可查看任务输出后重试。"
+
+
+def _start_job(
+    *,
+    kind: str,
+    command: list[str] | Callable[[], list[str]] | None,
+    prepare: Callable[[str], None] | None = None,
+    starting_stage: str = "starting",
+    starting_message: str = "启动任务",
+) -> str:
     job_id = f"job-{__import__('datetime').datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     with JOBS_LOCK:
         JOBS[job_id] = {
@@ -304,24 +353,90 @@ def _start_job(*, kind: str, command: list[str]) -> str:
             "output": "",
             "run_id": None,
             "error": None,
+            "stage": "preparing",
+            "message": "准备运行环境" if prepare else "等待启动",
+            "downloaded_bytes": 0,
+            "total_bytes": None,
+            "percent": None,
         }
 
     def run_process() -> None:
-        LOGGER.info("job started", extra={"event": "dashboard.job.started", "job_id": job_id, "params": {"kind": kind, "command": command[:4]}})
+        LOGGER.info("job started", extra={"event": "dashboard.job.started", "job_id": job_id, "params": {"kind": kind}})
         with JOBS_LOCK:
             JOBS[job_id]["status"] = "RUNNING"
+        phase = "runtime_prepare" if prepare is not None else "command_resolution"
+        try:
+            if prepare is not None:
+                prepare(job_id)
+            phase = "command_resolution"
+            actual_command = command() if callable(command) else command
+            with JOBS_LOCK:
+                JOBS[job_id].update(stage=starting_stage, message=starting_message, percent=100)
+        except BaseException as error:
+            with JOBS_LOCK:
+                JOBS[job_id].update(
+                    status="FAILED",
+                    stage="failed",
+                    message=_prestart_failure_message(phase),
+                    error=str(error),
+                    returncode=None,
+                )
+            LOGGER.exception(
+                "job failed before process start",
+                extra={
+                    "event": "dashboard.job.failed",
+                    "job_id": job_id,
+                    "result": "failed",
+                    "params": {"kind": kind, "phase": phase},
+                },
+            )
+            return
+        if actual_command is None:
+            with JOBS_LOCK:
+                JOBS[job_id].update(
+                    status="COMPLETE",
+                    stage="complete",
+                    message=starting_message,
+                    returncode=0,
+                )
+            LOGGER.info(
+                "job completed",
+                extra={"event": "dashboard.job.completed", "job_id": job_id, "result": "success", "params": {"kind": kind, "returncode": 0}},
+            )
+            return
         STATE.mkdir(parents=True, exist_ok=True)
-        process = subprocess.Popen(
-            command,
-            cwd=str(STATE),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            # Nautilus logs are UTF-8 with ANSI. Chinese Windows defaults to GBK.
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+        try:
+            process = subprocess.Popen(
+                actual_command,
+                cwd=str(STATE),
+                env=_plugin_environment(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                # Nautilus logs are UTF-8 with ANSI. Chinese Windows defaults to GBK.
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except Exception as error:
+            with JOBS_LOCK:
+                JOBS[job_id].update(
+                    status="FAILED",
+                    stage="failed",
+                    message=_prestart_failure_message("process_start"),
+                    error=str(error) or "Process could not start",
+                    returncode=None,
+                )
+            LOGGER.exception(
+                "job process could not start",
+                extra={
+                    "event": "dashboard.job.failed",
+                    "job_id": job_id,
+                    "result": "failed",
+                    "params": {"kind": kind, "phase": "process_start"},
+                },
+            )
+            return
         with JOBS_LOCK:
             JOBS[job_id]["_process"] = process
         lines: list[str] = []
@@ -334,13 +449,15 @@ def _start_job(*, kind: str, command: list[str]) -> str:
         process.stdout.close()
         returncode = process.wait()
         output = "".join(lines)
-        match = re.search(r'"run_id"\s*:\s*"([^"]+)"', output)
+        run_id = _job_run_id(output)
         with JOBS_LOCK:
             stopping = JOBS[job_id].get("status") == "STOPPING"
             JOBS[job_id].update(
                 status="STOPPED" if stopping else ("COMPLETE" if returncode == 0 else "FAILED"),
+                stage="stopped" if stopping else ("complete" if returncode == 0 else "failed"),
+                message=JOBS[job_id].get("message") if returncode == 0 or stopping else _execution_failure_message(kind),
                 output=output[-12000:],
-                run_id=match.group(1) if match else None,
+                run_id=run_id,
                 returncode=returncode,
                 error=None if returncode == 0 or stopping else _job_error(output, returncode),
             )
@@ -348,7 +465,7 @@ def _start_job(*, kind: str, command: list[str]) -> str:
         LOGGER.log(
             logging.INFO if returncode == 0 else logging.ERROR,
             "job completed",
-            extra={"event": "dashboard.job.completed" if returncode == 0 else "dashboard.job.failed", "job_id": job_id, "run_id": match.group(1) if match else None, "result": "success" if returncode == 0 else "failed", "params": {"kind": kind, "returncode": returncode}},
+            extra={"event": "dashboard.job.completed" if returncode == 0 else "dashboard.job.failed", "job_id": job_id, "run_id": run_id, "result": "success" if returncode == 0 else "failed", "params": {"kind": kind, "returncode": returncode}},
         )
 
     def worker() -> None:
@@ -379,122 +496,17 @@ def _safe_run_id(value: str) -> str:
 
 
 def _safe_directory(parent: Path, name: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,160}", name):
-        raise ValueError("invalid local item name")
-    path = (parent / name).resolve()
-    if path.parent != parent.resolve():
-        raise ValueError("invalid local path")
-    return path
+    return safe_directory(parent, name)
 
 
 def _safe_config_name(value: str) -> str:
-    if not re.fullmatch(r"[a-z][a-z0-9_-]{0,79}", value):
-        raise ValueError("configuration names use lowercase letters, numbers, underscores, and hyphens")
-    return value
-
-
-def _reject_secret_values(value: Any) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if any(fragment in str(key).lower() for fragment in ("secret", "api_key", "api_secret", "password", "passphrase", "token", "private_key")):
-                raise ValueError("credentials belong in the local .env file, not a configuration")
-            _reject_secret_values(item)
-    elif isinstance(value, list):
-        for item in value:
-            _reject_secret_values(item)
-
-
-def _without_none(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _without_none(item) for key, item in value.items() if item is not None}
-    if isinstance(value, list):
-        return [_without_none(item) for item in value]
-    return value
-
-
-def _validated_strategy_config(strategy_name: str, config_name: str, values: Any) -> tuple[Path, dict[str, Any]]:
-    strategy = resolve_strategy(strategy_name)
-    config_name = _safe_config_name(config_name)
-    if config_name == "default":
-        raise ConfigConflictError("default is a read-only recommended configuration; save it under a new name")
-    if not isinstance(values, dict):
-        raise ValueError("configuration must be a JSON object")
-    _reject_secret_values(values)
-    strategy_values = _without_none(resolve_strategy_parameters(strategy, preset_strategy_values(values)))
-    markets = preset_markets(values)
-    venues = preset_venues(values)
-    backtest = values.get("backtest", {})
-    days = backtest.get("days") if isinstance(backtest, dict) else None
-    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 5000:
-        raise ValueError("Preset backtest.days must be an integer between 1 and 5000")
-    for market in markets:
-        for key in ("instrument_id", "bar_type", "venue"):
-            if not str(market.get(key, "")).strip():
-                raise ValueError(f"Market {key} must not be empty")
-        if str(market["venue"]).upper() not in venues:
-            raise ValueError(f"Market venue is not configured: {market['venue']}")
-    directory = strategies_root() / strategy.name / "configs"
-    directory.mkdir(parents=True, exist_ok=True)
-    path = _safe_directory(directory, f"{config_name}.json")
-    snapshot = {**values, "strategy": strategy_values}
-    return path, snapshot
-
-
-def _config_bytes(values: dict[str, Any]) -> bytes:
-    return (json.dumps(values, indent=2, sort_keys=True) + "\n").encode("utf-8")
-
-
-def _create_strategy_config(strategy_name: str, config_name: str, values: Any) -> dict[str, Any]:
-    strategy = resolve_strategy(strategy_name)
-    safe_name = _safe_config_name(config_name)
-    if safe_name == "default":
-        raise ConfigConflictError("default is a read-only recommended configuration; save it under a new name")
-    existing = _safe_directory(strategies_root() / strategy.name / "configs", f"{safe_name}.json")
-    if existing.exists():
-        raise ConfigConflictError(f"configuration already exists: {config_name}")
-    path, snapshot = _validated_strategy_config(strategy_name, config_name, values)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(_config_bytes(snapshot))
-            handle.flush()
-            os.fsync(handle.fileno())
-        try:
-            os.link(temporary, path)
-        except FileExistsError as exc:
-            raise ConfigConflictError(f"configuration already exists: {config_name}") from exc
-    finally:
-        temporary.unlink(missing_ok=True)
-    return snapshot
-
-
-def _update_strategy_config(strategy_name: str, config_name: str, values: Any) -> dict[str, Any]:
-    strategy = resolve_strategy(strategy_name)
-    safe_name = _safe_config_name(config_name)
-    if safe_name == "default":
-        raise ConfigConflictError("default is a read-only recommended configuration; save it under a new name")
-    path = _safe_directory(strategies_root() / strategy.name / "configs", f"{safe_name}.json")
-    if not path.exists():
-        raise FileNotFoundError(config_name)
-    path, snapshot = _validated_strategy_config(strategy_name, config_name, values)
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(_config_bytes(snapshot))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return snapshot
+    return safe_config_name(value)
 
 
 def _delete_strategy(name: str) -> None:
     from edgepilot.marketplace import strategy_operation_lock
     with strategy_operation_lock(name):
-        path = _safe_directory(strategies_root(), name)
+        path = _safe_directory(strategies_state_root(), name)
         if not path.exists():
             raise FileNotFoundError(name)
         runs_path = path / "runs"
@@ -541,7 +553,11 @@ def _run_detail(run_id: str) -> dict[str, Any]:
     if record is None:
         raise FileNotFoundError(run_id)
     record["run_id"] = run_id
-    record["status"] = "RUNNING" if run_id in running_runs(directory.parent) else ("COMPLETE" if record.get("mode") == "backtest" else "STOPPED")
+    active = running_runs(directory.parent)
+    record["status"] = run_status(directory.parent, run_id, record.get("mode"), active=active)
+    execution = load_execution(directory.parent, run_id)
+    if execution:
+        record["execution"] = execution
     record["timeseries"] = _read_json(directory / "timeseries.json", [])
     record["market_timeseries"] = _market_timeseries(record, directory)
     record["positions"] = _csv_rows(directory / "positions.csv")
@@ -559,35 +575,17 @@ def _runtime_detail(run_id: str) -> dict[str, Any]:
     directory = find_run_directory(run_id)
     runtime = _read_json(directory / "runtime.json", {})
     runtime["run_id"] = run_id
-    runtime["status"] = "RUNNING" if run_id in running_runs(directory.parent) else "STOPPED"
+    record = _read_json(directory / "run.json", {})
+    runtime["status"] = run_status(directory.parent, run_id, record.get("mode"))
+    execution = load_execution(directory.parent, run_id)
+    if execution:
+        runtime["execution"] = execution
     return runtime
 
 
 def _market_timeseries(record: dict[str, Any], directory: Path) -> dict[str, Any]:
-    cached = _read_json(directory / "market_timeseries.json", {"markets": []})
-    if cached.get("markets"):
-        return cached
-    period = record.get("period", {})
-    if not period.get("start") or not period.get("end"):
-        return cached
-    try:
-        from edgepilot.reporting import _load_market
-
-        start = datetime.fromisoformat(str(period["start"]))
-        end = datetime.fromisoformat(str(period["end"]))
-        markets = []
-        for market in record.get("markets", []):
-            bars, _ = _load_market(STATE / "catalog", str(market["bar_type"]), start, end)
-            markets.append({
-                "instrument_id": str(market["instrument_id"]),
-                "series": json.loads(bars[["timestamp", "close"]].to_json(orient="records", date_format="iso")),
-            })
-        result = {"markets": markets}
-        if markets:
-            (directory / "market_timeseries.json").write_text(json.dumps(result), encoding="utf-8")
-        return result
-    except (KeyError, OSError, ValueError, RuntimeError):
-        return cached
+    del record
+    return _read_json(directory / "market_timeseries.json", {"markets": []})
 
 
 def _csv_rows(path: Path) -> list[dict[str, str]]:
@@ -595,6 +593,46 @@ def _csv_rows(path: Path) -> list[dict[str, str]]:
         return []
     with path.open(newline="", encoding="utf-8") as handle:
         return list(csv.DictReader(handle))
+
+
+def _runtime_prepare(payload: dict[str, Any]) -> Callable[[str], None] | None:
+    """Return the one shared delayed-runtime preparation used by Dashboard jobs."""
+    from edgepilot.runtime import runtime_status
+
+    if runtime_status().get("installed"):
+        return None
+    if payload.get("confirm_runtime") is not True:
+        raise ValueError("RUNTIME_CONFIRMATION_REQUIRED: confirm the locked EdgePilot Live runtime download")
+
+    def prepare(job_id: str) -> None:
+        from edgepilot.runtime import install_runtime
+
+        with RUNTIME_INSTALL_LOCK:
+            # Another Dashboard job may have installed the runtime while this
+            # job was queued. Never download or activate a second candidate.
+            if runtime_status().get("installed"):
+                return
+
+            def progress(stage: str, message: str, downloaded: int | None, total: int | None) -> None:
+                with JOBS_LOCK:
+                    percent = round(downloaded * 100 / total, 1) if downloaded is not None and total else None
+                    JOBS[job_id].update(stage=stage, message=message, downloaded_bytes=downloaded or 0, total_bytes=total, percent=percent)
+
+            install_runtime(progress)
+
+    return prepare
+
+
+def _start_runtime_install(payload: dict[str, Any]) -> str:
+    if set(payload) != {"confirm_runtime"} or payload.get("confirm_runtime") is not True:
+        raise ValueError("runtime installation requires only confirm_runtime=true")
+    return _start_job(
+        kind="runtime",
+        command=None,
+        prepare=_runtime_prepare(payload),
+        starting_stage="complete",
+        starting_message="运行环境安装完成",
+    )
 
 
 def _start_backtest(payload: dict[str, Any]) -> str:
@@ -605,32 +643,34 @@ def _start_backtest(payload: dict[str, Any]) -> str:
     strategy_name = str(payload.get("strategy", "")).strip()
     if not strategy_name:
         raise ValueError("strategy is required")
-    strategy = resolve_strategy(strategy_name)
     preset = _safe_config_name(str(payload.get("preset", "")).strip())
-    if preset not in preset_names(strategy):
-        raise ValueError(f"unknown preset: {preset}")
-    _, values = load_preset(strategy, preset)
-    backtest = preset_backtest_values(values)
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=min(int(backtest.get("days", 365)), 90))
-    if not bool(backtest.get("download", True)):
-        from edgepilot.backtest import CatalogDataRequiredError, missing_catalog_requirements
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", strategy_name):
+        raise ValueError("invalid strategy")
+    from edgepilot.runtime import active_runtime_python
+    allowed = {"strategy", "preset", "confirm_runtime"} if "confirm_runtime" in payload else {"strategy", "preset"}
+    if set(payload) != allowed:
+        raise ValueError("backtests accept strategy, preset, and optional confirm_runtime")
+    prepare = _runtime_prepare(payload)
 
-        markets = tuple(MarketRequest(
-            instrument_id=str(item["instrument_id"]),
-            bar_type=str(item["bar_type"]),
-            venue=str(item["venue"]).upper(),
-            data_type=str(item.get("data_type", "bars")),
-        ) for item in preset_markets(values))
-        requirements = missing_catalog_requirements(CATALOG_ROOT, markets, start, end)
-        if requirements:
-            raise CatalogDataRequiredError(CATALOG_ROOT, requirements)
-    command = [sys.executable, "-m", "edgepilot.cli", "backtest", strategy.name]
-    command.extend(["--preset", preset, "--start", start.isoformat(), "--end", end.isoformat()])
-    return _start_job(kind="backtest", command=command)
+    def command() -> list[str]:
+        prepared = _runtime_dashboard_call("prepare_backtest", {
+            "strategy": strategy_name,
+            "preset": preset,
+        })
+        return [str(active_runtime_python()), "-m", "edgepilot.cli", "backtest", prepared["strategy"],
+                "--preset", prepared["preset"], "--start", prepared["start"], "--end", prepared["end"]]
+    return _start_job(
+        kind="backtest",
+        command=command,
+        prepare=prepare,
+        starting_stage="starting_backtest",
+        starting_message="启动回测",
+    )
 
 
 def _start_data_pull(payload: dict[str, Any]) -> str:
+    from edgepilot.runtime import active_runtime_python
+
     venue = str(payload.get("venue", "")).strip().upper()
     instrument = str(payload.get("instrument", "")).strip()
     data_type = str(payload.get("data_type", "bars"))
@@ -638,9 +678,9 @@ def _start_data_pull(payload: dict[str, Any]) -> str:
         raise ValueError("venue and instrument are required")
     if data_type not in {"bars", "trades", "quotes", "order-book-depth", "order-book-deltas"}:
         raise ValueError("unsupported data type")
-    command = [sys.executable, "-m", "edgepilot.cli", "data", "pull", "--venue", venue, "--instrument", instrument, "--data-type", data_type]
+    arguments = ["-m", "edgepilot.cli", "data", "pull", "--venue", venue, "--instrument", instrument, "--data-type", data_type]
     if data_type == "bars":
-        command.extend(["--bar-type", str(payload.get("bar_type") or "1-HOUR-LAST-EXTERNAL")])
+        arguments.extend(["--bar-type", str(payload.get("bar_type") or "1-HOUR-LAST-EXTERNAL")])
     start_text = str(payload.get("start", "")).strip()
     end_text = str(payload.get("end", "")).strip()
     if start_text or end_text:
@@ -649,12 +689,12 @@ def _start_data_pull(payload: dict[str, Any]) -> str:
         start = parse_time(start_text); end = parse_time(end_text)
         if start >= end:
             raise ValueError("start must be earlier than end")
-        command.extend(["--start", start.isoformat(), "--end", end.isoformat()])
+        arguments.extend(["--start", start.isoformat(), "--end", end.isoformat()])
     else:
         days = int(payload.get("days", 365))
         if not 1 <= days <= 5000:
             raise ValueError("days must be between 1 and 5000")
-        command.extend(["--days", str(days)])
+        arguments.extend(["--days", str(days)])
     adapter_options = [str(option) for option in payload.get("adapter_set", [])]
     has_account_type = any(option.split("=", 1)[0].strip() == "account_type" for option in adapter_options)
     if venue == "BINANCE" and instrument.endswith("-PERP.BINANCE") and not has_account_type:
@@ -662,11 +702,25 @@ def _start_data_pull(payload: dict[str, Any]) -> str:
         # Direct bar downloads need the market family, but not API credentials.
         adapter_options.append("account_type=USDT_FUTURES")
     for option in adapter_options:
-        command.extend(["--adapter-set", str(option)])
-    return _start_job(kind="data", command=command)
+        arguments.extend(["--adapter-set", str(option)])
+
+    prepare = _runtime_prepare(payload)
+
+    def command() -> list[str]:
+        return [str(active_runtime_python()), *arguments]
+
+    return _start_job(
+        kind="data",
+        command=command,
+        prepare=prepare,
+        starting_stage="starting_data",
+        starting_message="启动数据下载",
+    )
 
 
 def _start_trading(payload: dict[str, Any]) -> str:
+    from edgepilot.runtime import active_runtime_python
+
     if "config" in payload:
         raise ValueError("trading only accepts saved configurations; remove config and provide preset")
     mode = str(payload.get("mode", ""))
@@ -675,26 +729,43 @@ def _start_trading(payload: dict[str, Any]) -> str:
     if mode == "live" and payload.get("confirm_live") is not True:
         raise ValueError("live trading requires explicit confirmation")
     run_id = payload.get("run_id")
+    safe_run_id: str | None = None
+    strategy_name: str | None = None
+    preset: str | None = None
     if run_id:
         safe_run_id = _safe_run_id(str(run_id))
         try:
             find_run_directory(safe_run_id)
         except FileNotFoundError as exc:
             raise ValueError(f"unknown run: {safe_run_id}") from exc
-        command = [sys.executable, "-m", "edgepilot.cli", mode, "--run", safe_run_id]
     else:
         strategy_name = str(payload.get("strategy", "")).strip()
         preset_value = str(payload.get("preset", "")).strip()
         if not strategy_name or not preset_value:
             raise ValueError("a saved run or strategy configuration is required")
         preset = _safe_config_name(preset_value)
-        strategy = resolve_strategy(strategy_name)
-        if preset not in preset_names(strategy):
-            raise ValueError(f"unknown configuration: {preset}")
-        command = [sys.executable, "-m", "edgepilot.cli", mode, "--strategy", strategy.name, "--preset", preset]
-    if mode == "live":
-        command.append("--confirm-live")
-    return _start_job(kind=mode, command=command)
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", strategy_name):
+            raise ValueError("invalid strategy")
+
+    prepare = _runtime_prepare(payload)
+
+    def command() -> list[str]:
+        if safe_run_id is not None:
+            arguments = ["-m", "edgepilot.cli", mode, "--run", safe_run_id]
+        else:
+            assert strategy_name is not None and preset is not None
+            arguments = ["-m", "edgepilot.cli", mode, "--strategy", strategy_name, "--preset", preset]
+        if mode == "live":
+            arguments.append("--confirm-live")
+        return [str(active_runtime_python()), *arguments]
+
+    return _start_job(
+        kind=mode,
+        command=command,
+        prepare=prepare,
+        starting_stage="starting_trading",
+        starting_message="启动交易",
+    )
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -720,11 +791,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         expected = getattr(self.server, "edgepilot_csrf", "")
         return self._valid_host() and self.headers.get("Origin") == self._origin() and secrets.compare_digest(self.headers.get("X-EdgePilot-CSRF", ""), expected)
 
-    def _business_authenticated(self) -> bool:
-        return bool(auth.status().get("authenticated"))
-
     def _auth_required(self) -> None:
         _error(self, "AUTH_REQUIRED", "Sign in to use EdgePilot.", 401, login={"action": "open_browser"})
+
+    def _require_business_auth(self) -> bool:
+        state = auth.status()
+        if state.get("authenticated"):
+            return True
+        reason = str(state.get("reason", "AUTH_SERVICE_UNAVAILABLE"))
+        if reason in {"NO_CREDENTIALS", "CREDENTIALS_INVALID", "REFRESH_REJECTED"}:
+            self._auth_required()
+        elif reason == "ACCOUNT_DISABLED":
+            _error(self, reason, "the account is disabled", 403)
+        else:
+            code = reason if reason in {"CREDENTIAL_STORE_ERROR", "AUTH_SERVICE_UNAVAILABLE"} else "AUTH_SERVICE_UNAVAILABLE"
+            LOGGER.warning("dashboard authentication unavailable", extra={"event": "dashboard.auth.unavailable", "result": "failed",
+                           "params": {"method": self.command, "path": urlparse(self.path).path, "code": code}})
+            _error(self, code, "authentication is temporarily unavailable", 503, retryable=True)
+        return False
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
@@ -740,18 +824,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/bootstrap":
                 return _json(self, {"csrf_token": getattr(self.server, "edgepilot_csrf", "")})
             if parsed.path == "/api/health":
+                identity = getattr(self.server, "edgepilot_identity", None)
+                if isinstance(identity, dict):
+                    if not secrets.compare_digest(self.headers.get("X-EdgePilot-Instance", ""), str(identity.get("instance_nonce", ""))):
+                        return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 403)
+                    return _json(self, identity)
                 return _json(self, {"ok": True})
             login_match = re.fullmatch(r"/api/auth/login/([A-Za-z0-9_-]{20,})/status", parsed.path)
             if login_match:
-                _prune_local_logins()
-                with LOCAL_LOGINS_LOCK:
-                    item = LOCAL_LOGINS.get(login_match.group(1))
-                return _json(self, item and {key: value for key, value in item.items() if key not in {"device", "created_at", "completed_at"}} or {"status": "expired"})
+                return _json(self, auth.login_status(login_match.group(1)))
             if parsed.path == "/api/runs/active":
                 return _json(self, {"runs": [{"run_id": row["run_id"], "strategy": row.get("strategy", {}).get("name", ""), "mode": row.get("mode", "")}
                     for row in _run_records() if row.get("status") == "RUNNING"]})
-            if parsed.path.startswith("/api/") and not self._business_authenticated():
-                return self._auth_required()
+            if parsed.path.startswith("/api/") and not self._require_business_auth():
+                return
             if parsed.path == "/api/marketplace/strategies":
                 from edgepilot.marketplace import search
                 query = parse_qs(parsed.query)
@@ -778,24 +864,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _json(self, _strategy_records(locale))
             strategy_config_match = re.fullmatch(r"/api/strategies/([^/]+)/configs/([^/]+)", parsed.path)
             if strategy_config_match:
-                strategy = resolve_strategy(strategy_config_match.group(1))
-                name, values = load_preset(strategy, _safe_config_name(strategy_config_match.group(2)))
-                return _json(self, {"strategy": strategy.name, "name": name, "config": values})
+                return _json(self, _runtime_dashboard_call("strategy_config", {
+                    "strategy": strategy_config_match.group(1),
+                    "name": strategy_config_match.group(2),
+                }))
             if parsed.path.startswith("/api/strategies/"):
-                strategy = resolve_strategy(parsed.path.rsplit("/", 1)[-1])
-                return _json(self, {
-                    "name": strategy.name,
-                    "strategy_path": strategy.strategy_path,
-                    "config_path": strategy.config_path,
-                    "presets": preset_names(strategy),
-                    "config_schema": strategy.config_cls.json_schema(),
-                })
+                return _json(self, _runtime_dashboard_call("strategy_detail", {
+                    "strategy": parsed.path.rsplit("/", 1)[-1],
+                }))
             if parsed.path == "/api/runs":
                 return _json(self, _run_records())
             if parsed.path == "/api/catalog":
                 return _json(self, _catalog_records())
             if parsed.path == "/api/credentials":
-                return _json(self, _credential_records())
+                return _json(self, _runtime_dashboard_call("credentials", {}))
             if parsed.path == "/api/jobs":
                 with JOBS_LOCK:
                     return _json(self, [_job_view(job) for job in JOBS.values()])
@@ -832,31 +914,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if length > 16 * 1024:
                 return _error(self, "REQUEST_TOO_LARGE", "request body exceeds 16 KiB", 413)
             if parsed.path == "/api/auth/status":
-                return _json(self, auth.status())
+                state = auth.status()
+                reason = str(state.get("reason", ""))
+                if not state.get("authenticated") and reason in {"CREDENTIAL_STORE_ERROR", "AUTH_SERVICE_UNAVAILABLE"}:
+                    return _error(self, reason, "authentication is temporarily unavailable", 503, retryable=True)
+                return _json(self, state)
             if parsed.path == "/api/auth/login":
-                _prune_local_logins()
-                with LOCAL_LOGINS_LOCK:
-                    existing = next(((key, value) for key, value in LOCAL_LOGINS.items() if value.get("status") == "pending" and time.time() - value["created_at"] < 600), None)
-                if existing:
-                    return _json(self, {"login_id": existing[0], **{key: value for key, value in existing[1].items() if key not in {"device", "created_at", "status"}}})
-                device = auth.start_login(open_browser=False); login_id = secrets.token_urlsafe(24)
-                item = {"status": "pending", "created_at": time.time(), "device": device,
-                    "verification_uri": device["verification_uri"], "verification_uri_complete": device["verification_uri_complete"],
-                    "user_code": device["user_code"], "expires_in": device["expires_in"]}
-                with LOCAL_LOGINS_LOCK: LOCAL_LOGINS[login_id] = item
-                def poll() -> None:
-                    try:
-                        result = auth.poll_login(device)
-                        state = "authenticated" if result.get("authenticated") else "denied" if result.get("reason") == "ACCESS_DENIED" else "expired"
-                        update = {"status": state, **({"credential_storage": result.get("credential_storage")} if state == "authenticated" else {})}
-                    except auth.AuthError as exc:
-                        LOGGER.warning("dashboard login failed", extra={"event": "dashboard.auth.login_failed", "result": "failed",
-                                       "params": {"code": str(exc), "stage": exc.stage or "unknown", **exc.diagnostics}})
-                        update = {"status": "failed", "reason": str(exc) if str(exc) in {"AUTH_SERVICE_UNAVAILABLE", "CREDENTIAL_STORE_ERROR"} else "PROTOCOL_ERROR"}
-                    with LOCAL_LOGINS_LOCK:
-                        if login_id in LOCAL_LOGINS: LOCAL_LOGINS[login_id].update(update, completed_at=time.time())
-                Thread(target=poll, daemon=True).start()
-                return _json(self, {"login_id": login_id, **{key: value for key, value in item.items() if key not in {"device", "created_at", "status"}}}, 201)
+                started = auth.start_login(open_browser=False)
+                public = {key: started[key] for key in (
+                    "login_id", "verification_uri", "verification_uri_complete", "user_code", "expires_in"
+                )}
+                _run_login_worker(public)
+                return _json(self, public, 201)
             if parsed.path == "/api/auth/logout":
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict) or not set(payload).issubset({"local_only", "all"}):
@@ -868,13 +937,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise ValueError("install only accepts slug and version")
                 from edgepilot.marketplace import download_and_install, preflight_install
                 preflight_install(str(payload["slug"]), str(payload["version"]))
-                if not self._business_authenticated():
-                    return self._auth_required()
+                if not self._require_business_auth():
+                    return
                 return _json(self, download_and_install(str(payload["slug"]), str(payload["version"])), 201)
             if re.fullmatch(r"/api/runs/[^/]+/emergency-stop", parsed.path):
                 pass
-            elif not self._business_authenticated():
-                return self._auth_required()
+            elif not self._require_business_auth():
+                return
             payload = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
@@ -882,28 +951,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 from edgepilot.marketplace import recommend
                 return _json(self, recommend(payload))
             if self.path == "/api/backtests":
-                try:
-                    return _json(self, {"job_id": _start_backtest(payload)}, 202)
-                except Exception as exc:
-                    from edgepilot.backtest import CatalogDataRequiredError
-                    if isinstance(exc, CatalogDataRequiredError):
-                        return _error(self, "DATA_REQUIRED", "market data must be prepared before this backtest", 409,
-                                      catalog_path=str(exc.catalog_path), requirements=exc.requirements)
-                    raise
+                return _json(self, {"job_id": _start_backtest(payload)}, 202)
             strategy_config_match = re.fullmatch(r"/api/strategies/([^/]+)/configs/([^/]+)", self.path)
             if strategy_config_match:
                 if set(payload) != {"config"}:
                     raise ValueError("configuration request body must contain only config")
-                values = _create_strategy_config(
-                    strategy_config_match.group(1),
-                    strategy_config_match.group(2),
-                    payload.get("config"),
-                )
+                values = _runtime_dashboard_call("create_strategy_config", {
+                    "strategy": strategy_config_match.group(1),
+                    "name": strategy_config_match.group(2),
+                    "config": payload.get("config"),
+                })
                 return _json(self, {"saved": strategy_config_match.group(2), "config": values}, 201)
             if self.path == "/api/data/pull":
                 return _json(self, {"job_id": _start_data_pull(payload)}, 202)
             if self.path == "/api/credentials":
-                return _json(self, _save_credentials(payload), 201)
+                if "confirm_runtime" in payload:
+                    return _json(self, {"job_id": _start_runtime_install(payload)}, 202)
+                return _json(self, _runtime_dashboard_call("save_credentials", payload), 201)
             if self.path == "/api/trading":
                 return _json(self, {"job_id": _start_trading(payload)}, 202)
             if self.path.startswith("/api/jobs/") and self.path.endswith("/stop"):
@@ -944,8 +1008,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
-            if not self._business_authenticated():
-                return self._auth_required()
+            if not self._require_business_auth():
+                return
             length = int(self.headers.get("Content-Length", "0"))
             if length > 16 * 1024:
                 return _error(self, "REQUEST_TOO_LARGE", "request body exceeds 16 KiB", 413)
@@ -957,11 +1021,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _error(self, "NOT_FOUND", "not found", 404)
             if set(payload) != {"config"}:
                 raise ValueError("configuration request body must contain only config")
-            values = _update_strategy_config(
-                strategy_config_match.group(1),
-                strategy_config_match.group(2),
-                payload.get("config"),
-            )
+            values = _runtime_dashboard_call("update_strategy_config", {
+                "strategy": strategy_config_match.group(1),
+                "name": strategy_config_match.group(2),
+                "config": payload.get("config"),
+            })
             return _json(self, {"saved": strategy_config_match.group(2), "config": values})
         except ConfigConflictError as exc:
             return _error(self, "CONFLICT", str(exc), 409)
@@ -979,8 +1043,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
-            if not self._business_authenticated():
-                return self._auth_required()
+            if not self._require_business_auth():
+                return
             if self.headers.get("X-EdgePilot-Confirm") != "delete":
                 return _error(self, "CONFIRMATION_REQUIRED", "deletion requires an explicit confirmation", 400)
             parsed = urlparse(self.path)
@@ -1045,6 +1109,9 @@ def serve(*, host: str = "127.0.0.1", port: int = 8787, language: str | None = N
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     server.edgepilot_language = normalize_supported_locale(language)  # type: ignore[attr-defined]
     server.edgepilot_csrf = secrets.token_urlsafe(32)  # type: ignore[attr-defined]
+    pending_login = auth.resume_login()
+    if pending_login is not None:
+        _run_login_worker(pending_login)
     LOGGER.info("dashboard started", extra={"event": "dashboard.started", "params": {"host": host, "port": port}})
     print(f"EdgePilot dashboard: http://{host}:{port}")
     try:

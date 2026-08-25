@@ -12,7 +12,6 @@ dependencies = [
   "matplotlib==3.10.8",
   "tqdm>=4.67.3,<5",
   "keyring>=25.6,<26",
-  "filelock>=3.18,<4",
 ]
 
 [project.scripts]
@@ -26,4 +25,4 @@ path = "src/edgepilot/VERSION"
 pattern = "^(?P<version>(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$"
 
 [tool.hatch.build.targets.wheel.force-include]
-"backtest_core_src/edgepilot_backtest_core" = "edgepilot_backtest_core"
+"core_src/edgepilot_core" = "edgepilot_core"

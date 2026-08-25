@@ -16,7 +16,7 @@ from matplotlib.ticker import StrMethodFormatter
 import numpy as np
 import pandas as pd
 from nautilus_trader.backtest.engine import BacktestEngine
-from edgepilot_backtest_core.metrics import collect_metrics
+from edgepilot_core.backtest.metrics import collect_metrics
 from nautilus_trader.model.data import BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
@@ -288,7 +288,7 @@ def _export_chart(
 
     fig.suptitle(
         (
-            f"Backtest | Return {metrics['return_pct']:.2f}% | "
+            f"Backtest | Annualized return {metrics['annualized_return_pct']:.2f}% | "
             f"PnL \\${metrics['realized_pnl']:,.0f} | "
             f"Max drawdown {metrics['max_drawdown_pct']:.2f}% | "
             f"Sharpe {metrics['sharpe']:.2f} | "

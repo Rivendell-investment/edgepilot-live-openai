@@ -22,11 +22,11 @@ from nautilus_trader.live.config import LiveExecClientConfig
 from nautilus_trader.live.factories import LiveDataClientFactory
 from nautilus_trader.live.factories import LiveExecClientFactory
 from nautilus_trader.trading.strategy import Strategy
-from edgepilot_backtest_core.discovery import StrategyDescriptor
-from edgepilot_backtest_core.discovery import instantiate_config as _core_instantiate_config
-from edgepilot_backtest_core.discovery import instantiate_config_class as _core_instantiate_config_class
-from edgepilot_backtest_core.discovery import resolve_strategy as _core_resolve_strategy
-from edgepilot_backtest_core.discovery import strategy_names as _core_strategy_names
+from edgepilot_core.backtest.discovery import StrategyDescriptor
+from edgepilot_core.backtest.discovery import instantiate_config as _core_instantiate_config
+from edgepilot_core.backtest.discovery import instantiate_config_class as _core_instantiate_config_class
+from edgepilot_core.backtest.discovery import resolve_strategy as _core_resolve_strategy
+from edgepilot_core.backtest.discovery import strategy_names as _core_strategy_names
 
 from edgepilot.paths import state_root
 

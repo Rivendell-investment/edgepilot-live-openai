@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from edgepilot_backtest_core.discovery import StrategyDescriptor, instantiate_config_class
+from edgepilot_core.backtest.discovery import StrategyDescriptor, instantiate_config_class
 
 
 def preset_names(root: Path, strategy: StrategyDescriptor) -> list[str]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 import hashlib
 import json
 import logging
@@ -14,6 +15,7 @@ import secrets
 import stat
 import subprocess
 import sys
+from threading import Lock
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -22,11 +24,22 @@ from urllib.parse import urlsplit
 import webbrowser
 import uuid
 
-from filelock import FileLock
-import keyring
-from keyring.errors import KeyringError, NoKeyringError
+from edgepilot.file_lock import FileLock
+try:
+    import keyring
+    from keyring.errors import KeyringError, NoKeyringError
+except ImportError:  # the lightweight Agent layer intentionally has no keyring dependency
+    class KeyringError(Exception):
+        pass
+    class NoKeyringError(KeyringError):
+        pass
+    class _MissingKeyring:
+        def get_password(self, *_args: object) -> None: raise NoKeyringError("keyring is not installed")
+        def set_password(self, *_args: object) -> None: raise NoKeyringError("keyring is not installed")
+        def delete_password(self, *_args: object) -> None: raise NoKeyringError("keyring is not installed")
+    keyring = _MissingKeyring()  # type: ignore[assignment]
 
-from edgepilot.paths import state_root
+from edgepilot.paths import state_root, strategies_state_root
 
 
 ORIGIN = os.environ.get("EDGEPILOT_MARKETPLACE_ORIGIN", "https://edge-pilot.rivendell.capital").rstrip("/")
@@ -36,7 +49,14 @@ if (_origin_parts.scheme != "https" and not (_origin_parts.scheme == "http" and 
     raise RuntimeError("EDGEPILOT_MARKETPLACE_ORIGIN must be HTTPS or HTTP loopback origin")
 KEYRING_SERVICE = "edgepilot"
 PENDING_INSTALLATIONS = "pending_installations.json"
+PENDING_LOGIN = "pending-login.json"
+PENDING_LOGIN_VERSION = 1
+DEVICE_POLL_TIMEOUT_SECONDS = 20
+POLL_LEASE_SECONDS = 30
+LOGIN_RECEIPT_SECONDS = 60
 LOGGER = logging.getLogger("edgepilot.auth")
+_WINDOWS_ACL_LOCK = Lock()
+_WINDOWS_ACL_FINGERPRINTS: dict[tuple[str, bool], tuple[int, int, int, int, int]] = {}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -96,7 +116,7 @@ def _auth_dir() -> Path:
         if stat.S_IMODE(path.stat().st_mode) != 0o700 or path.stat().st_uid != os.getuid():
             raise AuthError("CREDENTIAL_STORE_ERROR")
     else:
-        _secure_windows_acl(path, directory=True, stage="auth_dir_acl")
+        _secure_windows_acl_once(path, directory=True, stage="auth_dir_acl")
     return path
 
 
@@ -107,6 +127,74 @@ def _paths() -> tuple[Path, Path]:
 
 def _pending_path() -> Path:
     return _auth_dir() / PENDING_INSTALLATIONS
+
+
+def _pending_login_path() -> Path:
+    return _auth_dir() / PENDING_LOGIN
+
+
+def _read_pending_login_unlocked() -> dict[str, Any] | None:
+    path = _pending_login_path()
+    _validate_file(path, acl_stage="pending_login_acl")
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        path.unlink(missing_ok=True)
+        return None
+    if not isinstance(value, dict) or value.get("version") != PENDING_LOGIN_VERSION or value.get("origin") != ORIGIN:
+        path.unlink(missing_ok=True)
+        return None
+    return value
+
+
+def _write_pending_login_unlocked(value: dict[str, Any]) -> None:
+    _atomic_json(_pending_login_path(), value)
+
+
+def _clear_pending_login_unlocked() -> None:
+    path = _pending_login_path()
+    _validate_file(path, acl_stage="pending_login_acl")
+    path.unlink(missing_ok=True)
+
+
+def _login_receipt(login_id: str, status_value: str, *, reason: str | None = None,
+                   credential_storage: str | None = None, now: float | None = None) -> dict[str, Any]:
+    receipt: dict[str, Any] = {
+        "version": PENDING_LOGIN_VERSION,
+        "origin": ORIGIN,
+        "login_id": login_id,
+        "status": status_value,
+        "completed_at": time.time() if now is None else now,
+    }
+    if reason:
+        receipt["reason"] = reason
+    if credential_storage:
+        receipt["credential_storage"] = credential_storage
+    return receipt
+
+
+def _public_login_start(value: dict[str, Any], *, now: float | None = None) -> dict[str, Any]:
+    current = time.time() if now is None else now
+    return {
+        "login_id": value["login_id"],
+        "verification_uri": value["verification_uri"],
+        "verification_uri_complete": value["verification_uri_complete"],
+        "user_code": value["user_code"],
+        "expires_in": max(0, int(float(value["expires_at"]) - current)),
+    }
+
+
+def _public_login_status(value: dict[str, Any] | None) -> dict[str, Any]:
+    if value is None:
+        return {"status": "not_found", "reason": "LOGIN_NOT_FOUND"}
+    result = {"status": value.get("status", "not_found")}
+    if isinstance(value.get("reason"), str):
+        result["reason"] = value["reason"]
+    if value.get("status") == "authenticated" and value.get("credential_storage") in {"keyring", "file"}:
+        result["credential_storage"] = value["credential_storage"]
+    return result
 
 
 def _is_reparse(path: Path) -> bool:
@@ -127,6 +215,7 @@ def _validate_requested_chain(path: Path) -> None:
             raise AuthError("CREDENTIAL_STORE_ERROR")
 
 
+@lru_cache(maxsize=1)
 def _windows_sid() -> str:
     try:
         result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5, check=True)
@@ -153,6 +242,26 @@ def _secure_windows_acl(path: Path, *, directory: bool, stage: str = "windows_ac
         raise _credential_store_error(f"{stage}_verify", exc) from exc
 
 
+def _secure_windows_acl_once(path: Path, *, directory: bool, stage: str) -> None:
+    if os.name != "nt":
+        return
+    key = (str(path.absolute()), directory)
+    with _WINDOWS_ACL_LOCK:
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise _credential_store_error(f"{stage}_stat", exc) from exc
+        fingerprint = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if _WINDOWS_ACL_FINGERPRINTS.get(key) == fingerprint:
+            return
+        _secure_windows_acl(path, directory=directory, stage=stage)
+        try:
+            info = path.stat()
+        except OSError as exc:
+            raise _credential_store_error(f"{stage}_stat", exc) from exc
+        _WINDOWS_ACL_FINGERPRINTS[key] = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 def _validate_file(path: Path, *, acl_stage: str = "credential_acl") -> None:
     if not path.exists():
         return
@@ -161,7 +270,7 @@ def _validate_file(path: Path, *, acl_stage: str = "credential_acl") -> None:
     if os.name != "nt" and (path.stat().st_uid != os.getuid() or stat.S_IMODE(path.stat().st_mode) != 0o600):
         raise AuthError("CREDENTIAL_STORE_ERROR")
     if os.name == "nt":
-        _secure_windows_acl(path, directory=False, stage=acl_stage)
+        _secure_windows_acl_once(path, directory=False, stage=acl_stage)
 
 
 @contextmanager
@@ -172,7 +281,7 @@ def _credential_lock():
             descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(descriptor)
             if os.name == "nt":
-                _secure_windows_acl(lock_path, directory=False, stage="lock_acl")
+                _secure_windows_acl_once(lock_path, directory=False, stage="lock_acl")
         except FileExistsError:
             pass
     _validate_file(lock_path, acl_stage="lock_acl")
@@ -227,7 +336,7 @@ def _atomic_json(path: Path, value: dict[str, Any] | list[Any]) -> None:
         if os.name != "nt":
             path.chmod(0o600)
         else:
-            _secure_windows_acl(path, directory=False, stage="credential_acl")
+            _secure_windows_acl_once(path, directory=False, stage="credential_acl")
         if os.name != "nt":
             directory_descriptor = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
             try:
@@ -328,8 +437,6 @@ def update_pending_installation(idempotency_key: str, status_value: str) -> None
 
 def reconcile_prepared_installations() -> None:
     """Promote only intents whose exact Marketplace marker reached disk."""
-    from edgepilot.discovery import strategies_root
-
     with _credential_lock():
         items = _read_pending_unlocked()
         kept: list[dict[str, Any]] = []
@@ -337,7 +444,7 @@ def reconcile_prepared_installations() -> None:
             if item.get("status") != "prepared":
                 kept.append(item)
                 continue
-            marker = strategies_root() / str(item.get("strategy_slug", "")).replace("-", "_") / ".marketplace.json"
+            marker = strategies_state_root() / str(item.get("strategy_slug", "")).replace("-", "_") / ".marketplace.json"
             try:
                 metadata = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -418,18 +525,24 @@ def sync_pending_installations(*, token: str, user_id: str) -> None:
             _write_pending_unlocked(items)
 
 
-def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | None = None) -> str:
+def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | None = None,
+                   *, login_id: str | None = None) -> str:
     previous_keyring_user: str | None = None
+    previous: dict[str, Any] | None = None
     _validate_file(path)
     if path.exists():
         try:
-            previous = json.loads(path.read_text(encoding="utf-8"))
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            previous = loaded if isinstance(loaded, dict) else None
         except (OSError, json.JSONDecodeError):
             previous = None
         if isinstance(previous, dict) and isinstance(previous.get("keyring_user"), str):
             previous_keyring_user = previous["keyring_user"]
     record = {"access_token": tokens["access_token"], "access_expires_at": time.time() + int(tokens["expires_in"]),
               "session_expires_at": tokens["session_expires_at"], "user": user}
+    durable_login_id = login_id or tokens.get("login_id") or (previous or {}).get("login_id")
+    if isinstance(durable_login_id, str) and durable_login_id:
+        record["login_id"] = durable_login_id
     keyring_user = _keyring_user(user.get("id") if isinstance(user, dict) else None)
     stored_in_keyring = False
     try:
@@ -490,6 +603,7 @@ def clear_credentials() -> None:
             except (OSError, json.JSONDecodeError):
                 pass
         _clear_unlocked(path, credentials)
+        _clear_pending_login_unlocked()
 
 
 def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, Any]:
@@ -500,12 +614,31 @@ def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, 
     """
     if local_only:
         clear_credentials()
-        return {"logged_out": True, "local_only": True, "warning": "Remote tokens may still be valid."}
+        return {
+            "logged_out": True,
+            "local_only": True,
+            "warning": "Remote tokens or pending device authorizations may still be valid.",
+        }
     path, _ = _paths()
     with _credential_lock():
+        pending = _load_login_state_unlocked(time.time())
+        canceled_pending = False
+        if pending is not None and pending.get("status") == "pending":
+            device_code = pending.get("device_code")
+            if not isinstance(device_code, str) or not device_code:
+                raise AuthError("CREDENTIALS_INVALID")
+            _request("/api/auth/device/cancel", method="POST", payload={"device_code": device_code})
+            canceled_pending = True
+            _write_pending_login_unlocked(
+                _login_receipt(str(pending["login_id"]), "denied", reason="ACCESS_DENIED")
+            )
         credentials = _read_unlocked()
         if not credentials:
-            return {"logged_out": True, "all": all_devices}
+            _clear_pending_login_unlocked()
+            result = {"logged_out": True, "all": all_devices}
+            if canceled_pending:
+                result["canceled_pending_login"] = True
+            return result
         if all_devices:
             token = credentials.get("access_token")
             if not isinstance(token, str) or float(credentials.get("access_expires_at", 0)) <= time.time():
@@ -517,7 +650,11 @@ def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, 
                 raise AuthError("CREDENTIALS_INVALID")
             _request("/api/auth/logout", method="POST", payload={"refresh_token": refresh})
         _clear_unlocked(path, credentials)
-    return {"logged_out": True, "all": all_devices}
+        _clear_pending_login_unlocked()
+    result = {"logged_out": True, "all": all_devices}
+    if canceled_pending:
+        result["canceled_pending_login"] = True
+    return result
 
 
 def _request(path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, token: str | None = None,
@@ -657,6 +794,65 @@ def status() -> dict[str, Any]:
         return {"authenticated": False, "reason": str(exc)}
 
 
+def _load_login_state_unlocked(now: float) -> dict[str, Any] | None:
+    value = _read_pending_login_unlocked()
+    if value is None:
+        return None
+    status_value = value.get("status")
+    if status_value != "pending":
+        completed_at = value.get("completed_at")
+        if not isinstance(completed_at, (int, float)) or now - float(completed_at) > LOGIN_RECEIPT_SECONDS:
+            _clear_pending_login_unlocked()
+            return None
+        return value
+    required = {
+        "login_id": str, "device_code": str, "user_code": str,
+        "verification_uri": str, "verification_uri_complete": str,
+        "interval": (int, float), "created_at": (int, float),
+        "expires_at": (int, float), "next_poll_at": (int, float),
+    }
+    if any(not isinstance(value.get(key), expected) for key, expected in required.items()):
+        _clear_pending_login_unlocked()
+        return None
+    try:
+        credentials = _read_unlocked()
+    except AuthError as exc:
+        if exc.code in {"CREDENTIAL_STORE_ERROR", "CREDENTIALS_INVALID"}:
+            receipt = _login_receipt(str(value["login_id"]), "failed", reason="CREDENTIAL_STORE_ERROR", now=now)
+            _write_pending_login_unlocked(receipt)
+            return receipt
+        raise
+    if credentials and credentials.get("login_id") == value["login_id"]:
+        storage = credentials.get("storage")
+        if storage in {"keyring", "file"} and isinstance(credentials.get("refresh_token"), str):
+            receipt = _login_receipt(str(value["login_id"]), "authenticated",
+                                     credential_storage=str(storage), now=now)
+            _write_pending_login_unlocked(receipt)
+            return receipt
+    if float(value["expires_at"]) <= now:
+        receipt = _login_receipt(str(value["login_id"]), "expired", reason="EXPIRED_TOKEN", now=now)
+        _write_pending_login_unlocked(receipt)
+        return receipt
+    return value
+
+
+def login_status(login_id: str) -> dict[str, Any]:
+    with _credential_lock():
+        value = _load_login_state_unlocked(time.time())
+        if value is None or value.get("login_id") != login_id:
+            return _public_login_status(None)
+        return _public_login_status(value)
+
+
+def resume_login() -> dict[str, Any] | None:
+    """Return the current public pending flow so a restarted owner can resume it."""
+    with _credential_lock():
+        value = _load_login_state_unlocked(time.time())
+        if value is None or value.get("status") != "pending":
+            return None
+        return _public_login_start(value)
+
+
 def login(*, open_browser: bool = True) -> dict[str, Any]:
     started = start_login(open_browser=open_browser)
     print(
@@ -669,38 +865,182 @@ def login(*, open_browser: bool = True) -> dict[str, Any]:
 
 
 def start_login(*, open_browser: bool = True) -> dict[str, Any]:
-    started, _ = _request("/api/auth/device/start", method="POST", payload={"client_id": "edgepilot-cli", "scope": "edgepilot:use marketplace:install"})
+    now = time.time()
+    with _credential_lock():
+        existing = _load_login_state_unlocked(now)
+        if existing is not None and existing.get("status") == "pending":
+            public = _public_login_start(existing, now=now)
+        else:
+            public = None
+    if public is None:
+        started, _ = _request(
+            "/api/auth/device/start",
+            method="POST",
+            payload={"client_id": "edgepilot-cli", "scope": "edgepilot:use marketplace:install"},
+        )
+        string_fields = ("device_code", "user_code", "verification_uri", "verification_uri_complete")
+        if any(not isinstance(started.get(key), str) or not started[key] for key in string_fields) \
+                or not isinstance(started.get("expires_in"), int):
+            raise AuthError("PROTOCOL_ERROR")
+        with _credential_lock():
+            now = time.time()
+            existing = _load_login_state_unlocked(now)
+            if existing is not None and existing.get("status") == "pending":
+                public = _public_login_start(existing, now=now)
+            else:
+                interval = max(1, int(started.get("interval", 5)))
+                expires_in = max(1, int(started["expires_in"]))
+                value = {
+                    "version": PENDING_LOGIN_VERSION,
+                    "origin": ORIGIN,
+                    "login_id": uuid.uuid4().hex,
+                    "status": "pending",
+                    "device_code": str(started["device_code"]),
+                    "user_code": str(started["user_code"]),
+                    "verification_uri": str(started["verification_uri"]),
+                    "verification_uri_complete": str(started["verification_uri_complete"]),
+                    "interval": interval,
+                    "created_at": now,
+                    "expires_at": now + expires_in,
+                    "next_poll_at": now + interval,
+                    "lease_owner": None,
+                    "lease_expires_at": None,
+                }
+                _write_pending_login_unlocked(value)
+                public = _public_login_start(value, now=now)
     if open_browser:
-        webbrowser.open(str(started["verification_uri_complete"]))
-    return started
+        webbrowser.open(str(public["verification_uri_complete"]))
+    return public
+
+
+def _revoke_late_login(tokens: dict[str, Any]) -> None:
+    refresh = tokens.get("refresh_token")
+    if not isinstance(refresh, str) or not refresh:
+        return
+    try:
+        _request(
+            "/api/auth/logout",
+            method="POST",
+            payload={"refresh_token": refresh},
+            timeout=DEVICE_POLL_TIMEOUT_SECONDS,
+        )
+    except AuthError as exc:
+        LOGGER.warning(
+            "late device login revocation failed",
+            extra={"event": "auth.device.late_revoke", "result": "failed", "params": {"code": exc.code}},
+        )
+
+
+def _poll_result(value: dict[str, Any]) -> dict[str, Any]:
+    if value.get("status") == "authenticated":
+        return {"authenticated": True, "credential_storage": value.get("credential_storage")}
+    return {"authenticated": False, "reason": value.get("reason", "LOGIN_NOT_FOUND")}
 
 
 def poll_login(started: dict[str, Any]) -> dict[str, Any]:
-    interval = int(started.get("interval", 5))
-    deadline = time.monotonic() + int(started["expires_in"])
-    while time.monotonic() < deadline:
-        time.sleep(interval)
+    login_id = started.get("login_id")
+    if not isinstance(login_id, str) or not login_id:
+        raise AuthError("PROTOCOL_ERROR")
+    owner = uuid.uuid4().hex
+    while True:
+        wait_for = 0.0
+        with _credential_lock():
+            now = time.time()
+            value = _load_login_state_unlocked(now)
+            if value is None or value.get("login_id") != login_id:
+                return _poll_result(_public_login_status(None))
+            if value.get("status") != "pending":
+                return _poll_result(value)
+            next_poll_at = float(value["next_poll_at"])
+            lease_owner = value.get("lease_owner")
+            lease_expires_at = float(value.get("lease_expires_at") or 0)
+            if lease_owner and lease_owner != owner and lease_expires_at > now:
+                wait_for = max(next_poll_at, lease_expires_at) - now
+            elif next_poll_at > now:
+                wait_for = next_poll_at - now
+            else:
+                value["lease_owner"] = owner
+                value["lease_expires_at"] = now + POLL_LEASE_SECONDS
+                value["next_poll_at"] = now + float(value["interval"])
+                device_code = str(value["device_code"])
+                _write_pending_login_unlocked(value)
+        if wait_for > 0:
+            time.sleep(wait_for)
+            continue
         try:
-            tokens, _ = _request("/api/auth/device/poll", method="POST", payload={"device_code": started["device_code"]})
+            tokens, _ = _request(
+                "/api/auth/device/poll",
+                method="POST",
+                payload={"device_code": device_code},
+                timeout=DEVICE_POLL_TIMEOUT_SECONDS,
+            )
+        except AuthError as exc:
+            with _credential_lock():
+                response_at = time.time()
+                value = _load_login_state_unlocked(response_at)
+                if value is None or value.get("login_id") != login_id or value.get("status") != "pending":
+                    return _poll_result(_public_login_status(None) if value is None else value)
+                if value.get("lease_owner") != owner:
+                    continue
+                if exc.code in {"authorization_pending", "slow_down"}:
+                    if exc.code == "slow_down":
+                        value["interval"] = exc.interval if exc.interval is not None else min(60, int(value["interval"]) + 5)
+                    value["next_poll_at"] = response_at + float(value["interval"])
+                    value["lease_owner"] = None
+                    value["lease_expires_at"] = None
+                    _write_pending_login_unlocked(value)
+                    continue
+                if exc.code in {"access_denied", "expired_token"}:
+                    receipt = _login_receipt(login_id, "denied" if exc.code == "access_denied" else "expired",
+                                             reason=exc.code.upper(), now=response_at)
+                else:
+                    reason = exc.code if exc.code in {"AUTH_SERVICE_UNAVAILABLE", "CREDENTIAL_STORE_ERROR"} else "PROTOCOL_ERROR"
+                    receipt = _login_receipt(login_id, "failed", reason=reason, now=response_at)
+                _write_pending_login_unlocked(receipt)
+                return _poll_result(receipt)
+
+        late = False
+        try:
+            with _credential_lock():
+                value = _load_login_state_unlocked(time.time())
+                if value is None or value.get("login_id") != login_id or value.get("status") != "pending":
+                    late = True
+                else:
+                    path, _ = _paths()
+                    storage = _save_unlocked(path, tokens, login_id=login_id)
+                    saved = _read_unlocked()
+                    if not saved or saved.get("login_id") != login_id or not isinstance(saved.get("refresh_token"), str):
+                        raise AuthError("CREDENTIAL_STORE_ERROR")
+                    receipt = _login_receipt(login_id, "authenticated", credential_storage=storage)
+                    _write_pending_login_unlocked(receipt)
+        except AuthError:
+            with _credential_lock():
+                value = _read_pending_login_unlocked()
+                if value is not None and value.get("login_id") == login_id:
+                    receipt = _login_receipt(login_id, "failed", reason="CREDENTIAL_STORE_ERROR")
+                    _write_pending_login_unlocked(receipt)
+            _revoke_late_login(tokens)
+            return {"authenticated": False, "reason": "CREDENTIAL_STORE_ERROR"}
+        if late:
+            _revoke_late_login(tokens)
+            return _poll_result(_public_login_status(None))
+
+        user: dict[str, Any] | None = None
+        try:
             profile, _ = _request("/api/me", token=str(tokens["access_token"]))
             user = profile.get("user") if isinstance(profile.get("user"), dict) else None
             if user and isinstance(user.get("id"), int):
                 user = {**user, "id": str(user["id"])}
-            storage = save_credentials(tokens, user)
             if user and isinstance(user.get("id"), str):
+                with _credential_lock():
+                    current = _read_unlocked()
+                    if current and current.get("login_id") == login_id:
+                        _save_unlocked(_paths()[0], tokens, user, login_id=login_id)
                 reconcile_prepared_installations()
                 sync_pending_installations(token=str(tokens["access_token"]), user_id=user["id"])
-            return {"authenticated": True, "credential_storage": storage, "user": user}
-        except AuthError as exc:
-            if str(exc) == "authorization_pending":
-                continue
-            if str(exc) == "slow_down":
-                interval = exc.interval if exc.interval is not None else min(60, interval + 5)
-                continue
-            if str(exc) in {"access_denied", "expired_token"}:
-                return {"authenticated": False, "reason": str(exc).upper()}
-            raise
-    return {"authenticated": False, "reason": "EXPIRED_TOKEN"}
+        except AuthError:
+            pass
+        return {"authenticated": True, "credential_storage": storage, "user": user}
 
 
 def access_token(*, interactive: bool = False) -> str:
