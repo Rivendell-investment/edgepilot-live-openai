@@ -18,6 +18,9 @@ from typing import Callable
 
 from edgepilot import __version__
 from edgepilot.env_file import load_env
+from edgepilot.paths import account_credentials_path
+from edgepilot.paths import active_account_key
+from edgepilot.paths import clear_bound_account_key
 from edgepilot.paths import find_run_directory
 from edgepilot.paths import iter_run_directories
 from edgepilot.paths import state_root
@@ -163,6 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
         source.add_argument("--run", dest="run_id", help="Reuse an exact saved run configuration")
         source.add_argument("--strategy", help="Start directly from an installed strategy")
         trading.add_argument("--preset", help="Named strategy configuration; defaults to 'default'")
+        trading.add_argument("--venue", help="Run only the market configured for this venue")
         trading.add_argument("--dry-run", action="store_true", help="Validate without connecting")
         if mode == "live":
             trading.add_argument("--confirm-live", action="store_true", help="Required before real orders are enabled")
@@ -381,9 +385,51 @@ def _backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _select_trading_venue(record: dict[str, Any], requested_venue: str) -> None:
+    venue = requested_venue.strip().upper()
+    configured = {
+        str(item.get("adapter", "")).strip().upper(): item
+        for item in record.get("venues", [])
+        if isinstance(item, dict)
+    }
+    if venue not in configured:
+        raise ValueError(f"Venue is not configured by this preset: {venue}")
+    markets = [
+        market
+        for market in record.get("markets", [])
+        if isinstance(market, dict) and str(market.get("venue", "")).strip().upper() == venue
+    ]
+    if not markets:
+        raise ValueError(f"Selected venue has no configured markets: {venue}")
+
+    market_instruments = {
+        str(market.get("instrument_id", "")).strip()
+        for market in markets
+        if str(market.get("instrument_id", "")).strip()
+    }
+    strategy_instruments: set[str] = set()
+    parameters = record.get("strategy", {}).get("parameters", {})
+    if isinstance(parameters, dict):
+        for key, value in parameters.items():
+            if key.endswith("instrument_id") and isinstance(value, str) and value.strip():
+                strategy_instruments.add(value.strip())
+            elif key.endswith("instrument_ids") and isinstance(value, list):
+                strategy_instruments.update(str(item).strip() for item in value if isinstance(item, str) and item.strip())
+    mismatched = strategy_instruments - market_instruments
+    if mismatched:
+        raise ValueError(
+            f"Selected venue does not contain strategy instruments: {', '.join(sorted(mismatched))}",
+        )
+
+    record["markets"] = markets
+    record["venues"] = [configured[venue]]
+
+
 def _trade(args: argparse.Namespace, mode: str) -> int:
     if mode == "live" and not args.confirm_live and not args.dry_run:
         raise PermissionError("Live trading requires --confirm-live")
+    if args.run_id and args.venue is not None:
+        raise ValueError("Venue selection requires a strategy preset, not an exact saved run")
     if args.run_id:
         runs_path = find_run_directory(args.run_id).parent
         record = load_run(runs_path, args.run_id)
@@ -430,6 +476,8 @@ def _trade(args: argparse.Namespace, mode: str) -> int:
             "metrics": {},
         }
         runs_path = strategy_runs_path(strategy.name)
+    if args.venue is not None:
+        _select_trading_venue(record, args.venue)
     revision_path = strategies_root() / strategy.name / ".marketplace.json"
     if not revision_path.exists():
         source = python_inspect.getsourcefile(strategy.strategy_cls)
@@ -620,7 +668,7 @@ def _auth(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    load_env(STATE_ROOT / ".env")
+    clear_bound_account_key()
     logger = configure_logging()
     started = monotonic()
     parser = build_parser()
@@ -651,6 +699,10 @@ def main(argv: list[str] | None = None) -> int:
             auth.authorize_backtest()
         elif not exempt and not auth.skip_auth_enabled():
             auth.access_token(interactive=True)
+        if auth.skip_auth_enabled():
+            load_env(STATE_ROOT / ".env")
+        elif active_account_key() is not None:
+            load_env(account_credentials_path())
         if args.command == "strategies":
             result = _strategies(args)
         elif args.command == "data":
@@ -668,9 +720,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "auth":
             result = _auth(args)
         else:
-            from edgepilot.ui import serve
+            if args.host != "127.0.0.1":
+                raise ValueError("Dashboard must bind to 127.0.0.1")
+            from edgepilot.local_service import ensure_service
 
-            serve(host=args.host, port=args.port, language=args.language)
+            identity = ensure_service(port=args.port)
+            print(f"EdgePilot dashboard: {identity['url']}")
             result = 0
         logger.info("command completed", extra={"event": "cli.command.completed", "result": "success", "duration_ms": round((monotonic() - started) * 1000), "params": safe_params})
         return result

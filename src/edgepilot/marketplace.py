@@ -15,12 +15,13 @@ import zipfile
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import quote, urlencode, urlsplit
+from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from edgepilot import auth
 from edgepilot.file_lock import FileLock
+from edgepilot.marketplace_origin import marketplace_origin
 from edgepilot.paths import strategies_state_root
 
 
@@ -31,11 +32,6 @@ def strategies_root() -> Path:
     return root
 
 
-MARKETPLACE_ORIGIN = os.environ.get("EDGEPILOT_MARKETPLACE_ORIGIN", "https://edge-pilot.rivendell.capital").rstrip("/")
-_marketplace_origin_parts = urlsplit(MARKETPLACE_ORIGIN)
-if (_marketplace_origin_parts.scheme != "https" and not (_marketplace_origin_parts.scheme == "http" and _marketplace_origin_parts.hostname in {"127.0.0.1", "localhost", "::1"})) \
-        or _marketplace_origin_parts.path or _marketplace_origin_parts.query or _marketplace_origin_parts.fragment or _marketplace_origin_parts.username or _marketplace_origin_parts.password:
-    raise RuntimeError("EDGEPILOT_MARKETPLACE_ORIGIN must be HTTPS or HTTP loopback origin")
 RISK_PROFILE_ALIASES = {
     "conservative": "conservative",
     "balanced": "balanced",
@@ -383,7 +379,7 @@ def _download_request_error(exc: HTTPError) -> MarketplaceRequestError:
 
 def _download(slug: str, version: str) -> bytes:
     """Stream an archive to disk and validate declared and actual integrity."""
-    url = f"{MARKETPLACE_ORIGIN}/api/live/strategies/{slug}/{version}/download"
+    url = f"{marketplace_origin()}/api/live/strategies/{slug}/{version}/download"
     temporary_path: Path | None = None
     try:
         token = auth.access_token()
@@ -472,7 +468,7 @@ def download_and_install(slug: str, version: str) -> dict[str, str]:
 def installation_history() -> dict[str, Any]:
     user_id, _ = _current_user()
     payload, _ = auth.authenticated_request("/api/account/installations")
-    payload["pending_sync"] = auth.pending_installation_counts()
+    payload["pending_sync"] = auth.pending_installation_counts(user_id)
     payload["local_sync_issues"] = auth.pending_installation_issues(user_id)
     return payload
 

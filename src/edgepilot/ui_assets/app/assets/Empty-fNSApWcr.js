@@ -1,0 +1,1 @@
+import{s as e}from"./button-N5mJ-eFC.js";var t=e();function n({label:e}){return(0,t.jsx)(`div`,{className:`empty`,children:e})}export{n as t};

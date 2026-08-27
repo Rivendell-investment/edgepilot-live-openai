@@ -38,6 +38,20 @@ from edgepilot.run_state import unregister_running
 LOGGER = logging.getLogger("edgepilot.trading")
 
 
+class _UnexpectedShutdown:
+    """Capture engine-initiated shutdowns which otherwise return exit code zero."""
+
+    def __init__(self) -> None:
+        self.reason: str | None = None
+
+    def __call__(self, command: Any) -> None:
+        self.reason = str(command.reason or "Trading engine requested shutdown")
+
+    def raise_if_requested(self) -> None:
+        if self.reason is not None:
+            raise RuntimeError(f"Trading engine stopped unexpectedly: {self.reason}")
+
+
 SANDBOX_EXEC_CONFIG = (
     "nautilus_trader.adapters.sandbox.config:SandboxExecutionClientConfig"
 )
@@ -356,6 +370,8 @@ def execute_trading(
         node.add_data_client_factory(name, resolve_path(data_factory_path))
         node.add_exec_client_factory(name, resolve_path(exec_factory_path))
     node.build()
+    unexpected_shutdown = _UnexpectedShutdown()
+    node.kernel.msgbus.subscribe("commands.system.shutdown", unexpected_shutdown)
     LOGGER.info("trading node built", extra={"event": "trading.node.built", "run_id": record.get("run_id"), "result": "success", "params": {"mode": mode, "execution": execution}})
     pnl_ledger = _RunPnlLedger()
     node.kernel.msgbus.subscribe("events.position.*", pnl_ledger.handle)
@@ -372,6 +388,7 @@ def execute_trading(
     try:
         LOGGER.info("trading node started", extra={"event": "trading.node.started", "run_id": record.get("run_id"), "params": {"mode": mode}})
         node.run()
+        unexpected_shutdown.raise_if_requested()
     except Exception:
         failed = True
         LOGGER.exception("trading node failed", extra={"event": "trading.node.failed", "run_id": record.get("run_id"), "result": "failed", "params": {"mode": mode}})

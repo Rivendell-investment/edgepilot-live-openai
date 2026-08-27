@@ -28,7 +28,7 @@ from edgepilot_core.backtest.discovery import instantiate_config_class as _core_
 from edgepilot_core.backtest.discovery import resolve_strategy as _core_resolve_strategy
 from edgepilot_core.backtest.discovery import strategy_names as _core_strategy_names
 
-from edgepilot.paths import state_root
+from edgepilot.paths import strategies_state_root
 
 
 LOGGER = logging.getLogger("edgepilot.discovery")
@@ -49,7 +49,7 @@ def _class_path(cls: type[Any]) -> str:
 
 def strategies_root() -> Path:
     """Return the user-owned strategy directory without installing packages."""
-    persistent = state_root() / "strategies"
+    persistent = strategies_state_root()
     persistent.mkdir(parents=True, exist_ok=True)
     init = persistent / "__init__.py"
     if not init.exists():
@@ -58,7 +58,7 @@ def strategies_root() -> Path:
 
 
 def _ensure_project_importable() -> None:
-    root = str(state_root())
+    root = str(strategies_root().parent)
     if root not in sys.path:
         sys.path.insert(0, root)
 

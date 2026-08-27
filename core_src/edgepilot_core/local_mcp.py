@@ -272,9 +272,10 @@ def _cards(value: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, Any]],
-        server_factory: Callable[[str, int], ThreadingHTTPServer] | None = None) -> int:
-    dashboard = Dashboard(config, server_factory)
-    dashboard.start()
+        server_factory: Callable[[str, int], ThreadingHTTPServer] | None = None,
+        *, dashboard_client: Any | None = None,
+        persistent_actions: tuple[Callable[[], dict[str, Any]], Callable[[], dict[str, Any]]] | None = None) -> int:
+    dashboard = dashboard_client if dashboard_client is not None else Dashboard(config, server_factory)
     ui_html = _card_html(config.name)
 
     def respond(request_id: object, result: object = None, error: dict[str, Any] | None = None) -> None:
@@ -349,9 +350,13 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                     elif name in {"enable_persistent_dashboard", "disable_persistent_dashboard"}:
                         if arguments != {"confirm": True}:
                             raise RuntimeError(f"此操作会修改本机后台启动项 {config.service_id}；确认后再执行。")
-                        from edgepilot_core import persistent_service
-                        action = persistent_service.install if name.startswith("enable") else persistent_service.uninstall
-                        value = action(config, service_id=config.service_id, windows_task=config.windows_task)
+                        if persistent_actions is None:
+                            from edgepilot_core import persistent_service
+                            action = persistent_service.install if name.startswith("enable") else persistent_service.uninstall
+                            value = action(config, service_id=config.service_id, windows_task=config.windows_task)
+                        else:
+                            action = persistent_actions[0] if name.startswith("enable") else persistent_actions[1]
+                            value = action()
                         respond(request_id, {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}], "structuredContent": value})
                     else:
                         respond(request_id, error={"code": -32602, "message": "unknown tool"})

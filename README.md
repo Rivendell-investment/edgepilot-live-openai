@@ -5,21 +5,14 @@ native NautilusTrader integration, a local dashboard, and one universal
 `skills/edgepilot/SKILL.md` workflow. Runs are multi-market and multi-venue by
 default: each preset declares its market legs and venue configurations.
 
-## Install with Codex
-
-When you attach this extracted plugin directory to a Codex task, send the whole
-request below. The second sentence must be part of your request because files
-attached to a task provide context; they do not become user instructions by
-themselves.
-
-```text
-Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md and include its localized first-use prompt in your final response.
-```
-
-The plugin starts its lightweight local MCP and Dashboard without native dependencies. The agent creates a virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation.
+The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
 The plugin cache contains no credentials or trading data. Runtime state is stored
 in `~/.edgepilot/` on macOS/Linux or `%APPDATA%\\EdgePilot` on Windows, with
-`EDGEPILOT_HOME` available as an override.
+`EDGEPILOT_HOME` available as an override. Signed-in users keep installed
+strategies, exchange credentials, and runs under an account-specific
+`accounts/<non-PII-key>/` directory derived from the Marketplace user ID.
+Market data and the locked runtime remain shared because they contain no account
+orders or secrets.
 
 The published Live runtime supports Apple Silicon Macs (`arm64`) and 64-bit
 Windows (`amd64`), both with CPython 3.12. Intel Macs and Linux are not supported.
@@ -33,7 +26,7 @@ updates.
 Each strategy owns its configurations and results:
 
 ```text
-~/.edgepilot/strategies/STRATEGY_NAME/
+~/.edgepilot/accounts/ACCOUNT_KEY/strategies/STRATEGY_NAME/
 ├── strategy.py
 ├── configs/
 └── runs/
@@ -70,6 +63,12 @@ install an exact strategy version.
 Normally the agent performs this once. The Python environment is user-owned,
 outside both the plugin and strategy source directories:
 
+Installing or upgrading the plugin updates files on disk but cannot hot-replace
+an MCP process already owned by Codex. Fully quit and restart Codex after the
+install, open a new chat, and use only the Dashboard URL returned by that new
+session. The package `BUILD.json` exposes this as a required `host_activation`
+action; file delivery alone is not runtime activation.
+
 ```bash
 mkdir -p ~/.edgepilot
 python3 -m venv ~/.edgepilot/.venv
@@ -89,29 +88,30 @@ normal `edgepilot` command. `PYTHONPATH=/path/to/edgepilot/src` is only a
 temporary alternative for running uninstalled source directly; end users and
 agents do not need it.
 
-### Post-install guidance
-
-After installation, reply in the user's current conversation language and tell
-them to create a new Codex task. Translate the following prompt naturally while
-preserving the exact `@EdgePilot` mention and its request to ask about preferences
-one question at a time, obtain confirmation, and show three recommendation cards:
-
-```text
-@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them.
-```
-
 ## Use
 
 Ask the agent to list strategies, inspect a preset, download data, run a
 backtest, or start paper/demo/live trading. Credentials are requested only for
 the selected exchange mode.
 
-For a visual local monitor, run `edgepilot ui`. It serves one localhost-only
-dashboard for the current `~/.edgepilot/` state directory. Reuse an existing
-dashboard at `http://127.0.0.1:8787` rather than starting a second instance.
+For a visual local monitor, run `edgepilot ui`. It discovers or starts the same
+localhost-only service used by the MCP and prints its verified URL; it never
+binds a second Dashboard. The actual port may differ while a legacy process
+still owns 8787.
 It reads the same records as the CLI and lets users configure a strategy,
 start a backtest, inspect interactive equity/price charts and entry/exit
 markers, manage local credentials, and monitor active Demo/Live sessions.
+Email-code login stays on the Dashboard page. Google sign-in opens the system
+browser, completes hosted Google OAuth against the Dashboard's existing device
+authorization, and remains on the hosted completion page. Python polls that device
+authorization and stores only the resulting EdgePilot token family; Google tokens
+are not retained locally. The original Codex Dashboard detects the local session and
+enters the authenticated state automatically. Both methods share the same account whenever the Marketplace
+resolves the same normalized email to one canonical user ID. Signing out revokes the remote session and
+hides that account's local data; active runs and jobs must be stopped first.
+Older unassigned `~/.edgepilot/strategies/` and `~/.edgepilot/.env` data is not
+silently attached to the first new login: the Account page offers an explicit,
+one-time assignment when the destination account is empty.
 The installed-strategy page filters by asset and sorts the packaged/local
 backtest records by return, drawdown, or Sharpe.
 The **Marketplace** tab is separate from local state: it searches the public

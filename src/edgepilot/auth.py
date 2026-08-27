@@ -11,20 +11,21 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import subprocess
 import sys
-from threading import Lock
+from threading import Lock, Thread
 import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, Request, build_opener
-from urllib.parse import urlsplit
 import webbrowser
 import uuid
 
 from edgepilot.file_lock import FileLock
+from edgepilot.marketplace_origin import marketplace_origin
 try:
     import keyring
     from keyring.errors import KeyringError, NoKeyringError
@@ -39,14 +40,9 @@ except ImportError:  # the lightweight Agent layer intentionally has no keyring 
         def delete_password(self, *_args: object) -> None: raise NoKeyringError("keyring is not installed")
     keyring = _MissingKeyring()  # type: ignore[assignment]
 
-from edgepilot.paths import state_root, strategies_state_root
+from edgepilot.paths import activate_account, deactivate_account, state_root, strategies_state_root
 
 
-ORIGIN = os.environ.get("EDGEPILOT_MARKETPLACE_ORIGIN", "https://edge-pilot.rivendell.capital").rstrip("/")
-_origin_parts = urlsplit(ORIGIN)
-if (_origin_parts.scheme != "https" and not (_origin_parts.scheme == "http" and _origin_parts.hostname in {"127.0.0.1", "localhost", "::1"})) \
-        or _origin_parts.path or _origin_parts.query or _origin_parts.fragment or _origin_parts.username or _origin_parts.password:
-    raise RuntimeError("EDGEPILOT_MARKETPLACE_ORIGIN must be HTTPS or HTTP loopback origin")
 KEYRING_SERVICE = "edgepilot"
 PENDING_INSTALLATIONS = "pending_installations.json"
 PENDING_LOGIN = "pending-login.json"
@@ -54,9 +50,13 @@ PENDING_LOGIN_VERSION = 1
 DEVICE_POLL_TIMEOUT_SECONDS = 20
 POLL_LEASE_SECONDS = 30
 LOGIN_RECEIPT_SECONDS = 60
+MAX_AUTH_RESPONSE_BYTES = 1024 * 1024
+MAX_AUTH_ERROR_BYTES = 16 * 1024
 LOGGER = logging.getLogger("edgepilot.auth")
 _WINDOWS_ACL_LOCK = Lock()
 _WINDOWS_ACL_FINGERPRINTS: dict[tuple[str, bool], tuple[int, int, int, int, int]] = {}
+_DASHBOARD_FLOW_LOCK = Lock()
+_DASHBOARD_FLOWS: dict[str, dict[str, Any]] = {}
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -72,7 +72,7 @@ def urlopen(request: Request, *, timeout: int):  # test seam; deliberately rejec
 
 
 def _keyring_user(user_id: object = None) -> str:
-    origin_partition = hashlib.sha256(ORIGIN.encode("utf-8")).hexdigest()[:24]
+    origin_partition = hashlib.sha256(marketplace_origin().encode("utf-8")).hexdigest()[:24]
     account = str(user_id) if isinstance(user_id, (str, int)) and str(user_id) else "unknown"
     return f"{origin_partition}:{account}:refresh-token"
 
@@ -143,7 +143,8 @@ def _read_pending_login_unlocked() -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         path.unlink(missing_ok=True)
         return None
-    if not isinstance(value, dict) or value.get("version") != PENDING_LOGIN_VERSION or value.get("origin") != ORIGIN:
+    if not isinstance(value, dict) or value.get("version") != PENDING_LOGIN_VERSION \
+            or value.get("origin") != marketplace_origin():
         path.unlink(missing_ok=True)
         return None
     return value
@@ -163,7 +164,7 @@ def _login_receipt(login_id: str, status_value: str, *, reason: str | None = Non
                    credential_storage: str | None = None, now: float | None = None) -> dict[str, Any]:
     receipt: dict[str, Any] = {
         "version": PENDING_LOGIN_VERSION,
-        "origin": ORIGIN,
+        "origin": marketplace_origin(),
         "login_id": login_id,
         "status": status_value,
         "completed_at": time.time() if now is None else now,
@@ -306,7 +307,8 @@ def _read_unlocked() -> dict[str, Any] | None:
         raise AuthError("CREDENTIALS_INVALID")
     if value.get("storage") == "keyring":
         keyring_user = value.get("keyring_user")
-        if not isinstance(keyring_user, str) or not keyring_user.startswith(hashlib.sha256(ORIGIN.encode()).hexdigest()[:24] + ":"):
+        origin_partition = hashlib.sha256(marketplace_origin().encode()).hexdigest()[:24]
+        if not isinstance(keyring_user, str) or not keyring_user.startswith(origin_partition + ":"):
             raise AuthError("CREDENTIALS_INVALID")
         try:
             value["refresh_token"] = keyring.get_password(KEYRING_SERVICE, keyring_user)
@@ -365,10 +367,12 @@ def _write_pending_unlocked(items: list[dict[str, Any]]) -> None:
     _atomic_json(_pending_path(), items)
 
 
-def pending_installation_counts() -> dict[str, int]:
+def pending_installation_counts(user_id: str | None = None) -> dict[str, int]:
     with _credential_lock():
         counts = {state: 0 for state in ("prepared", "installed", "blocked", "failed")}
         for item in _read_pending_unlocked():
+            if user_id is not None and item.get("user_id") != user_id:
+                continue
             state = item.get("status")
             if state in counts:
                 counts[state] += 1
@@ -435,12 +439,15 @@ def update_pending_installation(idempotency_key: str, status_value: str) -> None
     raise AuthError("INSTALLATION_LOG_MISSING")
 
 
-def reconcile_prepared_installations() -> None:
+def reconcile_prepared_installations(user_id: str | None = None) -> None:
     """Promote only intents whose exact Marketplace marker reached disk."""
     with _credential_lock():
         items = _read_pending_unlocked()
         kept: list[dict[str, Any]] = []
         for item in items:
+            if user_id is not None and item.get("user_id") != user_id:
+                kept.append(item)
+                continue
             if item.get("status") != "prepared":
                 kept.append(item)
                 continue
@@ -578,7 +585,10 @@ def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | No
 def save_credentials(tokens: dict[str, Any], user: dict[str, Any] | None = None) -> str:
     path, _ = _paths()
     with _credential_lock():
-        return _save_unlocked(path, tokens, user)
+        storage = _save_unlocked(path, tokens, user)
+    if isinstance(user, dict) and isinstance(user.get("id"), str):
+        activate_account(user["id"], marketplace_origin())
+    return storage
 
 
 def _clear_unlocked(path: Path, credentials: dict[str, Any]) -> None:
@@ -604,6 +614,7 @@ def clear_credentials() -> None:
                 pass
         _clear_unlocked(path, credentials)
         _clear_pending_login_unlocked()
+    deactivate_account()
 
 
 def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, Any]:
@@ -614,6 +625,8 @@ def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, 
     """
     if local_only:
         clear_credentials()
+        with _DASHBOARD_FLOW_LOCK:
+            _DASHBOARD_FLOWS.clear()
         return {
             "logged_out": True,
             "local_only": True,
@@ -635,6 +648,9 @@ def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, 
         credentials = _read_unlocked()
         if not credentials:
             _clear_pending_login_unlocked()
+            deactivate_account()
+            with _DASHBOARD_FLOW_LOCK:
+                _DASHBOARD_FLOWS.clear()
             result = {"logged_out": True, "all": all_devices}
             if canceled_pending:
                 result["canceled_pending_login"] = True
@@ -651,6 +667,9 @@ def logout(*, all_devices: bool = False, local_only: bool = False) -> dict[str, 
             _request("/api/auth/logout", method="POST", payload={"refresh_token": refresh})
         _clear_unlocked(path, credentials)
         _clear_pending_login_unlocked()
+    deactivate_account()
+    with _DASHBOARD_FLOW_LOCK:
+        _DASHBOARD_FLOWS.clear()
     result = {"logged_out": True, "all": all_devices}
     if canceled_pending:
         result["canceled_pending_login"] = True
@@ -669,19 +688,35 @@ def _request(path: str, *, method: str = "GET", payload: dict[str, Any] | None =
     if idempotency_key:
         headers["Idempotency-Key"] = idempotency_key
     try:
-        with urlopen(Request(f"{ORIGIN}{path}", data=data, method=method, headers=headers), timeout=timeout) as response:
-            raw = response.read()
-            return (json.loads(raw) if raw else {}), {key.lower(): value for key, value in response.headers.items()}
+        with urlopen(Request(f"{marketplace_origin()}{path}", data=data, method=method, headers=headers), timeout=timeout) as response:
+            raw = response.read(MAX_AUTH_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_AUTH_RESPONSE_BYTES:
+                raise AuthError("PROTOCOL_ERROR")
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                raise AuthError("PROTOCOL_ERROR") from exc
+            if not isinstance(parsed, dict):
+                raise AuthError("PROTOCOL_ERROR")
+            return parsed, {key.lower(): value for key, value in response.headers.items()}
     except HTTPError as exc:
         try:
-            error = json.loads(exc.read())
+            raw = exc.read(MAX_AUTH_ERROR_BYTES + 1)
+            error = json.loads(raw) if len(raw) <= MAX_AUTH_ERROR_BYTES and raw else {}
         except (json.JSONDecodeError, UnicodeDecodeError):
             error = {}
-        envelope = error.get("error", {})
-        code = envelope.get("code", f"HTTP_{exc.code}")
-        interval = envelope.get("interval")
+        envelope = error.get("error") if isinstance(error, dict) else None
+        if isinstance(envelope, dict):
+            code = envelope.get("code", f"HTTP_{exc.code}")
+            interval = envelope.get("interval")
+        elif isinstance(envelope, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", envelope):
+            code = envelope
+            interval = None
+        else:
+            code = error.get("code", f"HTTP_{exc.code}") if isinstance(error, dict) else f"HTTP_{exc.code}"
+            interval = error.get("interval") if isinstance(error, dict) else None
         raise AuthError(str(code), interval=interval if isinstance(interval, int) else None, status=exc.code) from exc
-    except URLError as exc:
+    except (URLError, TimeoutError, ConnectionError) as exc:
         raise AuthError("AUTH_SERVICE_UNAVAILABLE") from exc
 
 
@@ -724,6 +759,249 @@ def authenticated_request(path: str, *, method: str = "GET", payload: dict[str, 
     return _request(path, method=method, payload=payload, token=refresh_access_token(), idempotency_key=idempotency_key, timeout=timeout)
 
 
+def _dashboard_flow(login_id: str) -> dict[str, Any]:
+    with _DASHBOARD_FLOW_LOCK:
+        flow = _DASHBOARD_FLOWS.get(login_id)
+        if not flow or float(flow.get("expires_at", 0)) <= time.time():
+            _DASHBOARD_FLOWS.pop(login_id, None)
+            raise AuthError("LOGIN_EXPIRED")
+        return dict(flow)
+
+
+def dashboard_login_active() -> bool:
+    """Keep the localhost service alive while a Dashboard login can still complete."""
+    now = time.time()
+    with _DASHBOARD_FLOW_LOCK:
+        expired = [
+            login_id
+            for login_id, flow in _DASHBOARD_FLOWS.items()
+            if float(flow.get("expires_at", 0)) <= now
+        ]
+        for login_id in expired:
+            _DASHBOARD_FLOWS.pop(login_id, None)
+        return bool(_DASHBOARD_FLOWS)
+
+
+def dashboard_login_cancel(login_id: str) -> dict[str, bool]:
+    with _DASHBOARD_FLOW_LOCK:
+        flow = _DASHBOARD_FLOWS.get(login_id)
+    if not flow:
+        return {"canceled": True}
+    try:
+        _request("/api/auth/device/cancel", method="POST", payload={"device_code": flow["device_code"]})
+    except AuthError as exc:
+        if exc.code not in {"access_denied", "expired_token", "HTTP_404"}:
+            raise
+    with _DASHBOARD_FLOW_LOCK:
+        _DASHBOARD_FLOWS.pop(login_id, None)
+    return {"canceled": True}
+
+
+def dashboard_login_start() -> dict[str, Any]:
+    with _DASHBOARD_FLOW_LOCK:
+        _DASHBOARD_FLOWS.clear()
+    try:
+        remote, _ = _request("/api/auth/dashboard/start", method="POST", payload={})
+    except AuthError as exc:
+        if exc.status == 404:
+            raise AuthError("SERVER_UPDATE_REQUIRED", status=503) from exc
+        raise
+    required = ("flow_token", "csrf_token", "device_code")
+    if any(not isinstance(remote.get(key), str) or not remote[key] for key in required):
+        raise AuthError("PROTOCOL_ERROR")
+    expires_in = remote.get("expires_in")
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        raise AuthError("PROTOCOL_ERROR")
+    interval = remote.get("interval", 5)
+    if not isinstance(interval, int) or interval <= 0:
+        raise AuthError("PROTOCOL_ERROR")
+    login_id = uuid.uuid4().hex
+    now = time.time()
+    with _DASHBOARD_FLOW_LOCK:
+        _DASHBOARD_FLOWS.clear()
+        _DASHBOARD_FLOWS[login_id] = {
+            **{key: remote[key] for key in required},
+            "poll_interval": interval,
+            "next_poll_at": now + interval,
+            "expires_at": now + expires_in,
+        }
+    return {"login_id": login_id, "expires_in": expires_in}
+
+
+def dashboard_email_request(login_id: str, email: str) -> dict[str, Any]:
+    flow = _dashboard_flow(login_id)
+    result, _ = _request("/api/auth/dashboard/email/request", method="POST", payload={
+        "flow_token": flow["flow_token"], "csrf_token": flow["csrf_token"], "email": email,
+    })
+    return {"accepted": result.get("accepted") is True}
+
+
+def dashboard_email_resend(login_id: str) -> dict[str, Any]:
+    flow = _dashboard_flow(login_id)
+    result, _ = _request("/api/auth/dashboard/email/resend", method="POST", payload={
+        "flow_token": flow["flow_token"], "csrf_token": flow["csrf_token"],
+    })
+    return {"accepted": result.get("accepted") is True, "restart_required": result.get("restart_required") is True}
+
+
+def _save_dashboard_tokens(login_id: str, tokens: dict[str, Any]) -> dict[str, Any]:
+    path, _ = _paths()
+    try:
+        profile, _ = _request("/api/me", token=str(tokens["access_token"]))
+    except AuthError:
+        _revoke_late_login(tokens)
+        with _DASHBOARD_FLOW_LOCK:
+            _DASHBOARD_FLOWS.pop(login_id, None)
+        raise
+    candidate = profile.get("user")
+    user = candidate if isinstance(candidate, dict) else None
+    if user and isinstance(user.get("id"), int):
+        user = {**user, "id": str(user["id"])}
+    if not user or not isinstance(user.get("id"), str) or not user["id"]:
+        _revoke_late_login(tokens)
+        with _DASHBOARD_FLOW_LOCK:
+            _DASHBOARD_FLOWS.pop(login_id, None)
+        raise AuthError("PROTOCOL_ERROR")
+    try:
+        with _credential_lock():
+            if _read_unlocked():
+                raise AuthError("ACCOUNT_SWITCH_REQUIRES_LOGOUT", status=409)
+            storage = _save_unlocked(path, tokens, user, login_id=login_id)
+    except AuthError:
+        _revoke_late_login(tokens)
+        with _DASHBOARD_FLOW_LOCK:
+            _DASHBOARD_FLOWS.pop(login_id, None)
+        raise
+    activate_account(user["id"], marketplace_origin())
+    with _DASHBOARD_FLOW_LOCK:
+        _DASHBOARD_FLOWS.pop(login_id, None)
+    return {"authenticated": True, "credential_storage": storage, "user": user}
+
+
+def dashboard_email_confirm(login_id: str, code: str) -> dict[str, Any]:
+    flow = _dashboard_flow(login_id)
+    tokens, _ = _request("/api/auth/dashboard/email/confirm", method="POST", payload={
+        "flow_token": flow["flow_token"], "csrf_token": flow["csrf_token"],
+        "device_code": flow["device_code"], "code": code,
+    })
+    return _save_dashboard_tokens(login_id, tokens)
+
+
+def _dashboard_google_poll(login_id: str, device_code: str) -> None:
+    """Poll a browser-owned Google authorization without exposing its tokens to the UI."""
+    while True:
+        with _DASHBOARD_FLOW_LOCK:
+            current = _DASHBOARD_FLOWS.get(login_id)
+            if not current or current.get("device_code") != device_code:
+                return
+            if float(current.get("expires_at", 0)) <= time.time():
+                current["google_status"] = "expired"
+                current["google_error"] = "LOGIN_EXPIRED"
+                return
+            interval = max(1, int(current.get("poll_interval", 5)))
+            wait_for = max(0.0, float(current.get("next_poll_at", 0)) - time.time())
+        if wait_for:
+            time.sleep(wait_for)
+            continue
+        try:
+            tokens, _ = _request(
+                "/api/auth/device/poll",
+                method="POST",
+                payload={"device_code": device_code},
+                timeout=DEVICE_POLL_TIMEOUT_SECONDS,
+            )
+        except AuthError as exc:
+            if exc.code in {"authorization_pending", "slow_down"}:
+                with _DASHBOARD_FLOW_LOCK:
+                    current = _DASHBOARD_FLOWS.get(login_id)
+                    if current and current.get("device_code") == device_code:
+                        if exc.code == "slow_down":
+                            current["poll_interval"] = exc.interval or min(60, interval + 5)
+                            current["next_poll_at"] = time.time() + int(current["poll_interval"])
+                        else:
+                            current["next_poll_at"] = time.time() + int(current.get("poll_interval", interval))
+                continue
+            with _DASHBOARD_FLOW_LOCK:
+                current = _DASHBOARD_FLOWS.get(login_id)
+                if current and current.get("device_code") == device_code:
+                    current["google_status"] = "failed"
+                    current["google_error"] = exc.code
+            return
+        with _DASHBOARD_FLOW_LOCK:
+            current = _DASHBOARD_FLOWS.get(login_id)
+            still_current = bool(current and current.get("device_code") == device_code)
+        if not still_current:
+            _revoke_late_login(tokens)
+            return
+        try:
+            _save_dashboard_tokens(login_id, tokens)
+        except AuthError as exc:
+            with _DASHBOARD_FLOW_LOCK:
+                current = _DASHBOARD_FLOWS.get(login_id)
+                if current and current.get("device_code") == device_code:
+                    current["google_status"] = "failed"
+                    current["google_error"] = exc.code
+        return
+
+
+def dashboard_google_open(login_id: str, handoff_url: str) -> dict[str, Any]:
+    flow = _dashboard_flow(login_id)
+    handoff_token = secrets.token_urlsafe(32)
+    with _DASHBOARD_FLOW_LOCK:
+        current = _DASHBOARD_FLOWS.get(login_id)
+        if not current or current.get("device_code") != flow["device_code"]:
+            raise AuthError("LOGIN_EXPIRED")
+        already_polling = current.get("google_status") == "pending"
+        current.update({
+            "google_handoff_token": handoff_token,
+            "google_handoff_expires_at": time.time() + 60,
+            "google_status": "pending",
+            "google_error": None,
+        })
+    if not already_polling:
+        Thread(
+            target=_dashboard_google_poll,
+            args=(login_id, str(flow["device_code"])),
+            name="edgepilot-google-login",
+            daemon=True,
+        ).start()
+    opened = bool(webbrowser.open(f"{handoff_url.rstrip('/')}/{handoff_token}"))
+    if not opened:
+        with _DASHBOARD_FLOW_LOCK:
+            current = _DASHBOARD_FLOWS.get(login_id)
+            if current and current.get("device_code") == flow["device_code"]:
+                current["google_status"] = "failed"
+                current["google_error"] = "BROWSER_OPEN_FAILED"
+    return {"opened": opened, "status": "pending" if opened else "failed"}
+
+
+def dashboard_google_handoff(handoff_token: str) -> dict[str, str]:
+    now = time.time()
+    with _DASHBOARD_FLOW_LOCK:
+        for flow in _DASHBOARD_FLOWS.values():
+            if not secrets.compare_digest(str(flow.get("google_handoff_token", "")), handoff_token):
+                continue
+            if float(flow.get("google_handoff_expires_at", 0)) <= now:
+                raise AuthError("LOGIN_EXPIRED")
+            flow.pop("google_handoff_token", None)
+            flow.pop("google_handoff_expires_at", None)
+            return {
+                "action": f"{marketplace_origin()}/api/auth/dashboard/google/continue",
+                "flow_token": str(flow["flow_token"]),
+                "csrf_token": str(flow["csrf_token"]),
+            }
+    raise AuthError("LOGIN_EXPIRED")
+
+
+def dashboard_google_status(login_id: str) -> dict[str, str]:
+    flow = _dashboard_flow(login_id)
+    result = {"status": str(flow.get("google_status", "pending"))}
+    error = flow.get("google_error")
+    if isinstance(error, str) and error:
+        result["error"] = error
+    return result
+
+
 def skip_auth_enabled() -> bool:
     """Return True when local research may bypass Marketplace login.
 
@@ -759,12 +1037,13 @@ def authorize_backtest() -> None:
         raise AuthError("ADMIN_AUTH_INVALID")
 
 
-def status() -> dict[str, Any]:
+def status(*, validate_remote: bool = False) -> dict[str, Any]:
     try:
         path, _ = _paths()
         with _credential_lock():
             credentials = _read_unlocked()
             if not credentials:
+                deactivate_account()
                 return {"authenticated": False, "reason": "NO_CREDENTIALS"}
             if float(credentials.get("access_expires_at", 0)) <= time.time():
                 try:
@@ -779,18 +1058,51 @@ def status() -> dict[str, Any]:
                         "CREDENTIAL_STORE_ERROR": "CREDENTIAL_STORE_ERROR",
                         "CREDENTIALS_INVALID": "CREDENTIALS_INVALID",
                     }.get(str(exc), "REFRESH_REJECTED")
+                    deactivate_account()
                     return {"authenticated": False, "reason": reason}
-            result = {"authenticated": True, "user": credentials.get("user"), "access_expires_at": credentials.get("access_expires_at"), "credential_storage": credentials.get("storage")}
+            user = credentials.get("user")
+            user_missing = not isinstance(user, dict) or not isinstance(user.get("id"), str) or not user["id"]
+            if validate_remote or user_missing:
+                try:
+                    profile, _ = _request("/api/me", token=str(credentials["access_token"]))
+                    candidate = profile.get("user")
+                    if isinstance(candidate, dict) and isinstance(candidate.get("id"), int):
+                        candidate = {**candidate, "id": str(candidate["id"])}
+                    if not isinstance(candidate, dict) or not isinstance(candidate.get("id"), str) or not candidate["id"]:
+                        raise AuthError("PROTOCOL_ERROR")
+                    if not user_missing and candidate["id"] != user["id"]:
+                        raise AuthError("CREDENTIALS_INVALID")
+                    user = candidate
+                    if user_missing:
+                        _save_unlocked(path, {
+                            "access_token": credentials["access_token"],
+                            "expires_in": max(1, int(float(credentials["access_expires_at"]) - time.time())),
+                            "refresh_token": credentials["refresh_token"],
+                            "session_expires_at": credentials["session_expires_at"],
+                        }, user, login_id=credentials.get("login_id"))
+                        credentials = _read_unlocked() or credentials
+                except AuthError as exc:
+                    if exc.code in {"AUTH_REQUIRED", "INVALID_TOKEN", "HTTP_401", "ACCOUNT_DISABLED", "CREDENTIALS_INVALID"}:
+                        _clear_unlocked(path, credentials)
+                    deactivate_account()
+                    reason = "AUTH_SERVICE_UNAVAILABLE" if exc.code == "AUTH_SERVICE_UNAVAILABLE" else (
+                        "ACCOUNT_DISABLED" if exc.code == "ACCOUNT_DISABLED" else "REFRESH_REJECTED"
+                    )
+                    return {"authenticated": False, "reason": reason}
+            assert isinstance(user, dict) and isinstance(user.get("id"), str)
+            activate_account(user["id"], marketplace_origin())
+            result = {"authenticated": True, "user": user, "access_expires_at": credentials.get("access_expires_at"), "credential_storage": credentials.get("storage")}
         user = result.get("user")
         if isinstance(user, dict) and isinstance(user.get("id"), str):
             try:
-                reconcile_prepared_installations()
+                reconcile_prepared_installations(user["id"])
                 sync_pending_installations(token=str(credentials["access_token"]), user_id=user["id"])
             except AuthError:
                 pass
-        result["pending_installations"] = pending_installation_counts()
+        result["pending_installations"] = pending_installation_counts(user["id"] if isinstance(user, dict) else None)
         return result
     except AuthError as exc:
+        deactivate_account()
         return {"authenticated": False, "reason": str(exc)}
 
 
@@ -892,7 +1204,7 @@ def start_login(*, open_browser: bool = True) -> dict[str, Any]:
                 expires_in = max(1, int(started["expires_in"]))
                 value = {
                     "version": PENDING_LOGIN_VERSION,
-                    "origin": ORIGIN,
+                    "origin": marketplace_origin(),
                     "login_id": uuid.uuid4().hex,
                     "status": "pending",
                     "device_code": str(started["device_code"]),
@@ -1036,7 +1348,8 @@ def poll_login(started: dict[str, Any]) -> dict[str, Any]:
                     current = _read_unlocked()
                     if current and current.get("login_id") == login_id:
                         _save_unlocked(_paths()[0], tokens, user, login_id=login_id)
-                reconcile_prepared_installations()
+                activate_account(user["id"], marketplace_origin())
+                reconcile_prepared_installations(user["id"])
                 sync_pending_installations(token=str(tokens["access_token"]), user_id=user["id"])
         except AuthError:
             pass

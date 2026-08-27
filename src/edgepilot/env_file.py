@@ -6,10 +6,11 @@ import os
 from pathlib import Path
 
 
-def load_env(path: Path) -> None:
-    """Load a user-state .env without overwriting explicit environment values."""
+def read_env(path: Path) -> dict[str, str]:
+    """Read a simple user-state environment file without mutating the process."""
+    values: dict[str, str] = {}
     if not path.exists():
-        return
+        return values
     for line in path.read_text(encoding="utf-8").splitlines():
         value = line.strip()
         if not value or value.startswith("#"):
@@ -24,4 +25,11 @@ def load_env(path: Path) -> None:
         if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {"'", '"'}:
             raw = raw[1:-1]
         if key:
-            os.environ.setdefault(key, raw)
+            values[key] = raw
+    return values
+
+
+def load_env(path: Path) -> None:
+    """Load a user-state .env without overwriting explicit environment values."""
+    for key, raw in read_env(path).items():
+        os.environ.setdefault(key, raw)

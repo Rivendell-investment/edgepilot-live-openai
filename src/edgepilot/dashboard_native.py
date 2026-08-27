@@ -17,9 +17,8 @@ from edgepilot.discovery import discover_execution_adapters
 from edgepilot.discovery import resolve_adapter
 from edgepilot.discovery import resolve_strategy
 from edgepilot.discovery import strategies_root
-from edgepilot.env_file import load_env
 from edgepilot.environment import credential_requirements
-from edgepilot.paths import state_root
+from edgepilot.paths import account_credentials_path, state_root
 from edgepilot.presets import load_preset
 from edgepilot.presets import preset_backtest_values
 from edgepilot.presets import preset_markets
@@ -31,7 +30,6 @@ from edgepilot.presets import resolve_strategy_parameters
 
 STATE = state_root()
 LOGGER = logging.getLogger("edgepilot.dashboard_native")
-load_env(STATE / ".env")
 
 
 def strategy_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -111,7 +109,7 @@ def save_credentials(payload: dict[str, Any]) -> dict[str, Any]:
             updates[permitted[field]] = value
     if not updates:
         raise ValueError("enter at least one credential value to save")
-    env_path = STATE / ".env"
+    env_path = account_credentials_path()
     existing = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
     retained = [
         line for line in existing

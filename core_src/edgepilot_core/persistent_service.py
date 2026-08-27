@@ -38,7 +38,7 @@ def _run(command: list[str]) -> None:
     subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
 
-def _register(root: Path, service_id: str, windows_task: str) -> None:
+def _register(root: Path, service_id: str, windows_task: str, *, restart: bool = True) -> None:
     launcher = root / "launcher.py"
     if sys.platform == "darwin":
         agents = Path.home() / "Library" / "LaunchAgents"; agents.mkdir(parents=True, exist_ok=True)
@@ -48,12 +48,19 @@ def _register(root: Path, service_id: str, windows_task: str) -> None:
         _atomic(plist, plistlib.dumps(payload))
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)])
-        _run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service_id}"])
+        if restart:
+            _run(["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{service_id}"])
     elif os.name == "nt":
         _run(["schtasks", "/Create", "/TN", windows_task, "/TR", f'"{sys.executable}" "{launcher}"', "/SC", "ONLOGON", "/F"])
-        _run(["schtasks", "/Run", "/TN", windows_task])
+        if restart:
+            _run(["schtasks", "/Run", "/TN", windows_task])
     else:
         raise RuntimeError("长期运行当前只支持 macOS 和 Windows")
+
+
+def register_launcher(root: Path, service_id: str, windows_task: str, *, restart: bool = True) -> None:
+    """Register a product-owned stable launcher using the shared OS adapter."""
+    _register(root, service_id, windows_task, restart=restart)
 
 
 def _unregister(root: Path, service_id: str, windows_task: str) -> None:
@@ -66,6 +73,11 @@ def _unregister(root: Path, service_id: str, windows_task: str) -> None:
         subprocess.run(["schtasks", "/Delete", "/TN", windows_task, "/F"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     else:
         raise RuntimeError("长期运行当前只支持 macOS 和 Windows")
+
+
+def unregister_launcher(root: Path, service_id: str, windows_task: str) -> None:
+    """Unregister a product-owned launcher without deleting product state."""
+    _unregister(root, service_id, windows_task)
 
 
 def _wait_for_service(config: Any, *, previous_pid: object, timeout: float = 10.0) -> dict[str, Any]:

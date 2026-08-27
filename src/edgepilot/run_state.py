@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,10 @@ def register_running(runs_path: Path, run_id: str) -> None:
             _write_json_atomic(runs_path / run_id / EXECUTION_FILE, {
                 "status": "RUNNING",
                 "pid": pid,
+                "process_start_token": process_start_token(pid),
+                "job_id": os.environ.get("EDGEPILOT_JOB_ID"),
+                "build_id": os.environ.get("EDGEPILOT_BUILD_ID"),
+                "runtime_release_id": os.environ.get("EDGEPILOT_RUNTIME_RELEASE_ID"),
                 "started_at": datetime.now(timezone.utc).isoformat(),
             })
         except OSError:
@@ -91,6 +96,9 @@ def record_execution_result(runs_path: Path, run_id: str, *, failed: BaseExcepti
         "started_at": previous.get("started_at"),
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
+    for key in ("process_start_token", "job_id", "build_id", "runtime_release_id"):
+        if previous.get(key) is not None:
+            payload[key] = previous[key]
     if failed is not None:
         from edgepilot.app_logging import redact
 
@@ -131,7 +139,11 @@ def _running_runs_unlocked(runs_path: Path) -> dict[str, int]:
             parsed_pid = int(pid)
         except (TypeError, ValueError):
             continue
-        if _pid_exists(parsed_pid):
+        outcome = load_execution(runs_path, str(run_id))
+        expected_token = outcome.get("process_start_token") if outcome.get("pid") == parsed_pid else None
+        if _pid_exists(parsed_pid) and (
+            not isinstance(expected_token, str) or process_start_token(parsed_pid) == expected_token
+        ):
             active[str(run_id)] = parsed_pid
         else:
             stale.append((str(run_id), parsed_pid))
@@ -152,6 +164,7 @@ def _record_unexpected_exit(runs_path: Path, run_id: str, pid: int) -> None:
     outcome.update({
         "status": "FAILED",
         "finished_at": datetime.now(timezone.utc).isoformat(),
+        "returncode": None,
         "error": {
             "code": "PROCESS_EXITED_UNEXPECTEDLY",
             "message": "The strategy process exited without reporting a final status.",
@@ -241,3 +254,53 @@ def _pid_exists(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def pid_matches(pid: object, start_token: object = None) -> bool:
+    if type(pid) is not int or not _pid_exists(pid):
+        return False
+    return not isinstance(start_token, str) or process_start_token(pid) == start_token
+
+
+def process_start_token(pid: int) -> str | None:
+    """Return an OS process-birth token so a reused PID is never trusted."""
+    if pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not handle:
+                return None
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            ok = ctypes.windll.kernel32.GetProcessTimes(
+                handle, ctypes.byref(creation), ctypes.byref(exit_time), ctypes.byref(kernel), ctypes.byref(user),
+            )
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return f"{creation.dwHighDateTime:08x}{creation.dwLowDateTime:08x}" if ok else None
+        except (AttributeError, OSError):
+            return None
+    proc_stat = Path(f"/proc/{pid}/stat")
+    try:
+        fields = proc_stat.read_text(encoding="ascii").split()
+        if len(fields) > 21:
+            return f"linux:{fields[21]}"
+    except OSError:
+        pass
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = completed.stdout.strip()
+    return f"ps:{value}" if completed.returncode == 0 and value else None

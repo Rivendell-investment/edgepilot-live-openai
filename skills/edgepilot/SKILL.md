@@ -9,7 +9,7 @@ Use the bundled `edgepilot` CLI. Do not generate ad hoc node scripts or recreate
 
 ## First-run strategy guidance
 
-On the first user-visible reply after EdgePilot Live is selected in a new ChatGPT conversation, start with a short welcome in the user's current language. Identify the product exactly as **EdgePilot Live** and explain that it can clarify a strategy preference, test strategies with historical data, and later run Paper, exchange Demo, or explicitly confirmed Live trading. In that same reply, explain that the bundled local Dashboard has started, is reachable only on this device, and normally stops when ChatGPT closes or the plugin is disabled; offer long-term background operation only as an explicit later choice. Do not call it EdgePilot Research and do not wait for `open_dashboard` before giving this lifecycle guidance.
+On the first user-visible reply after EdgePilot Live is selected in a new ChatGPT conversation, keep the existing product interaction concise and use the user's current language. Identify the product exactly as **EdgePilot Live**, then respond directly to the user's intent. For strategy-selection requests, ask the first unanswered preference question immediately. Do not volunteer Dashboard architecture, service sharing, leases, process lifetime, background startup, upgrade, or old-tab guidance in this flow. Explain lifecycle details only when the user opens the Dashboard, changes background operation, upgrades the plugin, or is diagnosing a lifecycle problem. Do not call it EdgePilot Research.
 
 Treat `Help me choose an EdgePilot strategy` and equivalent recommendation requests as onboarding routes. Ask one unanswered V2 question at a time, in the user's language, and map only unambiguous answers to `profit_style`, `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`, and `universe`. After showing the completed preference summary and receiving confirmation, call the bundled `recommend_strategies` MCP tool with only `questionnaire_version: "2.0"`, those seven canonical answers, and `locale`. Using that tool is required when it is available because its structured result is bound to the ChatGPT recommendation-card UI. Do not replace the tool call with a direct HTTP request, CLI request, or a manually formatted ranking. If the tool is unavailable, disclose that the current surface cannot render the formal three-card result and offer catalog browsing instead.
 
@@ -17,16 +17,27 @@ Preserve the returned `best_fit`, `safer`, and `more_aggressive` roles and exact
 
 ## Local dashboard
 
-The bundled local stdio MCP starts the localhost Dashboard automatically while
-this plugin is enabled in ChatGPT. Use `open_dashboard` to return its real
+Only when the user has just installed or upgraded EdgePilot Live and wants to
+open the Dashboard, tell them to fully restart Codex first. Updating plugin files
+does not hot-replace an MCP process that is already running. During upgrade
+diagnosis, treat installation as file delivery until a new Codex session exposes
+the EdgePilot Live MCP tools from the installed build; then close old Dashboard
+tabs and use only the URL returned by that new session. Do not include this
+guidance in ordinary strategy-selection, backtest, or trading conversations.
+
+The bundled local stdio MCP connects to the single localhost Live service on
+the first Dashboard operation. Use `open_dashboard` to return its real
 loopback URL; never assume port 8787, scan ports, or start a second server. It reads
 the same persistent run records, timeseries, fills, positions, runtime
 snapshots, and PNG artifacts as the CLI; do not create a second backtest or
 execution implementation for the UI.
 
-The default website follows the MCP/ChatGPT process lifetime. Explain:
-“EdgePilot Live 已自动启动本地网站（仅本机可访问）。关闭 ChatGPT 或停用 EdgePilot Live 后，网站会自动关闭。若希望退出 ChatGPT 后仍在本机后台运行并随系统启动，请回复：让 EdgePilot Live 长期运行。”
-Only after that exact product-specific request and explicit tool confirmation,
+The default website uses renewable chat and browser leases internally. Do not
+expose those implementation terms in normal conversation. When the Dashboard is
+opened, say only that it is local to this device and that closing the current chat
+will not interrupt active tasks. Mention system startup only after the user asks
+for long-term background operation. Only after that product-specific request and
+explicit tool confirmation,
 use `enable_persistent_dashboard`; disclose
 `capital.rivendell.edgepilot.live.dashboard` (Windows: `\EdgePilot\Live Dashboard`).
 For “恢复 EdgePilot Live 随 Codex 运行”, confirm and use
@@ -182,14 +193,14 @@ Python libraries. Prefer the bundled cross-platform installer
 (`skills/edgepilot/scripts/install_runtime.py`). It uses **uv** to install the Python version
 required by the hosted wheel (from `manifest.json`), creates a local venv, installs the
 **prebuilt** `nautilus_trader` wheel from the marketplace runtime host (or an explicit local
-wheel path for smoke tests), then installs the plugin editable. It does **not** vendor or
+wheel path for smoke tests), then installs a non-editable copy of the exact plugin build. It does **not** vendor or
 compile Nautilus. The hosted Live wheel currently uses CPython 3.12 on macOS and Windows; uv
 installs that exact version.
 The installer always builds a separate relocatable candidate environment, runs `pip check`,
 imports EdgePilot, its packaged backtest core, NautilusTrader, and the required Live adapters,
 and exercises the CLI before activation. It then swaps the candidate into the stable `.venv`
 path, keeps the prior environment as `.venv.previous`, and restores it if the post-activation
-check fails. Never install an upgrade directly into the active environment.
+check fails. Runtime state records a native fingerprint from the Python version, dependency contract and hosted wheel digest, while the plugin content digest is tracked separately. MCP, UI or plugin-only upgrades reuse the verified native runtime, update EdgePilot in a candidate copy and switch atomically; a native-contract mismatch or partial upgrade performs a full rebuild. Never install an upgrade directly into the active environment.
 
 ```bash
 # plugin-root = directory that contains edgepilot/pyproject.toml (the extracted plugin)

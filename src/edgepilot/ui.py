@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import logging
 import mimetypes
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import secrets
+import tempfile
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -23,8 +26,13 @@ from urllib.parse import parse_qs, urlparse
 from edgepilot.dashboard_common import ConfigConflictError
 from edgepilot.dashboard_common import safe_config_name
 from edgepilot.dashboard_common import safe_directory
-from edgepilot.env_file import load_env
+from edgepilot.env_file import read_env
 from edgepilot.marketplace import MarketplaceRequestError, install_package
+from edgepilot.paths import ACCOUNT_KEY_ENV
+from edgepilot.paths import account_credentials_path
+from edgepilot.paths import active_account_key
+from edgepilot.paths import bind_account_key
+from edgepilot.paths import clear_bound_account_key
 from edgepilot.paths import state_root
 from edgepilot.paths import find_run_directory
 from edgepilot.paths import iter_run_directories
@@ -34,8 +42,11 @@ from edgepilot.run_state import request_emergency_stop
 from edgepilot.run_state import load_execution
 from edgepilot.run_state import running_runs
 from edgepilot.run_state import run_status
+from edgepilot.run_state import pid_matches
+from edgepilot.run_state import process_start_token
 from edgepilot.app_logging import configure_logging
 from edgepilot.locale import SUPPORTED_LANGUAGES, normalize_supported_locale
+from edgepilot.marketplace_origin import marketplace_origin
 from edgepilot import auth
 
 
@@ -50,33 +61,37 @@ CATALOG_ROOT = STATE / "catalog"
 CATALOG = CATALOG_ROOT / "data"
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = Lock()
+JOB_STORE: Path | None = None
+JOB_STORE_IDENTITY: dict[str, Any] = {}
+ACCOUNT_SESSION_LOCK = Lock()
 RUNTIME_INSTALL_LOCK = Lock()
+LEGACY_MIGRATION_LOCK = Lock()
 
-# The dashboard process launches child CLI commands, so it needs the same
-# local-only environment values as the CLI itself. Values never leave this
-# process or appear in an API response.
-load_env(STATE / ".env")
 LOGGER = configure_logging()
 
-
-def _run_login_worker(started: dict[str, Any]) -> None:
-    def poll() -> None:
-        try:
-            auth.poll_login(started)
-        except auth.AuthError as exc:
-            LOGGER.warning("dashboard login failed", extra={"event": "dashboard.auth.login_failed", "result": "failed",
-                           "params": {"code": str(exc), "stage": exc.stage or "unknown", **exc.diagnostics}})
-
-    Thread(target=poll, daemon=True).start()
+_EXCHANGE_CREDENTIAL_NAME = re.compile(
+    r"^[A-Z0-9]+_(?:PAPER|DEMO|LIVE)_(?:API_KEY|API_SECRET|API_PASSPHRASE|PASSPHRASE|USERNAME|PASSWORD|PRIVATE_KEY)$"
+)
 
 
-def _plugin_environment() -> dict[str, str]:
+def _plugin_environment(account_key: str | None = None) -> dict[str, str]:
     from edgepilot.runtime import plugin_root
     root = plugin_root()
     core = root / "core_src"
     if not core.is_dir():
         core = root.parent / "edgepilot-core" / "src"
     environment = dict(os.environ)
+    for name in tuple(environment):
+        if _EXCHANGE_CREDENTIAL_NAME.fullmatch(name):
+            environment.pop(name, None)
+    selected_account = account_key or active_account_key()
+    if selected_account:
+        environment[ACCOUNT_KEY_ENV] = selected_account
+        credentials_path = state_root() / "accounts" / selected_account / ".env"
+    else:
+        environment.pop(ACCOUNT_KEY_ENV, None)
+        credentials_path = state_root() / ".env"
+    environment.update(read_env(credentials_path))
     python_path = [str(root / "src"), str(core)]
     if environment.get("PYTHONPATH"):
         python_path.append(environment["PYTHONPATH"])
@@ -92,7 +107,7 @@ def _runtime_dashboard_call(operation: str, payload: dict[str, Any]) -> Any:
         [str(active_runtime_python()), "-m", "edgepilot.dashboard_worker"],
         input=json.dumps({"operation": operation, "payload": payload}, separators=(",", ":")),
         cwd=STATE,
-        env=_plugin_environment(),
+        env=_plugin_environment(active_account_key()),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -153,11 +168,33 @@ _MARKETPLACE_ERROR_RESPONSES = {
     "AUTH_SERVICE_UNAVAILABLE": (503, "the authentication service is unavailable"),
 }
 
+_AUTH_ERROR_RESPONSES = {
+    "INVALID_REQUEST": (400, "the login request is invalid", False),
+    "INVALID_EMAIL_CODE": (400, "the code is invalid or expired", False),
+    "AUTH_REQUIRED": (401, "the login flow expired", False),
+    "LOGIN_EXPIRED": (410, "the login flow expired", False),
+    "LOGIN_NOT_READY": (409, "the login could not be completed", True),
+    "GOOGLE_CREDENTIAL_INVALID": (401, "Google sign-in was invalid or expired", False),
+    "GOOGLE_PROVIDER_UNAVAILABLE": (503, "Google sign-in is temporarily unavailable", True),
+    "ACCOUNT_SWITCH_REQUIRES_LOGOUT": (409, "sign out before using another account", False),
+    "RATE_LIMITED": (429, "too many login requests; try again later", True),
+    "SERVER_UPDATE_REQUIRED": (503, "Marketplace Server must be updated before Dashboard login can be used", False),
+    "AUTH_SERVICE_UNAVAILABLE": (503, "the authentication service is unavailable", True),
+    "CREDENTIAL_STORE_ERROR": (503, "the local credential store is unavailable", True),
+    "PROTOCOL_ERROR": (502, "the authentication service returned an invalid response", True),
+}
+
 
 def _marketplace_request_error(handler: BaseHTTPRequestHandler, exc: MarketplaceRequestError) -> None:
     status, message = _MARKETPLACE_ERROR_RESPONSES.get(exc.code, (500, "the recommendation request failed"))
     code = exc.code if exc.code in _MARKETPLACE_ERROR_RESPONSES else "INTERNAL_ERROR"
     _error(handler, code, message, status, **exc.public_details())
+
+
+def _auth_request_error(handler: BaseHTTPRequestHandler, exc: auth.AuthError) -> None:
+    status, message, retryable = _AUTH_ERROR_RESPONSES.get(exc.code, (502, "the authentication request failed", True))
+    code = exc.code if exc.code in _AUTH_ERROR_RESPONSES else "AUTH_SERVICE_UNAVAILABLE"
+    _error(handler, code, message, status, retryable=retryable)
 
 
 def _dashboard_config(language: str | None) -> dict[str, Any]:
@@ -185,6 +222,9 @@ def _run_records() -> list[dict[str, Any]]:
                 "invalid local run skipped",
                 extra={"event": "dashboard.run.invalid", "result": "skipped", "params": {"run_id": path.name}},
             )
+            continue
+        owner = record.pop("owner_account_key", None)
+        if owner is not None and owner != active_account_key():
             continue
         record["run_id"] = path.name
         active = running_runs(path.parent)
@@ -279,9 +319,225 @@ def _catalog_records() -> list[dict[str, Any]]:
     return records
 
 
+class LegacyStateConflict(RuntimeError):
+    pass
+
+
+def _legacy_state_summary() -> dict[str, Any]:
+    legacy_strategies = state_root() / "strategies"
+    strategy_count = sum(1 for path in legacy_strategies.iterdir() if path.is_dir() and path.name != ".locks") \
+        if legacy_strategies.is_dir() else 0
+    return {
+        "available": strategy_count > 0 or (state_root() / ".env").is_file(),
+        "strategy_count": strategy_count,
+        "has_credentials": (state_root() / ".env").is_file(),
+    }
+
+
+def _legacy_has_active_runs() -> bool:
+    root = state_root() / "strategies"
+    if not root.is_dir():
+        return False
+    for strategy in root.iterdir():
+        runs = strategy / "runs"
+        if runs.is_dir() and running_runs(runs):
+            return True
+    return False
+
+
+def _claim_legacy_state() -> dict[str, Any]:
+    """Atomically assign unowned pre-account state after an explicit UI confirmation."""
+    if active_account_key() is None:
+        raise auth.AuthError("AUTH_REQUIRED")
+    source_strategies = state_root() / "strategies"
+    source_credentials = state_root() / ".env"
+    destination_strategies = strategies_state_root()
+    destination_credentials = account_credentials_path()
+    with LEGACY_MIGRATION_LOCK:
+        summary = _legacy_state_summary()
+        if not summary["available"]:
+            return {"claimed": False, "reason": "NO_LEGACY_STATE"}
+        if _legacy_has_active_runs():
+            raise LegacyStateConflict("LEGACY_ACTIVE_WORK")
+        destination_entries = list(destination_strategies.iterdir()) if destination_strategies.is_dir() else []
+        meaningful_entries = [path for path in destination_entries if path.name not in {"__init__.py", ".locks"}]
+        if meaningful_entries or destination_credentials.exists():
+            raise LegacyStateConflict("ACCOUNT_STATE_NOT_EMPTY")
+        temporary = destination_strategies.parent / f".legacy-empty-{secrets.token_hex(8)}"
+        moved_strategies = False
+        moved_credentials = False
+        try:
+            if destination_strategies.exists():
+                destination_strategies.replace(temporary)
+            if source_strategies.exists():
+                source_strategies.replace(destination_strategies)
+                moved_strategies = True
+            if source_credentials.exists():
+                destination_credentials.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                source_credentials.replace(destination_credentials)
+                moved_credentials = True
+            if temporary.exists():
+                shutil.rmtree(temporary)
+        except Exception:
+            if moved_credentials and destination_credentials.exists():
+                destination_credentials.replace(source_credentials)
+            if moved_strategies and destination_strategies.exists():
+                destination_strategies.replace(source_strategies)
+            if temporary.exists():
+                temporary.replace(destination_strategies)
+            raise
+        return {"claimed": True, "strategy_count": summary["strategy_count"], "credentials_moved": moved_credentials}
+
+
 def _job_view(job: dict[str, Any]) -> dict[str, Any]:
     """Return only serializable, safe job fields to the browser."""
-    return {key: value for key, value in job.items() if not key.startswith("_")}
+    return {key: value for key, value in job.items() if not key.startswith("_") and key != "owner_account_key"}
+
+
+def _write_job_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(value, output, sort_keys=True, separators=(",", ":"), default=str)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _persist_job_locked(job_id: str) -> None:
+    if JOB_STORE is None or job_id not in JOBS:
+        return
+    job = {key: value for key, value in JOBS[job_id].items() if not key.startswith("_")}
+    job.setdefault("service_instance_id", JOB_STORE_IDENTITY.get("instance_nonce"))
+    job.setdefault("build_id", JOB_STORE_IDENTITY.get("build_id"))
+    try:
+        _write_job_atomic(JOB_STORE / f"{job_id}.json", job)
+    except OSError:
+        LOGGER.exception(
+            "Dashboard job state could not be persisted",
+            extra={"event": "dashboard.job.persist_failed", "job_id": job_id, "result": "failed"},
+        )
+
+
+def configure_job_store(directory: Path, identity: dict[str, Any]) -> None:
+    """Restore durable jobs when the single Live service starts."""
+    global JOB_STORE, JOB_STORE_IDENTITY
+    directory.mkdir(parents=True, exist_ok=True)
+    JOB_STORE = directory
+    JOB_STORE_IDENTITY = dict(identity)
+    restored: dict[str, dict[str, Any]] = {}
+    for path in sorted(directory.glob("job-*.json")):
+        value = _read_json(path, None)
+        if not isinstance(value, dict) or value.get("job_id") != path.stem:
+            continue
+        job = dict(value)
+        output_path = directory / f"{path.stem}.log"
+        if output_path.is_file():
+            try:
+                with output_path.open("rb") as output:
+                    output.seek(max(0, output_path.stat().st_size - 12000))
+                    job["output"] = _strip_ansi(output.read(12000).decode("utf-8", errors="replace"))
+                job["output_path"] = str(output_path)
+            except OSError:
+                pass
+        if not isinstance(job.get("run_id"), str):
+            discovered = _find_persisted_job_run(directory.parent, path.stem)
+            if discovered is not None:
+                job["run_id"] = discovered
+        if job.get("status") in {"QUEUED", "RUNNING", "STOPPING"}:
+            pid = job.get("pid")
+            if pid_matches(pid, job.get("process_start_token")):
+                job.update(recovered=True, message="本地服务已恢复对此任务的观察；停止将通过运行记录协调。")
+            else:
+                job.update(
+                    status="FAILED",
+                    stage="lost",
+                    message="任务进程已经退出。",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                    returncode=None,
+                    error="本地服务重启后未找到对应任务进程。",
+                    error_code="JOB_PROCESS_LOST",
+                )
+        restored[path.stem] = job
+    with JOBS_LOCK:
+        JOBS.clear()
+        JOBS.update(restored)
+        for job_id in restored:
+            _persist_job_locked(job_id)
+
+
+def _find_persisted_job_run(root: Path, job_id: str) -> str | None:
+    strategy_roots = [root / "strategies"]
+    accounts = root / "accounts"
+    if accounts.is_dir():
+        strategy_roots.extend(path / "strategies" for path in accounts.iterdir() if path.is_dir())
+    matches: list[str] = []
+    for strategies in strategy_roots:
+        for execution in strategies.glob("*/runs/*/execution.json") if strategies.is_dir() else ():
+            value = _read_json(execution, {})
+            if isinstance(value, dict) and value.get("job_id") == job_id:
+                matches.append(execution.parent.name)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _job_belongs_to_active_account(job: dict[str, Any]) -> bool:
+    return job.get("owner_account_key") == active_account_key()
+
+
+def _reconcile_recovered_jobs_locked() -> None:
+    """Resolve stale durable jobs before they are reported as active."""
+    for job_id, job in JOBS.items():
+        if job.get("status") not in {"QUEUED", "RUNNING", "STOPPING"} or job.get("_process") is not None:
+            continue
+        pid = job.get("pid")
+        if type(pid) is not int or pid_matches(pid, job.get("process_start_token")):
+            continue
+        stopping = job.get("status") == "STOPPING"
+        job.update(
+            status="STOPPED" if stopping else "FAILED",
+            stage="stopped" if stopping else "lost",
+            message="任务已停止。" if stopping else "任务进程已经退出。",
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            returncode=None,
+            error=None if stopping else "本地服务检测到任务进程已经退出。",
+            error_code=None if stopping else "JOB_PROCESS_LOST",
+        )
+        _persist_job_locked(job_id)
+
+
+def _active_account_work() -> bool:
+    if any(row.get("status") == "RUNNING" for row in _run_records()):
+        return True
+    with JOBS_LOCK:
+        return any(
+            _job_belongs_to_active_account(job) and job.get("status") in {"QUEUED", "RUNNING", "STOPPING"}
+            for job in JOBS.values()
+        )
+
+
+def _all_active_work() -> bool:
+    """Return service-wide work, including every authenticated account."""
+    with JOBS_LOCK:
+        _reconcile_recovered_jobs_locked()
+        if any(job.get("status") in {"QUEUED", "RUNNING", "STOPPING"} for job in JOBS.values()):
+            return True
+    roots = [state_root() / "strategies"]
+    accounts = state_root() / "accounts"
+    if accounts.is_dir():
+        roots.extend(path / "strategies" for path in accounts.iterdir() if path.is_dir())
+    for strategies in roots:
+        if not strategies.is_dir():
+            continue
+        for registry in strategies.glob("*/runs/running.json"):
+            if running_runs(registry.parent):
+                return True
+    return False
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
@@ -336,6 +592,70 @@ def _execution_failure_message(kind: str) -> str:
     return "交易任务执行失败；可查看任务输出后重试。"
 
 
+def _terminate_job_process(process: subprocess.Popen[str], job_id: str) -> None:
+    """Stop one isolated job tree and escalate only after a bounded grace period."""
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    def escalate() -> None:
+        try:
+            process.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["message"] = "任务未在宽限期内退出，已强制终止进程组。"
+                    _persist_job_locked(job_id)
+        except ProcessLookupError:
+            pass
+
+    Thread(target=escalate, name=f"edgepilot-stop-{job_id}", daemon=True).start()
+
+
+def _terminate_recovered_job(pid: int, start_token: str, job_id: str) -> None:
+    """Terminate only the verified process group created for a recovered job."""
+    if not pid_matches(pid, start_token):
+        return
+    try:
+        if os.name == "nt":
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    def escalate() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and pid_matches(pid, start_token):
+            time.sleep(0.1)
+        if not pid_matches(pid, start_token):
+            return
+        try:
+            if os.name == "nt":
+                os.kill(pid, signal.SIGTERM)
+            else:
+                os.killpg(pid, signal.SIGKILL)
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id]["message"] = "恢复任务未在宽限期内退出，已强制终止进程组。"
+                    _persist_job_locked(job_id)
+        except ProcessLookupError:
+            pass
+
+    Thread(target=escalate, name=f"edgepilot-recovered-stop-{job_id}", daemon=True).start()
+
+
 def _start_job(
     *,
     kind: str,
@@ -344,26 +664,35 @@ def _start_job(
     starting_stage: str = "starting",
     starting_message: str = "启动任务",
 ) -> str:
+    owner_account_key = active_account_key()
     job_id = f"job-{__import__('datetime').datetime.now().strftime('%Y%m%d%H%M%S%f')}"
-    with JOBS_LOCK:
-        JOBS[job_id] = {
-            "job_id": job_id,
-            "kind": kind,
-            "status": "QUEUED",
-            "output": "",
-            "run_id": None,
-            "error": None,
-            "stage": "preparing",
-            "message": "准备运行环境" if prepare else "等待启动",
-            "downloaded_bytes": 0,
-            "total_bytes": None,
-            "percent": None,
-        }
+    with ACCOUNT_SESSION_LOCK:
+        if owner_account_key is not None and os.environ.get(ACCOUNT_KEY_ENV) != owner_account_key:
+            raise auth.AuthError("AUTH_REQUIRED")
+        with JOBS_LOCK:
+            JOBS[job_id] = {
+                "job_id": job_id,
+                "owner_account_key": owner_account_key,
+                "kind": kind,
+                "status": "QUEUED",
+                "output": "",
+                "run_id": None,
+                "error": None,
+                "stage": "preparing",
+                "message": "准备运行环境" if prepare else "等待启动",
+                "downloaded_bytes": 0,
+                "total_bytes": None,
+                "percent": None,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _persist_job_locked(job_id)
 
     def run_process() -> None:
+        bind_account_key(owner_account_key)
         LOGGER.info("job started", extra={"event": "dashboard.job.started", "job_id": job_id, "params": {"kind": kind}})
         with JOBS_LOCK:
-            JOBS[job_id]["status"] = "RUNNING"
+            JOBS[job_id].update(status="RUNNING", started_at=datetime.now(timezone.utc).isoformat())
+            _persist_job_locked(job_id)
         phase = "runtime_prepare" if prepare is not None else "command_resolution"
         try:
             if prepare is not None:
@@ -372,6 +701,7 @@ def _start_job(
             actual_command = command() if callable(command) else command
             with JOBS_LOCK:
                 JOBS[job_id].update(stage=starting_stage, message=starting_message, percent=100)
+                _persist_job_locked(job_id)
         except BaseException as error:
             with JOBS_LOCK:
                 JOBS[job_id].update(
@@ -380,7 +710,10 @@ def _start_job(
                     message=_prestart_failure_message(phase),
                     error=str(error),
                     returncode=None,
+                    error_code="JOB_PRESTART_FAILED",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
                 )
+                _persist_job_locked(job_id)
             LOGGER.exception(
                 "job failed before process start",
                 extra={
@@ -398,27 +731,51 @@ def _start_job(
                     stage="complete",
                     message=starting_message,
                     returncode=0,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
                 )
+                _persist_job_locked(job_id)
             LOGGER.info(
                 "job completed",
                 extra={"event": "dashboard.job.completed", "job_id": job_id, "result": "success", "params": {"kind": kind, "returncode": 0}},
             )
             return
         STATE.mkdir(parents=True, exist_ok=True)
+        job_environment = _plugin_environment(owner_account_key)
+        job_environment["EDGEPILOT_JOB_ID"] = job_id
+        if isinstance(JOB_STORE_IDENTITY.get("build_id"), str):
+            job_environment["EDGEPILOT_BUILD_ID"] = JOB_STORE_IDENTITY["build_id"]
+        runtime_identity: dict[str, Any] = {}
+        try:
+            from edgepilot.runtime import runtime_status
+
+            runtime_identity = runtime_status()
+            release_id = runtime_identity.get("release_id") or runtime_identity.get("active_release")
+            if isinstance(release_id, str):
+                job_environment["EDGEPILOT_RUNTIME_RELEASE_ID"] = release_id
+        except Exception:
+            pass
+        output_path = (JOB_STORE or (STATE / "dashboard-jobs")) / f"{job_id}.log"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = output_path.open("wb")
         try:
             process = subprocess.Popen(
                 actual_command,
                 cwd=str(STATE),
-                env=_plugin_environment(),
-                stdout=subprocess.PIPE,
+                env=job_environment,
+                # A file descriptor owned by the child survives an abnormal
+                # supervisor exit; a PIPE would make later writes fail.
+                stdout=output_file,
                 stderr=subprocess.STDOUT,
                 text=True,
                 # Nautilus logs are UTF-8 with ANSI. Chinese Windows defaults to GBK.
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                start_new_session=os.name != "nt",
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
             )
         except Exception as error:
+            output_file.close()
             with JOBS_LOCK:
                 JOBS[job_id].update(
                     status="FAILED",
@@ -426,7 +783,10 @@ def _start_job(
                     message=_prestart_failure_message("process_start"),
                     error=str(error) or "Process could not start",
                     returncode=None,
+                    error_code="JOB_PROCESS_START_FAILED",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
                 )
+                _persist_job_locked(job_id)
             LOGGER.exception(
                 "job process could not start",
                 extra={
@@ -437,18 +797,57 @@ def _start_job(
                 },
             )
             return
+        output_file.close()
         with JOBS_LOCK:
-            JOBS[job_id]["_process"] = process
-        lines: list[str] = []
-        assert process.stdout is not None
-        for line in process.stdout:
+            process_pid = getattr(process, "pid", None)
+            JOBS[job_id].update(
+                _process=process,
+                pid=process_pid if type(process_pid) is int else None,
+                process_start_token=process_start_token(process_pid) if type(process_pid) is int else None,
+                python_executable=str(actual_command[0]) if actual_command else None,
+                output_path=str(output_path),
+                service_instance_id=JOB_STORE_IDENTITY.get("instance_nonce"),
+                build_id=JOB_STORE_IDENTITY.get("build_id"),
+            )
+            JOBS[job_id]["runtime_release_id"] = runtime_identity.get("release_id") or runtime_identity.get("active_release")
+            JOBS[job_id]["runtime_fingerprint"] = runtime_identity.get("runtime_fingerprint")
+            _persist_job_locked(job_id)
+        output_tail = ""
+        last_output_persisted = 0.0
+
+        def consume(line: str) -> None:
+            nonlocal last_output_persisted, output_tail
             cleaned = _strip_ansi(line)
-            lines.append(cleaned)
+            output_tail = (output_tail + cleaned)[-12000:]
             with JOBS_LOCK:
-                JOBS[job_id]["output"] = "".join(lines)[-12000:]
-        process.stdout.close()
+                JOBS[job_id]["output"] = output_tail
+                detected_run = _job_run_id(output_tail)
+                if detected_run is not None:
+                    JOBS[job_id]["run_id"] = detected_run
+                now = time.monotonic()
+                if now - last_output_persisted >= 0.5:
+                    _persist_job_locked(job_id)
+                    last_output_persisted = now
+
+        # Test doubles may still expose stdout. Real children write to the
+        # durable log and are tailed through a separate descriptor.
+        process_stdout = getattr(process, "stdout", None)
+        if process_stdout is not None:
+            for line in process_stdout:
+                consume(line)
+            process_stdout.close()
+        else:
+            with output_path.open("r", encoding="utf-8", errors="replace") as output_reader:
+                while True:
+                    line = output_reader.readline()
+                    if line:
+                        consume(line)
+                    elif process.poll() is not None:
+                        break
+                    else:
+                        time.sleep(0.05)
         returncode = process.wait()
-        output = "".join(lines)
+        output = output_tail
         run_id = _job_run_id(output)
         with JOBS_LOCK:
             stopping = JOBS[job_id].get("status") == "STOPPING"
@@ -460,8 +859,11 @@ def _start_job(
                 run_id=run_id,
                 returncode=returncode,
                 error=None if returncode == 0 or stopping else _job_error(output, returncode),
+                error_code=None if returncode == 0 or stopping else "JOB_PROCESS_EXITED",
+                finished_at=datetime.now(timezone.utc).isoformat(),
             )
             JOBS[job_id].pop("_process", None)
+            _persist_job_locked(job_id)
         LOGGER.log(
             logging.INFO if returncode == 0 else logging.ERROR,
             "job completed",
@@ -473,8 +875,15 @@ def _start_job(
             run_process()
         except Exception as exc:
             with JOBS_LOCK:
-                JOBS[job_id].update(status="FAILED", returncode=None, error=str(exc) or "Process could not start")
+                JOBS[job_id].update(
+                    status="FAILED",
+                    returncode=None,
+                    error=str(exc) or "Process could not start",
+                    error_code="JOB_SUPERVISOR_FAILED",
+                    finished_at=datetime.now(timezone.utc).isoformat(),
+                )
                 JOBS[job_id].pop("_process", None)
+                _persist_job_locked(job_id)
             LOGGER.exception(
                 "job failed",
                 extra={
@@ -552,6 +961,9 @@ def _run_detail(run_id: str) -> dict[str, Any]:
     record = _read_json(directory / "run.json", None)
     if record is None:
         raise FileNotFoundError(run_id)
+    owner = record.pop("owner_account_key", None)
+    if owner is not None and owner != active_account_key():
+        raise FileNotFoundError(run_id)
     record["run_id"] = run_id
     active = running_runs(directory.parent)
     record["status"] = run_status(directory.parent, run_id, record.get("mode"), active=active)
@@ -576,6 +988,9 @@ def _runtime_detail(run_id: str) -> dict[str, Any]:
     runtime = _read_json(directory / "runtime.json", {})
     runtime["run_id"] = run_id
     record = _read_json(directory / "run.json", {})
+    owner = record.get("owner_account_key")
+    if owner is not None and owner != active_account_key():
+        raise FileNotFoundError(run_id)
     runtime["status"] = run_status(directory.parent, run_id, record.get("mode"))
     execution = load_execution(directory.parent, run_id)
     if execution:
@@ -617,6 +1032,7 @@ def _runtime_prepare(payload: dict[str, Any]) -> Callable[[str], None] | None:
                 with JOBS_LOCK:
                     percent = round(downloaded * 100 / total, 1) if downloaded is not None and total else None
                     JOBS[job_id].update(stage=stage, message=message, downloaded_bytes=downloaded or 0, total_bytes=total, percent=percent)
+                    _persist_job_locked(job_id)
 
             install_runtime(progress)
 
@@ -728,17 +1144,27 @@ def _start_trading(payload: dict[str, Any]) -> str:
         raise ValueError("mode must be paper, demo, or live")
     if mode == "live" and payload.get("confirm_live") is not True:
         raise ValueError("live trading requires explicit confirmation")
+    requested_venue = payload.get("venue")
+    venue: str | None = None
+    if requested_venue is not None:
+        venue = str(requested_venue).strip().upper() if isinstance(requested_venue, str) else ""
+        if not re.fullmatch(r"[A-Z0-9_]+", venue):
+            raise ValueError("invalid venue selection")
     run_id = payload.get("run_id")
     safe_run_id: str | None = None
     strategy_name: str | None = None
     preset: str | None = None
     if run_id:
+        if venue is not None:
+            raise ValueError("venue selection requires a strategy configuration, not an exact saved run")
         safe_run_id = _safe_run_id(str(run_id))
         try:
             find_run_directory(safe_run_id)
         except FileNotFoundError as exc:
             raise ValueError(f"unknown run: {safe_run_id}") from exc
     else:
+        if venue is None:
+            raise ValueError("select one venue")
         strategy_name = str(payload.get("strategy", "")).strip()
         preset_value = str(payload.get("preset", "")).strip()
         if not strategy_name or not preset_value:
@@ -755,6 +1181,8 @@ def _start_trading(payload: dict[str, Any]) -> str:
         else:
             assert strategy_name is not None and preset is not None
             arguments = ["-m", "edgepilot.cli", mode, "--strategy", strategy_name, "--preset", preset]
+            assert venue is not None
+            arguments.extend(["--venue", venue])
         if mode == "live":
             arguments.append("--confirm-live")
         return [str(active_runtime_python()), *arguments]
@@ -772,11 +1200,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "EdgePilotDashboard/1.0"
 
     def log_message(self, _format: str, *args: Any) -> None:
+        path = urlparse(self.path).path
+        if path.startswith("/auth/google/handoff/"):
+            path = "/auth/google/handoff/:token"
         LOGGER.info(
             "dashboard request",
             extra={
                 "event": "dashboard.http.completed",
-                "params": {"method": self.command, "path": urlparse(self.path).path, "status": args[1] if len(args) > 1 else None},
+                "params": {"method": self.command, "path": path, "status": args[1] if len(args) > 1 else None},
             },
         )
 
@@ -791,12 +1222,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         expected = getattr(self.server, "edgepilot_csrf", "")
         return self._valid_host() and self.headers.get("Origin") == self._origin() and secrets.compare_digest(self.headers.get("X-EdgePilot-CSRF", ""), expected)
 
+    def _valid_instance(self) -> bool:
+        identity = getattr(self.server, "edgepilot_identity", {})
+        nonce = identity.get("instance_nonce") if isinstance(identity, dict) else None
+        return self._valid_host() and isinstance(nonce, str) and secrets.compare_digest(
+            self.headers.get("X-EdgePilot-Instance", ""), nonce,
+        )
+
     def _auth_required(self) -> None:
         _error(self, "AUTH_REQUIRED", "Sign in to use EdgePilot.", 401, login={"action": "open_browser"})
 
     def _require_business_auth(self) -> bool:
         state = auth.status()
         if state.get("authenticated"):
+            bind_account_key(active_account_key())
             return True
         reason = str(state.get("reason", "AUTH_SERVICE_UNAVAILABLE"))
         if reason in {"NO_CREDENTIALS", "CREDENTIALS_INVALID", "REFRESH_REJECTED"}:
@@ -811,10 +1250,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
+        clear_bound_account_key()
         parsed = urlparse(self.path)
         try:
             if parsed.path.startswith("/api/") and not self._valid_host():
                 return _error(self, "INVALID_HOST", "invalid Host header", 400)
+            handoff = re.fullmatch(r"/auth/google/handoff/([A-Za-z0-9_-]{40,})", parsed.path)
+            if handoff:
+                if not self._valid_host():
+                    return _error(self, "INVALID_HOST", "invalid Host header", 400)
+                values = auth.dashboard_google_handoff(handoff.group(1))
+                nonce = secrets.token_urlsafe(18)
+                body = (
+                    "<!doctype html><html><head><meta charset=utf-8><meta name=viewport "
+                    "content=\"width=device-width,initial-scale=1\"><title>Google · EdgePilot</title>"
+                    f"<style nonce=\"{nonce}\">*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;"
+                    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f6f7fb;color:#111827}}"
+                    ".card{width:min(440px,calc(100vw - 32px));padding:40px;border:1px solid #e5e7eb;border-radius:20px;"
+                    "background:#fff;box-shadow:0 18px 50px rgba(15,23,42,.09)}h1{margin:0 0 16px;font-size:30px}"
+                    "p{margin:0 0 24px;color:#667085;line-height:1.6}button{width:100%;padding:12px 16px;border:0;"
+                    "border-radius:10px;background:#4338ca;color:#fff;font:inherit;font-weight:600;cursor:pointer}"
+                    "small{display:block;margin-top:14px;color:#98a2b3;text-align:center}</style></head>"
+                    "<body><main class=card><h1>EdgePilot</h1><p>Opening Google sign-in in your system browser…</p>"
+                    f"<form id=handoff method=post action=\"{html.escape(values['action'], quote=True)}\">"
+                    f"<input type=hidden name=flow_token value=\"{html.escape(values['flow_token'], quote=True)}\">"
+                    f"<input type=hidden name=csrf_token value=\"{html.escape(values['csrf_token'], quote=True)}\">"
+                    "<button type=submit>Continue with Google</button></form>"
+                    "<small>If nothing happens, select Continue with Google.</small></main>"
+                    f"<script nonce=\"{nonce}\">document.getElementById('handoff').submit()</script></body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header(
+                    "Content-Security-Policy",
+                    f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                    # Chromium applies form-action to the whole form navigation,
+                    # including the Marketplace endpoint's OAuth redirect.
+                    f"form-action {marketplace_origin()} https://accounts.google.com; "
+                    "base-uri 'none'; frame-ancestors 'none'",
+                )
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if parsed.path == "/":
                 return self._asset("app/index.html", "text/html; charset=utf-8")
             if parsed.path.startswith("/assets/"):
@@ -830,14 +1311,25 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 403)
                     return _json(self, identity)
                 return _json(self, {"ok": True})
-            login_match = re.fullmatch(r"/api/auth/login/([A-Za-z0-9_-]{20,})/status", parsed.path)
-            if login_match:
-                return _json(self, auth.login_status(login_match.group(1)))
+            if parsed.path == "/api/process/status":
+                if not self._valid_instance():
+                    return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 403)
+                state = getattr(self.server, "edgepilot_service_state", None)
+                return _json(self, {
+                    "active_work": _all_active_work(),
+                    "login_active": auth.dashboard_login_active(),
+                    "persistent": (state.root / "background-dashboard/enabled.json").is_file() if state is not None else False,
+                    "replacement_protocol": 1,
+                    "host_plugin_version": getattr(
+                        self.server, "edgepilot_host_plugin_version", None,
+                    ),
+                    "identity": getattr(self.server, "edgepilot_identity", None),
+                })
+            if parsed.path.startswith("/api/") and not self._require_business_auth():
+                return
             if parsed.path == "/api/runs/active":
                 return _json(self, {"runs": [{"run_id": row["run_id"], "strategy": row.get("strategy", {}).get("name", ""), "mode": row.get("mode", "")}
                     for row in _run_records() if row.get("status") == "RUNNING"]})
-            if parsed.path.startswith("/api/") and not self._require_business_auth():
-                return
             if parsed.path == "/api/marketplace/strategies":
                 from edgepilot.marketplace import search
                 query = parse_qs(parsed.query)
@@ -876,16 +1368,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _json(self, _run_records())
             if parsed.path == "/api/catalog":
                 return _json(self, _catalog_records())
+            if parsed.path == "/api/legacy-state":
+                return _json(self, _legacy_state_summary())
             if parsed.path == "/api/credentials":
                 return _json(self, _runtime_dashboard_call("credentials", {}))
             if parsed.path == "/api/jobs":
                 with JOBS_LOCK:
-                    return _json(self, [_job_view(job) for job in JOBS.values()])
+                    _reconcile_recovered_jobs_locked()
+                    return _json(self, [_job_view(job) for job in JOBS.values() if _job_belongs_to_active_account(job)])
             if parsed.path.startswith("/api/jobs/"):
                 job_id = parsed.path.rsplit("/", 1)[-1]
                 with JOBS_LOCK:
+                    _reconcile_recovered_jobs_locked()
                     job = JOBS.get(job_id)
-                if job is None:
+                if job is None or not _job_belongs_to_active_account(job):
                     return _error(self, "JOB_NOT_FOUND", "job not found", 404)
                 return _json(self, _job_view(job))
             if parsed.path.startswith("/api/runs/") and parsed.path.endswith("/chart"):
@@ -901,13 +1397,86 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _error(self, "NOT_FOUND", "not found", 404)
         except (ValueError, TypeError) as exc:
             _error(self, "VALIDATION_FAILED", str(exc), 400)
+        except auth.AuthError as exc:
+            LOGGER.warning("dashboard authentication request failed", extra={"event": "dashboard.auth.failed", "result": "failed", "params": {"method": "GET", "path": parsed.path, "code": exc.code}})
+            _auth_request_error(self, exc)
         except Exception as exc:  # keep the dashboard usable while surfacing errors
             LOGGER.exception("dashboard request failed", extra={"event": "dashboard.http.failed", "result": "failed", "params": {"method": self.command, "path": parsed.path}})
-            _error(self, "INTERNAL_ERROR", str(exc), 500)
+            _error(self, "INTERNAL_ERROR", "the local service could not complete the request", 500)
 
     def do_POST(self) -> None:  # noqa: N802
+        clear_bound_account_key()
         try:
             parsed = urlparse(self.path)
+            if parsed.path.startswith("/api/process/leases/") or parsed.path in {
+                "/api/process/browser-handoff", "/api/process/stop",
+            }:
+                if not self._valid_instance():
+                    return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 403)
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > 16 * 1024:
+                    return _error(self, "REQUEST_TOO_LARGE", "request body exceeds 16 KiB", 413)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(payload, dict):
+                    raise TypeError("request body must be a JSON object")
+                state = getattr(self.server, "edgepilot_service_state", None)
+                if state is None:
+                    return _error(self, "SERVICE_UNAVAILABLE", "managed service lifecycle is unavailable", 503)
+                if parsed.path == "/api/process/leases/acquire":
+                    if payload:
+                        raise ValueError("lease acquisition accepts an empty object")
+                    return _json(self, {"lease_id": state.acquire_lease()}, 201)
+                if parsed.path == "/api/process/browser-handoff":
+                    if payload:
+                        raise ValueError("browser handoff accepts an empty object")
+                    return _json(self, {"handoff_seconds": state.begin_browser_handoff()})
+                if parsed.path == "/api/process/stop":
+                    identity = getattr(self.server, "edgepilot_identity", {})
+                    expected_keys = {
+                        "instance_nonce", "replacement_product_version", "replacement_host_version",
+                        "replacement_build_id",
+                    }
+                    if payload == {"instance_nonce": identity.get("instance_nonce")}:
+                        return _error(self, "UPGRADE_REQUEST_REQUIRED", "service replacement identity is required", 409)
+                    if set(payload) != expected_keys or payload.get("instance_nonce") != identity.get("instance_nonce"):
+                        return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 409)
+                    replacement_version = payload.get("replacement_product_version")
+                    replacement_host_version = payload.get("replacement_host_version")
+                    replacement_build = payload.get("replacement_build_id")
+                    current_version = str(identity.get("product_version", "")).split(".")
+                    requested_version = str(replacement_version or "").split(".")
+                    valid_build = isinstance(replacement_build, str) and len(replacement_build) == 64 \
+                        and all(character in "0123456789abcdef" for character in replacement_build)
+                    if len(current_version) != 3 or len(requested_version) != 3 \
+                            or any(not part.isdigit() for part in current_version + requested_version) or not valid_build:
+                        return _error(self, "INVALID_REPLACEMENT", "replacement generation is invalid", 400)
+                    from edgepilot.local_service import host_version_key
+                    current_host_version = getattr(
+                        self.server, "edgepilot_host_plugin_version", identity.get("product_version"),
+                    )
+                    current_host_key = host_version_key(current_host_version)
+                    requested_host_key = host_version_key(replacement_host_version)
+                    if replacement_version != str(replacement_host_version).split("+", 1)[0] \
+                            or current_host_key is None or requested_host_key is None:
+                        return _error(self, "INVALID_REPLACEMENT", "replacement host identity is invalid", 400)
+                    if requested_host_key <= current_host_key:
+                        return _error(self, "STALE_PLUGIN_GENERATION", "an older plugin cannot replace this service", 409)
+                    if _all_active_work():
+                        return _error(self, "ACTIVE_WORK", "active jobs must finish before the service can stop", 409)
+                    if auth.dashboard_login_active():
+                        return _error(self, "LOGIN_IN_PROGRESS", "Dashboard login must finish before the service can stop", 409)
+                    _json(self, {"stopping": True}, 202)
+                    Thread(target=self.server.shutdown, daemon=True).start()
+                    return None
+                lease_id = payload.get("lease_id")
+                if not isinstance(lease_id, str) or set(payload) != {"lease_id"}:
+                    raise ValueError("lease request requires only lease_id")
+                if parsed.path == "/api/process/leases/renew":
+                    if not state.renew_lease(lease_id):
+                        return _error(self, "LEASE_NOT_FOUND", "service lease has expired", 404)
+                    return _json(self, {"renewed": True})
+                if parsed.path == "/api/process/leases/release":
+                    return _json(self, {"released": state.release_lease(lease_id)})
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
             length = int(self.headers.get("Content-Length", "0"))
@@ -919,18 +1488,74 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not state.get("authenticated") and reason in {"CREDENTIAL_STORE_ERROR", "AUTH_SERVICE_UNAVAILABLE"}:
                     return _error(self, reason, "authentication is temporarily unavailable", 503, retryable=True)
                 return _json(self, state)
-            if parsed.path == "/api/auth/login":
-                started = auth.start_login(open_browser=False)
-                public = {key: started[key] for key in (
-                    "login_id", "verification_uri", "verification_uri_complete", "user_code", "expires_in"
-                )}
-                _run_login_worker(public)
-                return _json(self, public, 201)
+            if parsed.path == "/api/process/heartbeat":
+                state = getattr(self.server, "edgepilot_service_state", None)
+                if state is not None:
+                    connected_after = state.touch_browser()
+                    if connected_after is not None:
+                        LOGGER.info("dashboard browser connected", extra={
+                            "event": "local_service.browser.connected", "result": "success",
+                            "duration_ms": round(connected_after * 1000),
+                        })
+                return _json(self, {"alive": True})
+            if parsed.path == "/api/auth/dashboard/start":
+                return _json(self, auth.dashboard_login_start(), 201)
+            if parsed.path in {"/api/auth/dashboard/google/open", "/api/auth/dashboard/google/status"}:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(payload, dict):
+                    raise TypeError("request body must be a JSON object")
+                login_id = payload.get("login_id")
+                if not isinstance(login_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", login_id):
+                    raise ValueError("login_id is invalid")
+                if parsed.path.endswith("/open"):
+                    if set(payload) != {"login_id"}:
+                        raise ValueError("Google browser login accepts only login_id")
+                    return _json(
+                        self,
+                        auth.dashboard_google_open(
+                            login_id,
+                            f"{self._origin()}/auth/google/handoff",
+                        ),
+                        201,
+                    )
+                if set(payload) != {"login_id"}:
+                    raise ValueError("Google login status accepts only login_id")
+                return _json(self, auth.dashboard_google_status(login_id))
+            if parsed.path in {"/api/auth/dashboard/email/request", "/api/auth/dashboard/email/confirm", "/api/auth/dashboard/email/resend"}:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(payload, dict):
+                    raise TypeError("request body must be a JSON object")
+                login_id = payload.get("login_id")
+                if not isinstance(login_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", login_id):
+                    raise ValueError("login_id is invalid")
+                if parsed.path.endswith("/request"):
+                    if set(payload) != {"login_id", "email"} or not isinstance(payload.get("email"), str):
+                        raise ValueError("email request accepts login_id and email")
+                    return _json(self, auth.dashboard_email_request(login_id, payload["email"]), 202)
+                if parsed.path.endswith("/confirm"):
+                    if set(payload) != {"login_id", "code"} or not isinstance(payload.get("code"), str):
+                        raise ValueError("email confirmation accepts login_id and code")
+                    return _json(self, auth.dashboard_email_confirm(login_id, payload["code"]))
+                if set(payload) != {"login_id"}:
+                    raise ValueError("email resend accepts login_id")
+                return _json(self, auth.dashboard_email_resend(login_id), 202)
+            if parsed.path == "/api/auth/dashboard/cancel":
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                if not isinstance(payload, dict) or set(payload) != {"login_id"}:
+                    raise ValueError("login cancellation accepts only login_id")
+                login_id = payload.get("login_id")
+                if not isinstance(login_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,}", login_id):
+                    raise ValueError("login_id is invalid")
+                return _json(self, auth.dashboard_login_cancel(login_id))
             if parsed.path == "/api/auth/logout":
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict) or not set(payload).issubset({"local_only", "all"}):
                     raise ValueError("logout accepts only local_only and all")
-                return _json(self, auth.logout(all_devices=payload.get("all") is True, local_only=payload.get("local_only") is True))
+                state = auth.status()
+                with ACCOUNT_SESSION_LOCK:
+                    if state.get("authenticated") and _active_account_work():
+                        return _error(self, "ACTIVE_WORK", "stop active runs and jobs before signing out", 409)
+                    return _json(self, auth.logout(all_devices=payload.get("all") is True, local_only=payload.get("local_only") is True))
             if parsed.path == "/api/marketplace/install":
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict) or set(payload) != {"slug", "version"}:
@@ -940,13 +1565,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not self._require_business_auth():
                     return
                 return _json(self, download_and_install(str(payload["slug"]), str(payload["version"])), 201)
-            if re.fullmatch(r"/api/runs/[^/]+/emergency-stop", parsed.path):
-                pass
-            elif not self._require_business_auth():
+            if not self._require_business_auth():
                 return
             payload = json.loads(self.rfile.read(length) or b"{}")
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
+            if self.path == "/api/legacy-state/claim":
+                if payload != {"confirm": True}:
+                    raise ValueError("legacy state claim requires confirm=true")
+                return _json(self, _claim_legacy_state())
             if self.path == "/api/marketplace/recommendations":
                 from edgepilot.marketplace import recommend
                 return _json(self, recommend(payload))
@@ -974,13 +1601,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 job_id = self.path.split("/")[3]
                 with JOBS_LOCK:
                     job = JOBS.get(job_id)
+                    if job is not None and not _job_belongs_to_active_account(job):
+                        job = None
                     process = job.get("_process") if job else None
                     if job is None:
                         return _error(self, "JOB_NOT_FOUND", "job not found", 404)
-                    if process is None or process.poll() is not None:
-                        return _error(self, "JOB_NOT_RUNNING", "job is not running", 409)
+                    if job.get("status") == "STOPPING":
+                        return _json(self, {"job_id": job_id, "status": "STOPPING"}, 202)
+                    if job.get("status") not in {"QUEUED", "RUNNING"}:
+                        return _json(self, {"job_id": job_id, "status": job.get("status")})
+                    if process is None:
+                        run_id = job.get("run_id")
+                        if isinstance(run_id, str):
+                            _emergency_stop_run(run_id)
+                            job.update(status="STOPPING", stage="stopping", message="正在通过运行记录停止已恢复的策略")
+                            _persist_job_locked(job_id)
+                            return _json(self, {"job_id": job_id, "status": "STOPPING"}, 202)
+                        recovered_pid = job.get("pid")
+                        recovered_token = job.get("process_start_token")
+                        if type(recovered_pid) is int and isinstance(recovered_token, str) and pid_matches(
+                            recovered_pid, recovered_token,
+                        ):
+                            job.update(status="STOPPING", stage="stopping", message="正在停止已恢复的任务进程")
+                            _persist_job_locked(job_id)
+                            _terminate_recovered_job(recovered_pid, recovered_token, job_id)
+                            return _json(self, {"job_id": job_id, "status": "STOPPING"}, 202)
+                        job.update(
+                            status="FAILED",
+                            stage="lost",
+                            error="任务监督句柄已经丢失，无法安全终止未知进程。",
+                            error_code="JOB_SUPERVISOR_LOST",
+                            finished_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        _persist_job_locked(job_id)
+                        return _json(self, {"job_id": job_id, "status": "FAILED"})
+                    if process.poll() is not None:
+                        job.update(
+                            status="FAILED",
+                            stage="failed",
+                            returncode=process.returncode,
+                            error=_job_error(job.get("output", ""), process.returncode or 1),
+                            error_code="JOB_PROCESS_EXITED",
+                            finished_at=datetime.now(timezone.utc).isoformat(),
+                        )
+                        job.pop("_process", None)
+                        _persist_job_locked(job_id)
+                        return _json(self, {"job_id": job_id, "status": "FAILED"})
                     job["status"] = "STOPPING"
-                    process.terminate()
+                    job["stage"] = "stopping"
+                    job["message"] = "正在停止任务进程"
+                    _persist_job_locked(job_id)
+                    _terminate_job_process(process, job_id)
                 return _json(self, {"job_id": job_id, "status": "STOPPING"}, 202)
             if self.path.startswith("/api/runs/") and self.path.endswith("/emergency-stop"):
                 _emergency_stop_run(self.path.split("/")[3])
@@ -995,16 +1666,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except MarketplaceRequestError as exc:
             LOGGER.warning("dashboard Marketplace request failed", extra={"event": "dashboard.marketplace.failed", "result": "failed", "params": {"method": "POST", "path": self.path, "code": exc.code}})
             return _marketplace_request_error(self, exc)
+        except LegacyStateConflict as exc:
+            return _error(self, str(exc), "legacy state cannot be claimed in its current state", 409)
         except auth.AuthError as exc:
             LOGGER.warning("dashboard authentication request failed", extra={"event": "dashboard.auth.failed", "result": "failed", "params": {"method": "POST", "path": self.path, "code": str(exc)}})
-            return _error(self, "AUTH_SERVICE_UNAVAILABLE", "authentication service is unavailable", 502)
+            return _auth_request_error(self, exc)
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
             return _error(self, "VALIDATION_FAILED", str(exc), 400)
         except OSError as exc:
             LOGGER.exception("dashboard write failed", extra={"event": "dashboard.http.write_failed", "result": "failed", "params": {"method": "POST", "path": self.path}})
-            return _error(self, "INTERNAL_ERROR", str(exc), 500)
+            return _error(self, "INTERNAL_ERROR", "the local service could not complete the request", 500)
+        except Exception:
+            LOGGER.exception("dashboard request failed", extra={"event": "dashboard.http.failed", "result": "failed", "params": {"method": "POST", "path": self.path}})
+            return _error(self, "INTERNAL_ERROR", "the local service could not complete the request", 500)
 
     def do_PUT(self) -> None:  # noqa: N802
+        clear_bound_account_key()
         try:
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
@@ -1040,6 +1717,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return _error(self, "INTERNAL_ERROR", str(exc), 500)
 
     def do_DELETE(self) -> None:  # noqa: N802
+        clear_bound_account_key()
         try:
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
@@ -1076,14 +1754,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         guessed_type, _ = mimetypes.guess_type(path.name)
         self.send_header("Content-Type", content_type or guessed_type or "application/octet-stream")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
         if path.name == "index.html":
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
                 "style-src 'self' 'unsafe-inline'; script-src 'self'; "
                 "frame-ancestors 'none'; base-uri 'none'",
             )
+        else:
+            self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -1102,18 +1783,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(*, host: str = "127.0.0.1", port: int = 8787, language: str | None = None) -> None:
-    """Serve the local dashboard; no network access beyond localhost."""
+def create_server(host: str, port: int, *, language: str | None = None) -> ThreadingHTTPServer:
     if host != "127.0.0.1":
         raise ValueError("Dashboard must bind to 127.0.0.1")
     server = ThreadingHTTPServer((host, port), DashboardHandler)
     server.edgepilot_language = normalize_supported_locale(language)  # type: ignore[attr-defined]
     server.edgepilot_csrf = secrets.token_urlsafe(32)  # type: ignore[attr-defined]
-    pending_login = auth.resume_login()
-    if pending_login is not None:
-        _run_login_worker(pending_login)
-    LOGGER.info("dashboard started", extra={"event": "dashboard.started", "params": {"host": host, "port": port}})
+    return server
+
+
+def serve(*, host: str = "127.0.0.1", port: int = 8787, language: str | None = None) -> None:
+    """Serve the one managed Live service in the foreground."""
+    if language is not None:
+        os.environ["EDGEPILOT_DASHBOARD_LANGUAGE"] = normalize_supported_locale(language) or ""
+    from edgepilot.local_service import run_service
+
+    run_service(host=host, port=port)
+
+
+def _serve_unmanaged_for_test(*, host: str = "127.0.0.1", port: int = 8787, language: str | None = None) -> None:
+    """Keep the low-level listener available to narrow unit-test harnesses."""
+    server = create_server(host, port, language=language)
+    origin = marketplace_origin()
+    LOGGER.info("dashboard started", extra={
+        "event": "dashboard.started",
+        "params": {"host": host, "port": port, "marketplace_origin": origin},
+    })
     print(f"EdgePilot dashboard: http://{host}:{port}")
+    print(f"Marketplace: {origin}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
