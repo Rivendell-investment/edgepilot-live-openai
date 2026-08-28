@@ -1,6 +1,6 @@
 {
   "name": "edgepilot",
-  "version": "0.1.37",
+  "version": "0.11.45",
   "description": "Local-first trading strategy workflows powered by NautilusTrader.",
   "author": {
     "name": "Rivendell Holdings Investment Limited"
@@ -12,9 +12,9 @@
     "shortDescription": "Backtest and run trading strategies locally.",
     "longDescription": "Use native NautilusTrader workflows for strategy discovery, market-data downloads, backtests, paper trading, exchange demo runs, and live trading from chat.",
     "developerName": "Rivendell Holdings Investment Limited",
-    "websiteURL": "https://edge-pilot.rivendell.capital/",
-    "privacyPolicyURL": "https://edge-pilot.rivendell.capital/privacy",
-    "termsOfServiceURL": "https://edge-pilot.rivendell.capital/terms",
+    "websiteURL": "https://www.edgepilotai.io/",
+    "privacyPolicyURL": "https://www.edgepilotai.io/privacy/",
+    "termsOfServiceURL": "https://www.edgepilotai.io/terms/",
     "category": "Productivity",
     "logo": "./assets/edgepilot-icon.png",
     "capabilities": [],

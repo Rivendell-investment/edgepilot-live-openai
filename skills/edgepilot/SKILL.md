@@ -17,6 +17,28 @@ Preserve the returned `best_fit`, `safer`, and `more_aggressive` roles and exact
 
 ## Local dashboard
 
+Treat install, reinstall, repair, upgrade, uninstall, and explicit restart as
+single-service maintenance operations. EdgePilot Live owns the fixed loopback
+address `127.0.0.1:8787`; never scan for another port or accept an ephemeral
+fallback. Before replacing or removing an installed build, run the candidate
+package's `skills/edgepilot/scripts/stop_local_service.py --force`. That helper
+stops only a service authenticated by EdgePilot's owner-only service record and
+health identity, refuses while runs or jobs are active, and rechecks the PID's
+birth token before forced termination. If another product owns 8787, do not stop
+it; report `EDGEPILOT_PORT_IN_USE` and ask the user to resolve the conflict.
+
+Reinstall and upgrade preserve `~/.edgepilot` (Windows:
+`%APPDATA%\\EdgePilot`) by default, including accounts, credentials, strategies,
+runs, catalog and runtime. Delete that state only when the user explicitly asks
+for a complete data removal. An unfinished Dashboard email or Google login may
+be canceled by maintenance and restarted after activation; never force-stop an
+active run or job through this maintenance flow.
+
+After plugin files are delivered, say that installation is complete but host
+activation is pending. Do not say the new build is enabled or running until the
+user has fully restarted Codex and a new task verifies matching plugin, MCP and
+Dashboard build identities on port 8787.
+
 Only when the user has just installed or upgraded EdgePilot Live and wants to
 open the Dashboard, tell them to fully restart Codex first. Updating plugin files
 does not hot-replace an MCP process that is already running. During upgrade
@@ -27,7 +49,7 @@ guidance in ordinary strategy-selection, backtest, or trading conversations.
 
 The bundled local stdio MCP connects to the single localhost Live service on
 the first Dashboard operation. Use `open_dashboard` to return its real
-loopback URL; never assume port 8787, scan ports, or start a second server. It reads
+loopback URL; verify that it is `http://127.0.0.1:8787`, and never scan ports or start a second server. It reads
 the same persistent run records, timeseries, fills, positions, runtime
 snapshots, and PNG artifacts as the CLI; do not create a second backtest or
 execution implementation for the UI.

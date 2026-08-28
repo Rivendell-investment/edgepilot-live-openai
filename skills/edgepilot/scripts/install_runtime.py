@@ -89,7 +89,7 @@ DOWNLOAD_USER_AGENT = DOWNLOAD_USER_AGENT.format(version=_plugin_version())
 #   {base}/manifest.json
 #   {base}/nautilus_trader-<ver>-<tag>.whl
 #   {base}/SHA256SUMS
-DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260822"
+DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260828"
 
 
 @dataclass(frozen=True)
@@ -574,7 +574,9 @@ def runtime_state_path(venv: Path) -> Path:
 
 def runtime_contract_digest(plugin_root: Path, runtime_python: str) -> str:
     """Identify native/runtime dependencies without binding ordinary plugin code."""
-    module = runpy.run_path(str(plugin_root / "src" / "edgepilot" / "build_identity.py"))
+    module = runpy.run_path(
+        str(plugin_root / "src" / "edgepilot" / "service" / "build_identity.py"),
+    )
     function = module.get("runtime_contract_digest")
     if not callable(function):
         raise SystemExit("EdgePilot runtime contract helper is unavailable")
@@ -605,7 +607,9 @@ def reusable_native_runtime(
 
 
 def plugin_content_digest(plugin_root: Path) -> str:
-    module = runpy.run_path(str(plugin_root / "src" / "edgepilot" / "build_identity.py"))
+    module = runpy.run_path(
+        str(plugin_root / "src" / "edgepilot" / "service" / "build_identity.py"),
+    )
     function = module.get("plugin_content_digest")
     if not callable(function):
         raise SystemExit("EdgePilot build identity helper is unavailable")

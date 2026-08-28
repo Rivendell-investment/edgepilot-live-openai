@@ -51,6 +51,82 @@ def _app_meta(ui_uri: str) -> dict[str, Any]:
     }
 
 
+def _control_uri(config: "ProductConfig") -> str:
+    prefix = config.ui_uri.rsplit("/", 1)[0]
+    return f"{prefix}/control-center/v1.html"
+
+
+def _control_dashboard_identity(config: "ProductConfig") -> dict[str, Any] | None:
+    try:
+        candidate = json.loads((config.state_root / "local-dashboard.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(candidate, dict) or not _pid_exists(candidate.get("pid")):
+        return None
+    port, nonce = candidate.get("port"), candidate.get("instance_nonce")
+    if (candidate.get("host") != "127.0.0.1" or type(port) is not int or not 1 <= port <= 65535
+            or not isinstance(nonce, str) or len(nonce) < 20
+            or candidate.get("url") != f"http://127.0.0.1:{port}"):
+        return None
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/health",
+        headers={"Host": f"127.0.0.1:{port}", "X-EdgePilot-Instance": nonce},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=1) as response:
+            health = json.loads(response.read(64 * 1024 + 1))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return candidate if (isinstance(health, dict) and health.get("pid") == candidate.get("pid")
+                         and secrets.compare_digest(str(health.get("instance_nonce", "")), nonce)) else None
+
+
+def _control_status(config: "ProductConfig", dashboard: Any) -> dict[str, Any]:
+    identity = dashboard.identity if isinstance(getattr(dashboard, "identity", None), dict) else None
+    if identity is None:
+        identity = _control_dashboard_identity(config)
+    persistent = (config.state_root / config.persistent_state_file).is_file()
+    return {
+        "product": config.name,
+        "version": config.version,
+        "dashboard": {
+            "state": "running" if identity is not None else "stopped",
+            "url": identity.get("url") if identity is not None else None,
+            "persistent": persistent,
+        },
+        "runtime": {
+            "management": "dashboard",
+            "description": "在本地 Dashboard 中检查、安装或修复运行环境。",
+        },
+        "strategies": {
+            "management": "dashboard",
+            "description": "沿用现有 Marketplace 选择、安装、重新安装和卸载流程。",
+        },
+    }
+
+
+def _control_html(product: str) -> str:
+    product_json = json.dumps(product, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>:root{color-scheme:light dark}*{box-sizing:border-box}body{margin:0;padding:16px;font:14px/1.5 system-ui;color:#172033;background:transparent}.shell{border:1px solid #dfe3eb;border-radius:18px;background:#fff;box-shadow:0 12px 32px rgba(30,41,59,.08);overflow:hidden}.head{padding:18px 20px;background:linear-gradient(135deg,#eef5ff,#f8fbff)}h1{font-size:18px;margin:0 0 5px}.sub{margin:0;color:#64748b}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;padding:14px}.panel{border:1px solid #e2e8f0;border-radius:14px;padding:14px;min-width:0}.eyebrow{font-size:12px;font-weight:700;color:#2563eb;margin:0 0 8px}.status{display:flex;align-items:center;gap:7px;font-weight:650}.dot{width:8px;height:8px;border-radius:50%;background:#94a3b8}.dot.ready{background:#16a34a}.detail{min-height:43px;color:#64748b;margin:8px 0 12px}.actions{display:flex;flex-wrap:wrap;gap:8px}button,a.link{border:1px solid #cbd5e1;border-radius:9px;padding:7px 10px;background:#fff;color:#172033;font:inherit;cursor:pointer;text-decoration:none}button.primary{background:#2563eb;border-color:#2563eb;color:#fff}button:disabled{opacity:.55;cursor:wait}.notice{margin:0 14px 14px;padding:9px 11px;border-radius:9px;background:#f1f5f9;color:#475569}.notice.error{background:#fff1f2;color:#be123c}@media(max-width:720px){.grid{grid-template-columns:1fr}}@media(prefers-color-scheme:dark){body{color:#e5e7eb}.shell,.panel,button,a.link{background:#111827;border-color:#334155;color:#e5e7eb}.head{background:linear-gradient(135deg,#172554,#111827)}.sub,.detail{color:#94a3b8}.notice{background:#1e293b;color:#cbd5e1}}</style></head>
+<body><section class="shell"><header class="head"><h1 id="title"></h1><p class="sub">本地控制中心 · 推荐与策略选择逻辑保持不变</p></header><div class="grid">
+<article class="panel"><p class="eyebrow">常用操作</p><div class="status"><i id="dashboard-dot" class="dot"></i><span id="dashboard-state">读取中…</span></div><p id="dashboard-detail" class="detail"></p><div class="actions"><button class="primary" data-action="open">打开 Dashboard</button><button data-action="refresh">刷新状态</button><button data-action="persistent"></button></div></article>
+<article class="panel"><p class="eyebrow">运行环境</p><div class="status"><i class="dot ready"></i><span>由 Dashboard 管理</span></div><p class="detail">查看 Runtime 状态，并沿用现有安装与修复流程。</p><div class="actions"><button class="primary" data-action="runtime">管理运行环境</button></div></article>
+<article class="panel"><p class="eyebrow">策略管理</p><div class="status"><i class="dot ready"></i><span>沿用现有策略流程</span></div><p class="detail">安装、重新安装和卸载不会改变推荐问卷或策略选择规则。</p><div class="actions"><button class="primary" data-action="strategies">管理策略</button></div></article>
+</div><p id="notice" class="notice" hidden></p></section><script>
+const product=__PRODUCT_JSON__,title=document.getElementById('title'),notice=document.getElementById('notice');title.textContent=product;
+let nextId=1;const pending=new Map();function request(method,params){const id=nextId++;window.parent.postMessage({jsonrpc:'2.0',id,method,params},'*');return new Promise((resolve,reject)=>pending.set(id,{resolve,reject}));}
+function output(value){return value?.structuredContent||value?.result?.structuredContent||value;}
+function render(raw){const value=output(raw)||{},dashboard=value.dashboard||{};document.getElementById('dashboard-state').textContent=dashboard.state==='running'?'Dashboard 正在运行':'Dashboard 尚未启动';document.getElementById('dashboard-dot').className='dot '+(dashboard.state==='running'?'ready':'');document.getElementById('dashboard-detail').textContent=dashboard.url||`插件版本 ${value.version||'—'}`;const button=document.querySelector('[data-action="persistent"]');button.textContent=dashboard.persistent?'关闭后台运行':'启用后台运行';button.dataset.tool=dashboard.persistent?'disable_persistent_dashboard':'enable_persistent_dashboard';}
+function show(message,error=false,url=''){notice.hidden=false;notice.className='notice'+(error?' error':'');notice.textContent=message;if(url){const a=document.createElement('a');a.className='link';a.href=url;a.target='_blank';a.rel='noreferrer';a.textContent='打开链接';notice.append(' ',a);}}
+async function callTool(name,args={}){const result=await request('tools/call',{name,arguments:args});if(result?.isError)throw new Error(result.content?.[0]?.text||'操作失败');return result;}
+async function openDashboard(){const result=await callTool('open_dashboard');const value=output(result)||{},url=value.url;if(url){try{await request('ui/open-link',{url});}catch{}show('Dashboard 已就绪。',false,url);}return value;}
+document.querySelectorAll('button').forEach(button=>button.addEventListener('click',async()=>{document.querySelectorAll('button').forEach(item=>item.disabled=true);notice.hidden=true;try{const action=button.dataset.action;if(action==='refresh'){render(await callTool('open_control_center'));}else if(action==='persistent'){const tool=button.dataset.tool;await callTool(tool,{confirm:true});render(await callTool('open_control_center'));show(tool.startsWith('enable')?'后台运行已启用。':'后台运行已关闭；策略和配置未删除。');}else{await openDashboard();}}catch(error){show(error?.message||'操作失败，请重试。',true);}finally{document.querySelectorAll('button').forEach(item=>item.disabled=false);}}));
+window.addEventListener('message',event=>{if(event.source!==window.parent)return;const message=event.data;if(!message||message.jsonrpc!=='2.0')return;if(message.id!==undefined&&pending.has(message.id)){const callback=pending.get(message.id);pending.delete(message.id);message.error?callback.reject(message.error):callback.resolve(message.result);return;}if(message.method==='ui/notifications/tool-result')render(message.params);});
+window.addEventListener('openai:set_globals',event=>render(event.detail?.globals?.toolOutput));render(window.openai?.toolOutput);request('ui/initialize',{appInfo:{name:'edgepilot-control-center',version:'1.0.0'},appCapabilities:{},protocolVersion:'2026-01-26'}).then(()=>window.parent.postMessage({jsonrpc:'2.0',method:'ui/notifications/initialized'},'*')).catch(()=>{});
+</script></body></html>""".replace("__PRODUCT_JSON__", product_json)
+
+
 @dataclass(frozen=True)
 class ProductConfig:
     name: str
@@ -63,6 +139,7 @@ class ProductConfig:
     service_id: str
     windows_task: str
     identity_attribute: str = "edgepilot_identity"
+    persistent_state_file: str = "background-dashboard/active.json"
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -277,6 +354,8 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
         persistent_actions: tuple[Callable[[], dict[str, Any]], Callable[[], dict[str, Any]]] | None = None) -> int:
     dashboard = dashboard_client if dashboard_client is not None else Dashboard(config, server_factory)
     ui_html = _card_html(config.name)
+    control_uri = _control_uri(config)
+    control_html = _control_html(config.name)
 
     def respond(request_id: object, result: object = None, error: dict[str, Any] | None = None) -> None:
         payload = {"jsonrpc": "2.0", "id": request_id}
@@ -301,14 +380,19 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
             elif method == "ping":
                 respond(request_id, {})
             elif method == "resources/list":
-                respond(request_id, {"resources": [{"uri": config.ui_uri, "name": f"{config.name} strategy cards", "mimeType": CARD_MIME,
-                                                    "_meta": {"ui": {"prefersBorder": False}}}]})
+                respond(request_id, {"resources": [
+                    {"uri": config.ui_uri, "name": f"{config.name} strategy cards", "mimeType": CARD_MIME,
+                     "_meta": {"ui": {"prefersBorder": False}}},
+                    {"uri": control_uri, "name": f"{config.name} control center", "mimeType": CARD_MIME,
+                     "_meta": {"ui": {"prefersBorder": False}}},
+                ]})
             elif method == "resources/read":
                 uri = (message.get("params") or {}).get("uri")
-                if uri != config.ui_uri:
+                if uri not in {config.ui_uri, control_uri}:
                     respond(request_id, error={"code": -32602, "message": "unknown resource"})
                 else:
-                    respond(request_id, {"contents": [{"uri": config.ui_uri, "mimeType": CARD_MIME, "text": ui_html,
+                    respond(request_id, {"contents": [{"uri": uri, "mimeType": CARD_MIME,
+                                                       "text": ui_html if uri == config.ui_uri else control_html,
                                                        "_meta": {"ui": {"prefersBorder": False, "csp": {"connectDomains": [], "resourceDomains": []}}}}]})
             elif method == "tools/list":
                 respond(request_id, {"tools": [
@@ -321,6 +405,11 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                      "description": "Return the real loopback URL for the current local website.",
                      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+                    {"name": "open_control_center", "title": f"Open {config.name} control center",
+                     "description": "Show common actions, runtime guidance, and strategy management entry points without changing recommendation logic.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                     "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+                     "_meta": _app_meta(control_uri)},
                     {"name": "enable_persistent_dashboard", "title": f"Keep {config.name} running",
                      "description": f"Install the fixed local background service {config.service_id}. Requires explicit confirmation.",
                      "inputSchema": {"type": "object", "properties": {"confirm": {"type": "boolean"}}, "required": ["confirm"], "additionalProperties": False},
@@ -347,6 +436,10 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                         url = dashboard.identity["url"]
                         respond(request_id, {"content": [{"type": "text", "text": f"{url}\n\n{config.lifecycle_prompt}"}],
                                              "structuredContent": {"url": url, "lifecycle": config.lifecycle_prompt}})
+                    elif name == "open_control_center":
+                        value = _control_status(config, dashboard)
+                        respond(request_id, {"content": [{"type": "text", "text": f"{config.name} 本地控制中心已就绪。"}],
+                                             "structuredContent": value})
                     elif name in {"enable_persistent_dashboard", "disable_persistent_dashboard"}:
                         if arguments != {"confirm": True}:
                             raise RuntimeError(f"此操作会修改本机后台启动项 {config.service_id}；确认后再执行。")

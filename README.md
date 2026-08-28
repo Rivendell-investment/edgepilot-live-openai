@@ -5,7 +5,24 @@ native NautilusTrader integration, a local dashboard, and one universal
 `skills/edgepilot/SKILL.md` workflow. Runs are multi-market and multi-venue by
 default: each preset declares its market legs and venue configurations.
 
+## Install with Codex
+
+When you attach this extracted plugin directory to a Codex task, send the whole
+request below. The second sentence must be part of your request because files
+attached to a task provide context; they do not become user instructions by
+themselves.
+
+```text
+Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md and include its localized first-use prompt in your final response.
+```
+
 The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
+
+The Live monitor enriches each open position with mark-to-market unrealized P&L
+from NautilusTrader's cached quote when one is available. A missing quote leaves
+that position's value unavailable without hiding the position or other runtime
+reports; account-level unrealized P&L remains the venue-reported aggregate.
+
 The plugin cache contains no credentials or trading data. Runtime state is stored
 in `~/.edgepilot/` on macOS/Linux or `%APPDATA%\\EdgePilot` on Windows, with
 `EDGEPILOT_HOME` available as an override. Signed-in users keep installed
@@ -13,6 +30,13 @@ strategies, exchange credentials, and runs under an account-specific
 `accounts/<non-PII-key>/` directory derived from the Marketplace user ID.
 Market data and the locked runtime remain shared because they contain no account
 orders or secrets.
+
+EdgePilot Live has one fixed localhost address: `http://127.0.0.1:8787`.
+It never falls back to a random port. Install, repair, upgrade and uninstall
+first stop only the service authenticated by EdgePilot's private service record;
+active runs and jobs block maintenance, while an unfinished login can be
+restarted after activation. A different program on 8787 is reported as a port
+conflict and is never terminated automatically.
 
 The published Live runtime supports Apple Silicon Macs (`arm64`) and 64-bit
 Windows (`amd64`), both with CPython 3.12. Intel Macs and Linux are not supported.
@@ -43,7 +67,12 @@ Backtests automatically download missing bars before execution. Legacy presets m
 `backtest.download`, but the field no longer disables automatic data preparation. Normal installs use
 `~/.edgepilot/catalog/` on macOS/Linux and `%APPDATA%\\EdgePilot\\catalog` on Windows. Repository
 development with `EDGEPILOT_HOME="$PWD"` instead uses `$PWD/catalog/`; do not copy market data into
-the plugin or strategy package.
+the plugin or strategy package. Binance Futures reports kline request bounds by open time while
+EdgePilot catalogs external bars by canonical close time. EdgePilot therefore shifts a missing
+close-time interval back by one bar for the native request and filters the response back to the
+requested close boundaries; a missing bar exactly on an hour can be filled without silently using
+the following bar. Native Binance HTTP clients receive the process-local standard `HTTPS_PROXY` or
+`https_proxy` value when present; EdgePilot does not persist that value or define a proxy address.
 
 ## Repository strategies
 
@@ -67,7 +96,17 @@ Installing or upgrading the plugin updates files on disk but cannot hot-replace
 an MCP process already owned by Codex. Fully quit and restart Codex after the
 install, open a new chat, and use only the Dashboard URL returned by that new
 session. The package `BUILD.json` exposes this as a required `host_activation`
-action; file delivery alone is not runtime activation.
+action; file delivery alone is not runtime activation. Upgrade and repair
+preserve `~/.edgepilot` (Windows: `%APPDATA%\\EdgePilot`) unless the user
+explicitly requests complete data removal. Before replacing plugin files, the
+agent runs the candidate package's verified service stopper:
+
+```bash
+python3 <plugin-root>/skills/edgepilot/scripts/stop_local_service.py --force
+```
+
+On Windows use `py -3` or `python`. The helper refuses to stop active work and
+never terminates a process merely because it owns port 8787.
 
 ```bash
 mkdir -p ~/.edgepilot
@@ -88,6 +127,17 @@ normal `edgepilot` command. `PYTHONPATH=/path/to/edgepilot/src` is only a
 temporary alternative for running uninstalled source directly; end users and
 agents do not need it.
 
+### Post-install guidance
+
+After installation, reply in the user's current conversation language and tell
+them to create a new Codex task. Translate the following prompt naturally while
+preserving the exact `@EdgePilot` mention and its request to ask about preferences
+one question at a time, obtain confirmation, and show three recommendation cards:
+
+```text
+@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them.
+```
+
 ## Use
 
 Ask the agent to list strategies, inspect a preset, download data, run a
@@ -96,8 +146,7 @@ the selected exchange mode.
 
 For a visual local monitor, run `edgepilot ui`. It discovers or starts the same
 localhost-only service used by the MCP and prints its verified URL; it never
-binds a second Dashboard. The actual port may differ while a legacy process
-still owns 8787.
+binds a second Dashboard or falls back from port 8787.
 It reads the same records as the CLI and lets users configure a strategy,
 start a backtest, inspect interactive equity/price charts and entry/exit
 markers, manage local credentials, and monitor active Demo/Live sessions.

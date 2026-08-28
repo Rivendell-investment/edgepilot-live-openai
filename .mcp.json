@@ -1,12 +1,19 @@
 {
   "mcpServers": {
-    "edgepilot-live": {
+    "edgepilot-live-0-11-45": {
       "type": "stdio",
       "command": "node",
-      "args": ["./.mcp-launcher.mjs", "edgepilot.local_mcp", "./src"],
+      "args": [
+        "./.mcp-launcher.mjs",
+        "edgepilot.local_mcp",
+        "./src"
+      ],
       "cwd": ".",
       "enabled": true,
-      "env_vars": ["PATH", "APPDATA", "EDGEPILOT_HOME", "EDGEPILOT_MARKETPLACE_ORIGIN"],
+      "env_vars": [
+        "PATH",
+        "APPDATA"
+      ],
       "startup_timeout_sec": 10,
       "tool_timeout_sec": 30
     }
