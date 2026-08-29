@@ -1,1 +1,0 @@
-import{d as e}from"./button-DksDSiHa.js";var t=e();function n({label:e}){return(0,t.jsx)(`div`,{className:`empty`,children:e})}export{n as t};
