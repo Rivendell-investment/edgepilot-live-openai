@@ -132,10 +132,11 @@ agents do not need it.
 After installation, reply in the user's current conversation language and tell
 them to create a new Codex task. Translate the following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
-one question at a time, obtain confirmation, and show three recommendation cards:
+one question at a time, obtain confirmation, show three recommendation cards, and
+open the Dashboard at the same time:
 
 ```text
-@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them.
+@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the Dashboard at the same time.
 ```
 
 ## Use

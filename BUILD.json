@@ -1,1 +1,1 @@
-{"build_id":"ac11b17aff7e1313144fbce5b46bdf446a011a3c339b57cb478f4ba802941caa","host_activation":{"action":"restart","host":"codex","required_after_install":true},"host_plugin_version":"0.11.46","product_version":"0.11.46","schema_version":1,"service_protocol":1}
+{"build_id":"79661be90e6229941dc9f048d25a8d8220819e3ba0f09b9368e09aeae0163d5b","host_activation":{"action":"restart","host":"codex","required_after_install":true},"host_plugin_version":"0.11.47","product_version":"0.11.47","schema_version":1,"service_protocol":1}
