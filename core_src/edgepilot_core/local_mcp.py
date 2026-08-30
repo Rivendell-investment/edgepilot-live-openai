@@ -18,6 +18,7 @@ import tempfile
 from threading import Thread
 import time
 from typing import Any, Callable
+import urllib.error
 import urllib.request
 
 
@@ -83,15 +84,22 @@ def _control_dashboard_identity(config: "ProductConfig") -> dict[str, Any] | Non
 
 def _control_status(config: "ProductConfig", dashboard: Any) -> dict[str, Any]:
     identity = dashboard.identity if isinstance(getattr(dashboard, "identity", None), dict) else None
+    if identity is None and isinstance(getattr(dashboard, "activation_identity", None), dict):
+        identity = dashboard.activation_identity
     if identity is None:
         identity = _control_dashboard_identity(config)
     persistent = (config.state_root / config.persistent_state_file).is_file()
+    dashboard_version = None
+    if identity is not None:
+        dashboard_version = identity.get("product_version") or identity.get("version")
     return {
         "product": config.name,
         "version": config.version,
         "dashboard": {
             "state": "running" if identity is not None else "stopped",
             "url": identity.get("url") if identity is not None else None,
+            "version": dashboard_version,
+            "matches_mcp": identity is None or dashboard_version == config.version,
             "persistent": persistent,
         },
         "runtime": {
@@ -103,6 +111,70 @@ def _control_status(config: "ProductConfig", dashboard: Any) -> dict[str, Any]:
             "description": "沿用现有 Marketplace 选择、安装、重新安装和卸载流程。",
         },
     }
+
+
+def _activation_status(config: "ProductConfig", dashboard: Any) -> dict[str, Any]:
+    status = _control_status(config, dashboard)
+    dashboard = status["dashboard"]
+    stale_service = dashboard["state"] == "running" and dashboard["matches_mcp"] is not True
+    return {
+        "product": config.name,
+        "mcp_version": config.version,
+        "activation": "restart_required" if stale_service else "ready",
+        "restart_codex": stale_service,
+        "reason": "verified_old_dashboard_service" if stale_service else "none",
+        "dashboard": dashboard,
+    }
+
+
+def inspect_verified_embedded_dashboard(state_root: Path) -> dict[str, Any] | None:
+    """Return only a loopback Dashboard verified by its private record and health nonce."""
+    config = ProductConfig("", "", "", state_root, 0, "ui://unused", "", "", "")
+    return _control_dashboard_identity(config)
+
+
+def stop_verified_embedded_dashboard(state_root: Path, *, timeout: float = 5.0) -> dict[str, Any]:
+    """Stop an idle bundled Dashboard without trusting a PID or port by itself."""
+    identity = inspect_verified_embedded_dashboard(state_root)
+    if identity is None:
+        return {"running": False, "stopped": False, "reason": "not_running"}
+    url = str(identity["url"])
+    host = f"127.0.0.1:{identity['port']}"
+    try:
+        bootstrap_request = urllib.request.Request(f"{url}/api/bootstrap", headers={"Host": host})
+        with urllib.request.urlopen(bootstrap_request, timeout=1) as response:
+            bootstrap = json.loads(response.read(16 * 1024 + 1))
+        csrf = bootstrap.get("csrf_token") if isinstance(bootstrap, dict) else None
+        if not isinstance(csrf, str) or not csrf:
+            raise RuntimeError("DASHBOARD_STOP_UNSUPPORTED: verified Dashboard does not expose a stop handshake")
+        payload = json.dumps({"instance_nonce": identity["instance_nonce"]}, separators=(",", ":")).encode()
+        stop_request = urllib.request.Request(
+            f"{url}/api/process/stop",
+            data=payload,
+            headers={"Host": host, "Origin": url, "X-EdgePilot-CSRF": csrf, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(stop_request, timeout=2) as response:
+            stopped = json.loads(response.read(16 * 1024 + 1))
+    except urllib.error.HTTPError as error:
+        try:
+            value = json.loads(error.read(16 * 1024 + 1))
+        except (ValueError, json.JSONDecodeError):
+            value = {}
+        code = value.get("error", {}).get("code") if isinstance(value, dict) else None
+        if error.code == 409:
+            raise RuntimeError(f"ACTIVE_WORK: verified Dashboard refused maintenance ({code or 'CONFLICT'})") from error
+        raise RuntimeError(f"DASHBOARD_STOP_FAILED: verified Dashboard returned HTTP {error.code}") from error
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise RuntimeError("DASHBOARD_STOP_FAILED: verified Dashboard stop handshake failed") from error
+    if not isinstance(stopped, dict) or stopped.get("stopping") is not True:
+        raise RuntimeError("DASHBOARD_STOP_FAILED: verified Dashboard did not accept maintenance")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while inspect_verified_embedded_dashboard(state_root) is not None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("DASHBOARD_STOP_TIMEOUT: verified Dashboard did not stop")
+        time.sleep(0.05)
+    return {"running": True, "stopped": True, "pid": identity["pid"], "version": identity.get("version")}
 
 
 def _control_html(product: str) -> str:
@@ -256,6 +328,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             body = json.dumps(identity, separators=(",", ":")).encode()
             content_type = "application/json"
+        elif self.path == "/api/bootstrap":
+            body = json.dumps({"csrf_token": getattr(self.server, "edgepilot_csrf")}, separators=(",", ":")).encode()
+            content_type = "application/json"
         elif self.path in {"/", "/index.html"}:
             body = getattr(self.server, "edgepilot_html")
             content_type = "text/html; charset=utf-8"
@@ -269,6 +344,36 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802
+        identity = getattr(self.server, "edgepilot_identity")
+        expected_host = f"127.0.0.1:{identity['port']}"
+        expected_origin = identity["url"]
+        if self.path != "/api/process/stop" or self.headers.get("Host") != expected_host \
+                or self.headers.get("Origin") != expected_origin \
+                or not secrets.compare_digest(self.headers.get("X-EdgePilot-CSRF", ""), getattr(self.server, "edgepilot_csrf")):
+            self.send_error(403)
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 16 * 1024:
+                raise ValueError("invalid body length")
+            value = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self.send_error(400)
+            return
+        nonce = value.get("instance_nonce") if isinstance(value, dict) else None
+        if not isinstance(nonce, str) or not secrets.compare_digest(nonce, identity["instance_nonce"]):
+            self.send_error(403)
+            return
+        body = b'{"stopping":true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        Thread(target=self.server.shutdown, name="edgepilot-dashboard-stop", daemon=True).start()
 
 
 class Dashboard:
@@ -309,6 +414,7 @@ class Dashboard:
         self.identity = {"pid": os.getpid(), "version": self.config.version, "instance_nonce": nonce,
                          "host": "127.0.0.1", "port": actual_port, "url": url}
         self.server.edgepilot_identity = self.identity  # type: ignore[attr-defined]
+        self.server.edgepilot_csrf = secrets.token_urlsafe(24)  # type: ignore[attr-defined]
         setattr(self.server, self.config.identity_attribute, self.identity)
         self.server.edgepilot_html = _dashboard_html(self.config, url)  # type: ignore[attr-defined]
         _atomic_json(self.record_path, self.identity)
@@ -405,6 +511,10 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                      "description": "Return the real loopback URL for the current local website.",
                      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+                    {"name": "verify_activation", "title": f"Verify {config.name} activation",
+                     "description": "Report the current MCP version and any verified local Dashboard version without starting a service.",
+                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                     "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
                     {"name": "open_control_center", "title": f"Open {config.name} control center",
                      "description": "Show common actions, runtime guidance, and strategy management entry points without changing recommendation logic.",
                      "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
@@ -436,6 +546,10 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                         url = dashboard.identity["url"]
                         respond(request_id, {"content": [{"type": "text", "text": f"{url}\n\n{config.lifecycle_prompt}"}],
                                              "structuredContent": {"url": url, "lifecycle": config.lifecycle_prompt}})
+                    elif name == "verify_activation":
+                        value = _activation_status(config, dashboard)
+                        respond(request_id, {"content": [{"type": "text", "text": json.dumps(value, ensure_ascii=False)}],
+                                             "structuredContent": value})
                     elif name == "open_control_center":
                         value = _control_status(config, dashboard)
                         respond(request_id, {"content": [{"type": "text", "text": f"{config.name} 本地控制中心已就绪。"}],

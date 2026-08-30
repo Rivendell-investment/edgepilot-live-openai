@@ -93,10 +93,12 @@ Normally the agent performs this once. The Python environment is user-owned,
 outside both the plugin and strategy source directories:
 
 Installing or upgrading the plugin updates files on disk but cannot hot-replace
-an MCP process already owned by Codex. Fully quit and restart Codex after the
-install, open a new chat, and use only the Dashboard URL returned by that new
-session. The package `BUILD.json` exposes this as a required `host_activation`
-action; file delivery alone is not runtime activation. Upgrade and repair
+an MCP process in an already open task. After installation, open a new Codex task.
+When the verified service preflight reports `not_running` or safely stops the old
+service and the new task's `verify_activation` result is `ready`, no full Codex restart is required. Restart Codex only if a verified old service remains, the
+new task does not expose the installed MCP, or the reported MCP version differs
+from the installed version. The package `BUILD.json` exposes this conditional
+`host_activation` contract. Upgrade and repair
 preserve `~/.edgepilot` (Windows: `%APPDATA%\\EdgePilot`) unless the user
 explicitly requests complete data removal. Before replacing plugin files, the
 agent runs the candidate package's verified service stopper:
@@ -130,14 +132,19 @@ agents do not need it.
 ### Post-install guidance
 
 After installation, reply in the user's current conversation language and tell
-them to create a new Codex task. Translate the following prompt naturally while
+them to create a new Codex task without restarting when the verified service
+preflight reports `not_running` or `stopped`. Explain that restarting Codex is
+only the fallback when the new task cannot verify the installed MCP version.
+Translate the following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
 one question at a time, obtain confirmation, show three recommendation cards, and
-open the Dashboard at the same time:
+offer the EdgePilot Live Dashboard button after the cards:
 
 ```text
-@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the Dashboard at the same time.
+@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
+
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards; the agent must then call `open_control_center` to show the existing local control center. Its **Open Dashboard** button starts or reconnects to the verified Live service. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 

@@ -790,6 +790,7 @@ class ServiceDashboardClient:
 
     def __init__(self) -> None:
         self.identity: dict[str, Any] | None = None
+        self.activation_identity: dict[str, Any] | None = None
         self.error: str | None = None
         self.lease_id: str | None = None
         self._stop = Event()
@@ -799,6 +800,7 @@ class ServiceDashboardClient:
         self.error = None
         try:
             self.identity = ensure_service()
+            self.activation_identity = self.identity
             response = service_request(self.identity, "POST", "/api/process/leases/acquire", body={})
             if not isinstance(response, dict) or not isinstance(response.get("lease_id"), str):
                 raise RuntimeError("Live local service did not issue a chat lease")
@@ -812,8 +814,9 @@ class ServiceDashboardClient:
     def reconcile(self) -> None:
         self.error = None
         try:
-            reconcile_existing_service()
+            self.activation_identity = reconcile_existing_service()
         except Exception as error:
+            self.activation_identity = trusted_service(read_service_record(state_root()))
             self.error = str(error)
 
     def _renew(self) -> None:

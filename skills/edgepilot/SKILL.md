@@ -11,7 +11,11 @@ Use the bundled `edgepilot` CLI. Do not generate ad hoc node scripts or recreate
 
 On the first user-visible reply after EdgePilot Live is selected in a new ChatGPT conversation, keep the existing product interaction concise and use the user's current language. Identify the product exactly as **EdgePilot Live**, then respond directly to the user's intent. For strategy-selection requests, ask the first unanswered preference question immediately. Do not volunteer Dashboard architecture, service sharing, leases, process lifetime, background startup, upgrade, or old-tab guidance in this flow. Explain lifecycle details only when the user opens the Dashboard, changes background operation, upgrades the plugin, or is diagnosing a lifecycle problem. Do not call it EdgePilot Research.
 
+Before the first preference question, call the read-only `verify_activation` tool. If it reports `activation: "ready"`, ask the first question in the same reply. If it reports `restart_required`, explain that a verified Dashboard from another plugin version is still running and ask the user to restart Codex, then continue in a new task. Never infer activation from a PID, process name, port scan, or plugin files alone.
+
 Treat `Help me choose an EdgePilot strategy` and equivalent recommendation requests as onboarding routes. Ask one unanswered V2 question at a time, in the user's language, and map only unambiguous answers to `profit_style`, `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`, and `universe`. After showing the completed preference summary and receiving confirmation, call the bundled `recommend_strategies` MCP tool with only `questionnaire_version: "2.0"`, those seven canonical answers, and `locale`. Using that tool is required when it is available because its structured result is bound to the ChatGPT recommendation-card UI. Do not replace the tool call with a direct HTTP request, CLI request, or a manually formatted ranking. If the tool is unavailable, disclose that the current surface cannot render the formal three-card result and offer catalog browsing instead.
+
+When the onboarding request also asks to open the Dashboard, do not start it while the questionnaire is incomplete. After `recommend_strategies` successfully renders the three cards, call `open_control_center` so ChatGPT shows the existing **Open Dashboard** button. Tell the user to use that button; the button calls `open_dashboard` and opens only the verified URL returned by the current MCP. Do not call `open_dashboard` before the user presses the button, and do not install or check the native runtime merely to show the button or open the Dashboard.
 
 Preserve the returned `best_fit`, `safer`, and `more_aggressive` roles and exact versions. Keep the tool's concise text fallback useful, but do not repeat every card field as a long prose response when ChatGPT has rendered the cards. Historical results do not promise future performance.
 
@@ -34,18 +38,18 @@ for a complete data removal. An unfinished Dashboard email or Google login may
 be canceled by maintenance and restarted after activation; never force-stop an
 active run or job through this maintenance flow.
 
-After plugin files are delivered, say that installation is complete but host
-activation is pending. Do not say the new build is enabled or running until the
-user has fully restarted Codex and a new task verifies matching plugin, MCP and
-Dashboard build identities on port 8787.
+After plugin files are delivered, say that installation is complete and ask the
+user to create a new Codex task. A full Codex restart is not required when the
+verified service preflight returned `not_running` or safely stopped the old
+service and the new task's `verify_activation` result is `ready`. Restart Codex only if a verified old service remains, the new task does not
+expose the installed MCP, or its reported MCP version does not match the installed
+version. Updating plugin files never hot-replaces the MCP process in an already
+open task, so do not continue onboarding in the installation or old task.
 
-Only when the user has just installed or upgraded EdgePilot Live and wants to
-open the Dashboard, tell them to fully restart Codex first. Updating plugin files
-does not hot-replace an MCP process that is already running. During upgrade
-diagnosis, treat installation as file delivery until a new Codex session exposes
-the EdgePilot Live MCP tools from the installed build; then close old Dashboard
-tabs and use only the URL returned by that new session. Do not include this
-guidance in ordinary strategy-selection, backtest, or trading conversations.
+During upgrade diagnosis, treat installation as file delivery until a new Codex
+task exposes the EdgePilot Live MCP tools from the installed build. Close old
+Dashboard tabs and use only the URL returned by that new task. Do not include
+this guidance in ordinary strategy-selection, backtest, or trading conversations.
 
 The bundled local stdio MCP connects to the single localhost Live service on
 the first Dashboard operation. Use `open_dashboard` to return its real
