@@ -18,6 +18,11 @@ Install this EdgePilot Live plugin. After installation, read the "Post-install g
 
 The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
 
+The Codex plugin exposes one first-use route: verify activation, collect one
+preference at a time, wait for confirmation, render three recommendation cards,
+and then show the Live Dashboard button. Catalog listing and backtesting remain
+available after onboarding, but they are not installation validation steps.
+
 The Live monitor enriches each open position with mark-to-market unrealized P&L
 from NautilusTrader's cached quote when one is available. A missing quote leaves
 that position's value unavailable without hiding the position or other runtime
@@ -87,10 +92,16 @@ They are not automatically copied into the shareable plugin ZIP. A user starts
 with no installed strategies and uses Marketplace or an agent to inspect and
 install an exact strategy version.
 
-## Install
+## Source development setup (not Codex plugin installation)
 
-Normally the agent performs this once. The Python environment is user-owned,
-outside both the plugin and strategy source directories:
+Do not run the commands in this section during a normal Codex plugin install or
+upgrade. They are only for contributors running the repository source directly.
+Normal plugin delivery must not create a Python environment, install
+NautilusTrader, query the authenticated strategy catalog, or use runtime health
+as an installation success condition.
+
+For source development, the Python environment is user-owned, outside both the
+plugin and strategy source directories:
 
 Installing or upgrading the plugin updates files on disk but cannot hot-replace
 an MCP process in an already open task. After installation, open a new Codex task.
