@@ -14,7 +14,7 @@ if not CORE.is_dir():
 sys.path[:0] = [str(PRODUCT_ROOT / "src"), str(CORE)]
 
 from edgepilot import __version__  # noqa: E402
-from edgepilot.marketplace_client.client import recommend  # noqa: E402
+from edgepilot.marketplace_client.client import guest_recommend  # noqa: E402
 from edgepilot.service.local_service import ServiceDashboardClient, disable_persistent_service, enable_persistent_service  # noqa: E402
 from edgepilot.platform.paths import state_root  # noqa: E402
 from edgepilot_core.local_mcp import ProductConfig, run  # noqa: E402
@@ -43,5 +43,5 @@ if __name__ == "__main__":
         service_id="capital.rivendell.edgepilot.live.dashboard",
         windows_task=r"\EdgePilot\Live Dashboard",
         persistent_state_file="background-dashboard/enabled.json",
-    ), recommend, dashboard_client=dashboard,
+    ), guest_recommend, dashboard_client=dashboard,
         persistent_actions=(enable_persistent_service, disable_persistent_service)))
