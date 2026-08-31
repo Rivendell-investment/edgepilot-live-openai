@@ -13,15 +13,19 @@ attached to a task provide context; they do not become user instructions by
 themselves.
 
 ```text
-Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md and include its localized first-use prompt in your final response.
+Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md. If this Codex surface can create tasks, create and start the guided first-use task with its localized prompt; otherwise include that prompt in your final response.
 ```
 
 The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
 
 The Codex plugin exposes one first-use route: verify activation, collect one
 preference at a time, wait for confirmation, render three recommendation cards,
-and then show the Live Dashboard button. Catalog listing and backtesting remain
+and then open the Live Dashboard from its verified MCP URL. Catalog listing and backtesting remain
 available after onboarding, but they are not installation validation steps.
+The bundled recommendation tool uses the existing anonymous Live recommendation
+endpoint, so the seven answers and three cards do not require login. Installing a
+selected package and using account or trading capabilities still require the
+applicable authenticated session and confirmation.
 
 The Live monitor enriches each open position with mark-to-market unrealized P&L
 from NautilusTrader's cached quote when one is available. A missing quote leaves
@@ -142,26 +146,38 @@ agents do not need it.
 
 ### Post-install guidance
 
-After installation, reply in the user's current conversation language and tell
-them to create a new Codex task without restarting when the verified service
-preflight reports `not_running` or `stopped`. Explain that restarting Codex is
+After installation, reply in the user's current conversation language. When the
+current Codex surface exposes a task-creation tool, the installation request above
+is explicit authorization to create and start a fresh task, using the same project
+when applicable, with the localized prompt below as its initial message. Open that
+task for the user when the host supports navigation. Do not use task handoff: it
+moves an existing task and does not create the fresh MCP/tool context required after
+installation. If task creation is unavailable, tell the user to create a new Codex
+task and include the prompt for one-click copying. No restart is needed when the
+verified service preflight reports `not_running` or `stopped`; restarting Codex is
 only the fallback when the new task cannot verify the installed MCP version.
 Translate the following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
 one question at a time, obtain confirmation, show three recommendation cards, and
-offer the EdgePilot Live Dashboard button after the cards:
+open the EdgePilot Live Dashboard after the cards:
 
 ```text
 @EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
 
-The new task completes the questionnaire first. After confirmation it renders the three recommendation cards; the agent must then call `open_control_center` to show the existing local control center. Its **Open Dashboard** button starts or reconnects to the verified Live service. The onboarding flow does not install or rebuild the native runtime.
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly, using the verified URL returned by the current MCP. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 
 Ask the agent to list strategies, inspect a preset, download data, run a
 backtest, or start paper/demo/live trading. Credentials are requested only for
 the selected exchange mode.
+
+Longbridge uses authenticated quote data in all three trading modes. Its
+`paper` mode keeps execution in the local Nautilus sandbox, `demo` targets the
+official Longbridge simulated account, and `live` targets the real account;
+each mode uses its own App Key, App Secret, and Access Token variables stored in
+the selected EdgePilot account directory.
 
 For a visual local monitor, run `edgepilot ui`. It discovers or starts the same
 localhost-only service used by the MCP and prints its verified URL; it never

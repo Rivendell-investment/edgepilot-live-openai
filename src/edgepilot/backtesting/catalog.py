@@ -13,6 +13,7 @@ import logging
 from typing import Any
 from typing import cast
 from typing import get_type_hints
+from urllib.error import HTTPError
 
 import pandas as pd
 
@@ -36,6 +37,7 @@ from edgepilot.execution.environment import apply_proxy_url
 
 UTC = timezone.utc
 LOGGER = logging.getLogger("edgepilot.backtesting.catalog")
+ALPACA_SIP_DELAY = timedelta(minutes=15)
 
 
 def parse_time(value: str) -> datetime:
@@ -48,6 +50,29 @@ def parse_time(value: str) -> datetime:
 def _https_proxy_url() -> str | None:
     """Forward a standard process-local HTTPS proxy to native HTTP clients."""
     return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+
+
+def _alpaca_recent_sip_retry_params(
+    params: dict[str, Any],
+    interval_end: datetime,
+    error: Exception,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    """Build retry params that let Alpaca choose an entitlement-safe end time."""
+    cause = error.__cause__
+    current = (now or datetime.now(UTC)).astimezone(UTC)
+    if (
+        params.get("feed") != "sip"
+        or interval_end <= current - ALPACA_SIP_DELAY
+        or not isinstance(cause, HTTPError)
+        or cause.code != 403
+    ):
+        return None
+    retry = dict(params)
+    # Alpaca resolves an omitted end to the safe boundary allowed by the account entitlement.
+    retry.pop("end", None)
+    return retry
 
 
 def _binance_request_window(
@@ -346,7 +371,21 @@ async def _pull_alpaca_bars(
             while True:
                 if page_token:
                     params["page_token"] = page_token
-                payload = await client.request("get", path, params, data=True)
+                try:
+                    payload = await client.request("get", path, params, data=True)
+                except Exception as exc:
+                    retry_params = _alpaca_recent_sip_retry_params(params, interval_end, exc)
+                    if retry_params is None:
+                        raise
+                    params = retry_params
+                    LOGGER.info(
+                        "Alpaca recent SIP query retried with the entitlement-safe default end",
+                        extra={
+                            "event": "data.pull.alpaca_sip_delayed_retry",
+                            "params": {"instrument_id": instrument_id, "bar_type": bar_type},
+                        },
+                    )
+                    payload = await client.request("get", path, params, data=True)
                 rows = (payload or {}).get("bars", {}).get(native) or []
                 interval_bars.extend(
                     bars_from_alpaca(

@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from typing import get_type_hints
 
 from nautilus_trader.analysis import MaxDrawdown
 from nautilus_trader.backtest.config import BacktestDataConfig
@@ -15,6 +16,7 @@ from nautilus_trader.backtest.config import BacktestEngineConfig
 from nautilus_trader.backtest.config import BacktestRunConfig
 from nautilus_trader.backtest.config import BacktestVenueConfig
 from nautilus_trader.backtest.node import BacktestNode
+from nautilus_trader.common.config import resolve_path
 from nautilus_trader.config import ImportableStrategyConfig
 from nautilus_trader.config import LoggingConfig
 from nautilus_trader.model.data import Bar
@@ -50,6 +52,19 @@ class BacktestRequest:
     download: bool = True  # Accepted for legacy callers; missing data is always downloaded.
     export_artifacts: bool = True
     preset_name: str | None = None
+
+
+def _download_adapter_options(venue: VenueRequest) -> dict[str, Any]:
+    """Build automatic download options with only natively supported account types."""
+    options = dict(venue.adapter_options)
+    config_cls = resolve_path(venue.adapter.data_config_path)
+    supported_fields = get_type_hints(config_cls)
+    if (
+        "account_type" in supported_fields
+        and str(venue.account_type).upper() != "MARGIN"
+    ):
+        options["account_type"] = venue.account_type
+    return options
 
 
 def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
@@ -88,17 +103,7 @@ def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
                     start=start,
                     end=end,
                     bar_type=market.bar_type,
-                    # Preserve the generic venue account selection as a native
-                    # adapter option when downloading data (e.g. Binance
-                    # USDT_FUTURES instead of its Spot default).
-                    adapter_options={
-                        **venue.adapter_options,
-                        **(
-                            {"account_type": venue.account_type}
-                            if str(venue.account_type).upper() != "MARGIN"
-                            else {}
-                        ),
-                    },
+                    adapter_options=_download_adapter_options(venue),
                 )
             except Exception as exc:
                 raise RuntimeError(

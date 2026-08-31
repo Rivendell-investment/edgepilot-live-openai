@@ -15,8 +15,6 @@ Before the first preference question, call the read-only `verify_activation` too
 
 Treat `Help me choose an EdgePilot strategy` and equivalent recommendation requests as onboarding routes. Ask one unanswered V2 question at a time, in the user's language, and map only unambiguous answers to `profit_style`, `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`, and `universe`. After showing the completed preference summary and receiving confirmation, call the bundled `recommend_strategies` MCP tool with only `questionnaire_version: "2.0"`, those seven canonical answers, and `locale`. Using that tool is required when it is available because its structured result is bound to the ChatGPT recommendation-card UI. Do not replace the tool call with a direct HTTP request, CLI request, or a manually formatted ranking. If the tool is unavailable, disclose that the current surface cannot render the formal three-card result and offer catalog browsing instead.
 
-When the onboarding request also asks to open the Dashboard, do not start it while the questionnaire is incomplete. After `recommend_strategies` successfully renders the three cards, call `open_control_center` so ChatGPT shows the existing **Open Dashboard** button. Tell the user to use that button; the button calls `open_dashboard` and opens only the verified URL returned by the current MCP. Do not call `open_dashboard` before the user presses the button, and do not install or check the native runtime merely to show the button or open the Dashboard.
-
 Preserve the returned `best_fit`, `safer`, and `more_aggressive` roles and exact versions. Keep the tool's concise text fallback useful, but do not repeat every card field as a long prose response when ChatGPT has rendered the cards. Historical results do not promise future performance.
 
 ## Local dashboard
@@ -38,8 +36,12 @@ for a complete data removal. An unfinished Dashboard email or Google login may
 be canceled by maintenance and restarted after activation; never force-stop an
 active run or job through this maintenance flow.
 
-After plugin files are delivered, say that installation is complete and ask the
-user to create a new Codex task. A full Codex restart is not required when the
+After plugin files are delivered, say that installation is complete. When the
+host exposes task creation, use it to create and start a fresh Codex task with
+the documented first-use prompt; the installation request is explicit
+authorization for that action. Do not use task handoff, which moves an existing
+task without creating a fresh MCP/tool context. If task creation is unavailable,
+ask the user to create the task and provide the prompt for copying. A full Codex restart is not required when the
 verified service preflight returned `not_running` or safely stopped the old
 service and the new task's `verify_activation` result is `ready`. Restart Codex only if a verified old service remains, the new task does not
 expose the installed MCP, or its reported MCP version does not match the installed
@@ -519,7 +521,7 @@ instrument fee metadata. Override venue fees when the account tier differs.
 
 The three modes are deliberately separate:
 
-- `paper` uses Nautilus's local sandbox matching engine with live market data. Orders and fills are simulated locally and it never places exchange orders. The selected native data adapter may still require read-only API credentials; pinned OKX requires them for its business WebSocket bars.
+- `paper` uses Nautilus's local sandbox matching engine with live market data. Orders and fills are simulated locally and it never places exchange orders. The selected native data adapter may still require read-only API credentials; pinned OKX requires them for its business WebSocket bars, and Longbridge requires App Key, App Secret, and Access Token for authenticated quote data.
 - `demo` uses the exchange adapter's native demo/test environment. It places orders in the exchange's demo account and requires that environment's API credentials.
 - `live` uses the exchange adapter's production environment. It places real orders, requires production credentials, and requires explicit confirmation.
 

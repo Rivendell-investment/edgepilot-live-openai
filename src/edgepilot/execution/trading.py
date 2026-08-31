@@ -35,6 +35,7 @@ from edgepilot.execution.run_state import running_runs
 from edgepilot.execution.run_state import unregister_running
 from edgepilot.execution.environment import adapter_environment
 from edgepilot.execution.environment import apply_proxy_url
+from edgepilot.execution.environment import config_accepts_field
 
 
 LOGGER = logging.getLogger("edgepilot.execution.trading")
@@ -296,7 +297,7 @@ def execute_trading(
         missing = [
             item["environment_variable"]
             for item in requirements
-            if mode != "paper" and not item["configured"]
+            if item["required"] and not item["configured"]
         ]
         if missing:
             missing_credentials[adapter.name] = missing
@@ -304,7 +305,10 @@ def execute_trading(
         # Keep the generic venue account selection visible to Nautilus' native
         # adapter.  Binance uses this to distinguish Spot from USD-M/COIN-M
         # Futures; dropping it silently makes a perpetual preset open Spot.
-        if str(venue_record["account_type"]).upper() != "MARGIN":
+        if (
+            str(venue_record["account_type"]).upper() != "MARGIN"
+            and config_accepts_field(adapter.data_config_path, "account_type")
+        ):
             data_options.setdefault("account_type", venue_record["account_type"])
         data_options.setdefault("environment", adapter_environment(adapter.name, mode))
         # A preset may pin its own proxy per venue; otherwise the account-wide
@@ -393,7 +397,11 @@ def execute_trading(
                     "parameters": strategy["parameters"],
                     "exchange_orders": mode != "paper",
                     "execution_credentials_required": mode != "paper",
-                    "market_data_credentials_required_by_wrapper": False,
+                    "market_data_credentials_required_by_wrapper": any(
+                        item["required"] for item in requirements
+                    )
+                    if mode == "paper"
+                    else False,
                     "credential_variables_supported": [
                         item["environment_variable"] for item in requirements
                     ],
