@@ -19,7 +19,7 @@
     "logo": "./assets/edgepilot-icon.png",
     "capabilities": [],
     "defaultPrompt": [
-      "Open the Live Dashboard now, then ask my strategy preferences one at a time and show three recommendation cards after I confirm."
+      "Ask my strategy preferences one at a time; after I confirm, show three recommendation cards and open the Live Dashboard."
     ]
   }
 }

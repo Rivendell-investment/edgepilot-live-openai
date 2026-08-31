@@ -18,9 +18,9 @@ Install this EdgePilot Live plugin. After installation, read the "Post-install g
 
 The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
 
-The Codex plugin exposes one first-use route: verify activation, immediately open
-the Live Dashboard from its verified MCP URL, collect one preference at a time,
-wait for confirmation, and render three recommendation cards. Catalog listing and backtesting remain
+The Codex plugin exposes one first-use route: verify activation, collect one
+preference at a time, wait for confirmation, render three recommendation cards,
+and then open the Live Dashboard from its verified MCP URL. Catalog listing and backtesting remain
 available after onboarding, but they are not installation validation steps.
 The bundled recommendation tool uses the existing anonymous Live recommendation
 endpoint, so the seven answers and three cards do not require login. Installing a
@@ -157,15 +157,15 @@ task and include the prompt for one-click copying. No restart is needed when the
 verified service preflight reports `not_running` or `stopped`; restarting Codex is
 only the fallback when the new task cannot verify the installed MCP version.
 Translate the following prompt naturally while
-preserving the exact `@EdgePilot` mention and its request to open the Dashboard
-immediately, then ask about preferences one question at a time, obtain confirmation,
-and show three recommendation cards:
+preserving the exact `@EdgePilot` mention and its request to ask about preferences
+one question at a time, obtain confirmation, show three recommendation cards, and
+open the EdgePilot Live Dashboard after the cards:
 
 ```text
-@EdgePilot Open the EdgePilot Live Dashboard immediately, then help me choose a suitable trading strategy. Ask about my preferences one question at a time and show three strategy recommendation cards after I confirm them.
+@EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
 
-After activation succeeds, the new task calls `open_dashboard` immediately, presents the verified local link or opening result, and asks the first preference question in the same reply. It then preserves the existing one-question-at-a-time flow and renders three recommendation cards after confirmation. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly, using the verified URL returned by the current MCP. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 
