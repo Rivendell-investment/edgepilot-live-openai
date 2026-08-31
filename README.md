@@ -159,13 +159,13 @@ only the fallback when the new task cannot verify the installed MCP version.
 Translate the following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
 one question at a time, obtain confirmation, show three recommendation cards, and
-open the EdgePilot Live Dashboard:
+open the EdgePilot Live Dashboard after the cards:
 
 ```text
 @EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
 
-After `verify_activation` reports ready, the new task calls `open_dashboard` once before the first preference question and returns its verified clickable URL. The questionnaire then continues one question at a time. After confirmation it renders the three recommendation cards and calls `open_dashboard` again, returning the URL verified by the second call even when the first call succeeded. The user does not need to send another Dashboard command. If the host blocks automatic navigation, each successful tool result still provides its clickable URL. A Dashboard failure is reported separately and does not invalidate the questionnaire or recommendation result. The onboarding flow does not install or rebuild the native runtime.
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly, using the verified URL returned by the current MCP. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 
