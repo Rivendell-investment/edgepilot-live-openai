@@ -19,6 +19,11 @@ _DEMO_ENVIRONMENT_ALIASES = {
     "DIGIFINEX": "TEST",
 }
 
+# Most crypto venues expose public market data, so EdgePilot paper execution can
+# use their data clients without credentials. Longbridge requires authenticated
+# quote access even when orders are executed by the local Nautilus sandbox.
+_PAPER_DATA_CREDENTIAL_ADAPTERS = frozenset({"LONGBRIDGE"})
+
 
 def adapter_environment(adapter_name: str, mode: str) -> str:
     """Return the native adapter environment name for an EdgePilot trading mode."""
@@ -48,6 +53,11 @@ _PROXY_VARIABLES = (
 def _config_fields(config_path: str) -> set[str]:
     """Return the field names a native Nautilus config class accepts."""
     return {field.name for field in msgspec.structs.fields(resolve_path(config_path))}
+
+
+def config_accepts_field(config_path: str, field: str) -> bool:
+    """Return whether a native config explicitly declares a field."""
+    return field in _config_fields(config_path)
 
 
 def resolve_proxy_url() -> str | None:
@@ -93,9 +103,12 @@ def apply_proxy_url(options: dict[str, Any], config_path: str) -> None:
 
 
 _CREDENTIAL_LABELS = {
+    "app_key": "App key",
+    "app_secret": "App secret",
     "api_key": "API key",
     "api_secret": "API secret",
     "api_passphrase": "API passphrase",
+    "access_token": "access token",
     "passphrase": "passphrase",
     "username": "username",
     "password": "password",
@@ -110,7 +123,9 @@ def credential_requirements(
     """Inspect the native config and report mode-scoped credential variables."""
     if mode not in {"paper", "demo", "live"}:
         raise ValueError(f"Unsupported credential mode: {mode}")
-    config_path = adapter.data_config_path if mode == "paper" else adapter.exec_config_path
+    config_path = (
+        adapter.data_config_path if mode == "paper" else adapter.exec_config_path
+    )
     if config_path is None:
         return []
     fields = _config_fields(config_path)
@@ -124,7 +139,8 @@ def credential_requirements(
                 "field": name,
                 "label": label,
                 "environment_variable": environment_variable,
-                "required": mode != "paper",
+                "required": mode != "paper"
+                or adapter.name in _PAPER_DATA_CREDENTIAL_ADAPTERS,
                 "configured": bool(os.environ.get(environment_variable)),
             },
         )

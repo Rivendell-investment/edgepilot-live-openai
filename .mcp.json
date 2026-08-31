@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "edgepilot-live-0-11-50": {
+    "edgepilot-live-0-11-51": {
       "type": "stdio",
       "command": "node",
       "args": [

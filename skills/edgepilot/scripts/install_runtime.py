@@ -89,7 +89,7 @@ DOWNLOAD_USER_AGENT = DOWNLOAD_USER_AGENT.format(version=_plugin_version())
 #   {base}/manifest.json
 #   {base}/nautilus_trader-<ver>-<tag>.whl
 #   {base}/SHA256SUMS
-DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260828"
+DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260831"
 
 
 @dataclass(frozen=True)
@@ -691,8 +691,9 @@ def activate_candidate(candidate: Path, active: Path, metadata: dict[str, Any] |
 
 def verify(venv_py: Path, venv: Path) -> None:
     code = (
-        "import edgepilot, edgepilot_core, importlib.metadata, nautilus_trader, pathlib, sys; "
-        "import nautilus_trader.adapters.bitget, nautilus_trader.adapters.gateio; "
+        "import edgepilot, edgepilot_core, importlib.metadata, longbridge.openapi, nautilus_trader, pathlib, sys; "
+        "import nautilus_trader.adapters.bitget, nautilus_trader.adapters.gateio, "
+        "nautilus_trader.adapters.longbridge; "
         "edgepilot_path=pathlib.Path(edgepilot.__file__).resolve(); "
         "runtime_prefix=pathlib.Path(sys.prefix).resolve(); "
         "installed_version=importlib.metadata.version('edgepilot'); "
@@ -701,6 +702,7 @@ def verify(venv_py: Path, venv: Path) -> None:
         "print(f'edgepilot_version={edgepilot.__version__} installed_version={installed_version}'); "
         "print(f'nautilus_trader={nautilus_trader.__file__}'); "
         "print(f'nautilus_version={getattr(nautilus_trader, \"__version__\", \"?\")}'); "
+        "print(f'longbridge_version={importlib.metadata.version(\"longbridge\")}'); "
         "assert edgepilot_path.is_relative_to(runtime_prefix), "
         "f'EdgePilot imported outside runtime: {edgepilot_path} not under {runtime_prefix}'; "
         "assert installed_version == edgepilot.__version__, "

@@ -1,6 +1,6 @@
 {
   "name": "edgepilot",
-  "version": "0.11.50",
+  "version": "0.11.51",
   "description": "Local-first trading strategy workflows powered by NautilusTrader.",
   "author": {
     "name": "Rivendell Holdings Investment Limited"
@@ -19,7 +19,7 @@
     "logo": "./assets/edgepilot-icon.png",
     "capabilities": [],
     "defaultPrompt": [
-      "Ask my strategy preferences one at a time; after I confirm, show three recommendation cards and open the Live Dashboard."
+      "Open the Live Dashboard now, then ask my strategy preferences one at a time and show three recommendation cards after I confirm."
     ]
   }
 }

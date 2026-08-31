@@ -9,6 +9,7 @@ description = "Agent-facing CLI for backtesting and running trading strategies"
 requires-python = ">=3.12,<3.15"
 dependencies = [
   "nautilus_trader==1.228.0",
+  "longbridge==4.5.0",
   "matplotlib==3.10.8",
   "tqdm>=4.67.3,<5",
   "keyring>=25.6,<26",
