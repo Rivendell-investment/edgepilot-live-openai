@@ -170,7 +170,7 @@ open the EdgePilot Live Dashboard after the cards:
 @EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
 
-The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly, using the verified URL returned by the current MCP. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly with the same `locale` used for `recommend_strategies`, so the verified URL opens the Dashboard in that language. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 

@@ -59,6 +59,9 @@ loopback URL; verify that it is `http://127.0.0.1:8787`, and never scan ports or
 the same persistent run records, timeseries, fills, positions, runtime
 snapshots, and PNG artifacts as the CLI; do not create a second backtest or
 execution implementation for the UI.
+When onboarding opens the Dashboard, call `open_dashboard` with the same `locale` used for `recommend_strategies`;
+for another Dashboard request, pass the canonical current conversation locale when it is supported. The returned URL
+owns this per-open language choice; do not store it in shared service state.
 
 The default website uses renewable chat and browser leases internally. Do not
 expose those implementation terms in normal conversation. When the Dashboard is

@@ -178,6 +178,9 @@ def _create_windows_junction(source: Path, target: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
+            # Backtests run under the console-less local service; without this
+            # every junction would flash a cmd.exe window at the user.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", None) or str(exc)

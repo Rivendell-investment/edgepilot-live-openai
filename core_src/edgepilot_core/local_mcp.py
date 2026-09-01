@@ -24,6 +24,8 @@ import urllib.request
 
 MCP_PROTOCOL_VERSION = "2025-06-18"
 CARD_MIME = "text/html;profile=mcp-app"
+SUPPORTED_LOCALES = ("en", "ko", "zh-CN", "zh-TW")
+LOCALE_SCHEMA = {"type": "string", "enum": list(SUPPORTED_LOCALES)}
 RECOMMEND_SCHEMA = {
     "type": "object",
     "properties": {
@@ -35,7 +37,7 @@ RECOMMEND_SCHEMA = {
         "trading_mode": {"type": "string", "enum": ["long_only_no_leverage", "long_short_low_leverage", "long_short_high_leverage"]},
         "allocation_band": {"type": "string", "enum": ["under_25k", "25k_100k", "over_100k"]},
         "universe": {"type": "string", "enum": ["majors", "altcoins", "any"]},
-        "locale": {"type": "string", "enum": ["en", "ko", "zh-CN", "zh-TW"]},
+        "locale": LOCALE_SCHEMA,
     },
     "required": ["questionnaire_version", "profit_style", "holding_period", "pain_point", "max_drawdown_pct",
                  "trading_mode", "allocation_band", "universe", "locale"],
@@ -233,6 +235,21 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 def _pid_exists(pid: object) -> bool:
     if type(pid) is not int or pid <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) on Windows terminates the target process and raises
+        # OSError (WinError 87) for stale PIDs, so probe via OpenProcess instead.
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
     try:
         os.kill(pid, 0)
         return True
@@ -240,6 +257,8 @@ def _pid_exists(pid: object) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError:
+        return False
 
 
 def _trusted_dashboard(record: object, config: ProductConfig) -> dict[str, Any] | None:
@@ -509,8 +528,9 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True},
                      "_meta": _app_meta(config.ui_uri)},
                     {"name": "open_dashboard", "title": f"Open {config.name} local website",
-                     "description": "Return the real loopback URL for the current local website.",
-                     "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                     "description": "Return the real loopback URL, using locale for the Dashboard language when provided.",
+                     "inputSchema": {"type": "object", "properties": {"locale": LOCALE_SCHEMA},
+                                     "additionalProperties": False},
                      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
                     {"name": "verify_activation", "title": f"Verify {config.name} activation",
                      "description": "Report the current MCP version and any verified local Dashboard version without starting a service.",
@@ -545,6 +565,11 @@ def run(config: ProductConfig, recommend: Callable[[dict[str, Any]], dict[str, A
                         if dashboard.identity is None:
                             raise RuntimeError(dashboard.error or "本地网站不可用，请重试。")
                         url = dashboard.identity["url"]
+                        locale = arguments.get("locale")
+                        if locale is not None:
+                            if locale not in SUPPORTED_LOCALES:
+                                raise ValueError("locale must be one of: " + ", ".join(SUPPORTED_LOCALES))
+                            url = f"{url}?lang={locale}"
                         respond(request_id, {"content": [{"type": "text", "text": f"{url}\n\n{config.lifecycle_prompt}"}],
                                              "structuredContent": {"url": url, "lifecycle": config.lifecycle_prompt}})
                     elif name == "verify_activation":

@@ -11,6 +11,7 @@ import hashlib
 import importlib
 import inspect as python_inspect
 import logging
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -82,6 +83,16 @@ def parse_time(value: str) -> datetime:
     if not isinstance(parsed, datetime):
         raise TypeError("parse_time must return datetime")
     return parsed
+
+
+def _add_workspace_execution_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--workspace-configuration", help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-revision", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--workspace-digest", help=argparse.SUPPRESS)
+    parser.add_argument("--starting-balance", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--leverage", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--maker-fee-bps", type=float, help=argparse.SUPPRESS)
+    parser.add_argument("--taker-fee-bps", type=float, help=argparse.SUPPRESS)
 
 
 def _period(args: argparse.Namespace, *, default_days: int = 365) -> tuple[datetime, datetime]:
@@ -172,6 +183,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip backtest.png while retaining JSON and CSV artifacts",
     )
     _add_period(backtest, default_days=None)
+    _add_workspace_execution_options(backtest)
 
     mode_help = {
         "paper": "Run with local Nautilus simulated execution",
@@ -186,6 +198,7 @@ def build_parser() -> argparse.ArgumentParser:
         trading.add_argument("--preset", help="Named strategy configuration; defaults to 'default'")
         trading.add_argument("--venue", help="Trade the preset on this venue; defaults to its own")
         trading.add_argument("--dry-run", action="store_true", help="Validate without connecting")
+        _add_workspace_execution_options(trading)
         if mode == "live":
             trading.add_argument("--confirm-live", action="store_true", help="Required before real orders are enabled")
 
@@ -374,12 +387,71 @@ def _run_venues(preset: dict) -> tuple[Any, ...]:
     return tuple(venues)
 
 
+def _workspace_preset(preset: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    configuration = getattr(args, "workspace_configuration", None)
+    if not configuration:
+        return preset
+    values = json.loads(json.dumps(preset))
+    backtest = values.get("backtest")
+    if not isinstance(backtest, dict) or not isinstance(backtest.get("venues"), dict):
+        raise ValueError("workspace configuration requires preset venue settings")
+    venues = backtest["venues"]
+    if len(venues) != 1:
+        raise ValueError("MULTI_VENUE_NOT_SUPPORTED: Live Strategy Workspace v1 supports one venue")
+    settings = next(iter(venues.values()))
+    if not isinstance(settings, dict):
+        raise ValueError("workspace venue settings are invalid")
+    overrides = {
+        "starting_balance": getattr(args, "starting_balance", None),
+        "default_leverage": getattr(args, "leverage", None),
+        "maker_fee_bps": getattr(args, "maker_fee_bps", None),
+        "taker_fee_bps": getattr(args, "taker_fee_bps", None),
+    }
+    for key, value in overrides.items():
+        if value is not None:
+            settings[key] = value
+    return values
+
+
+def _workspace_snapshot(args: argparse.Namespace) -> dict[str, Any] | None:
+    name = getattr(args, "workspace_configuration", None)
+    if not name:
+        return None
+    revision = getattr(args, "workspace_revision", None)
+    digest = getattr(args, "workspace_digest", None)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+        raise ValueError("workspace revision must be a non-negative integer")
+    if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError("workspace digest is invalid")
+    return {"name": str(name), "revision": revision, "sha256": digest}
+
+
+def _attach_workspace_snapshot(path: Path, snapshot: dict[str, Any] | None) -> None:
+    if snapshot is None:
+        return
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict):
+        raise ValueError("run record is invalid")
+    record["configuration"] = snapshot
+    payload = (json.dumps(record, indent=2, default=str) + "\n").encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _backtest(args: argparse.Namespace) -> int:
     from edgepilot.backtesting.backtest import BacktestRequest
 
     strategy = resolve_strategy(args.strategy, args.config_path)
     preset_name, preset = load_preset(strategy, args.preset)
     preset = resolve_preset(preset, getattr(args, "venue", None))
+    preset = _workspace_preset(preset, args)
     backtest_values = preset_backtest_values(preset)
     start, end = _period(args, default_days=int(backtest_values.get("days", 365)))
     strategy_values = preset_strategy_values(preset)
@@ -404,6 +476,10 @@ def _backtest(args: argparse.Namespace) -> int:
             export_chart=not args.skip_chart,
             preset_name=preset_name,
         ),
+    )
+    _attach_workspace_snapshot(
+        strategy_runs_path(strategy.name) / run_id / "run.json",
+        _workspace_snapshot(args),
     )
     print(json.dumps({"run_id": run_id, "metrics": metrics}, indent=2))
     if not args.skip_chart:
@@ -467,6 +543,7 @@ def _trade(args: argparse.Namespace, mode: str) -> int:
         # Reduce first so a variant venue reaches _select_trading_venue as an ordinary
         # single-venue record; that check then still guards presets without variants.
         preset = resolve_preset(preset, args.venue)
+        preset = _workspace_preset(preset, args)
         strategy_values = preset_strategy_values(preset)
         resolved = resolve_strategy_parameters(strategy, strategy_values)
         markets = _run_markets(preset)
@@ -504,6 +581,9 @@ def _trade(args: argparse.Namespace, mode: str) -> int:
             ],
             "metrics": {},
         }
+        snapshot = _workspace_snapshot(args)
+        if snapshot is not None:
+            record["configuration"] = snapshot
         runs_path = strategy_runs_path(strategy.name)
     if args.venue is not None:
         _select_trading_venue(record, args.venue)

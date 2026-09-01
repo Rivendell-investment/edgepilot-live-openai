@@ -95,6 +95,11 @@ def strategies_state_root() -> Path:
     return account_state_root() / "strategies"
 
 
+def strategy_configurations_state_root() -> Path:
+    """Return account-owned Strategy Workspace v1 configuration state."""
+    return account_state_root() / "strategy-configurations"
+
+
 def strategy_runs_path(strategy_name: str) -> Path:
     """Return a strategy's own persistent run directory."""
     if not strategy_name or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in strategy_name):

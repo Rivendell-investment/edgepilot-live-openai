@@ -25,6 +25,7 @@ from edgepilot.dashboard.common import ConfigConflictError
 from edgepilot.dashboard.common import safe_config_name
 from edgepilot.dashboard.common import safe_directory
 from edgepilot.platform.env_file import read_env
+from edgepilot.platform.process import no_window_flags
 from edgepilot.marketplace_client.client import MarketplaceRequestError
 from edgepilot.platform.paths import ACCOUNT_KEY_ENV
 from edgepilot.platform.paths import account_credentials_path
@@ -59,6 +60,11 @@ from edgepilot.dashboard.queries import strategy_content
 from edgepilot.dashboard.queries import strategy_records
 from edgepilot.dashboard import job_supervisor
 from edgepilot.dashboard.routes import match_route
+from edgepilot.strategies.configuration_store import ConfigurationConflictError as WorkspaceConfigurationConflictError
+from edgepilot.strategies.workspace import create_workspace_configuration
+from edgepilot.strategies.workspace import reset_workspace_configuration
+from edgepilot.strategies.workspace import strategy_workspace
+from edgepilot.strategies.workspace import update_workspace_configuration
 
 if TYPE_CHECKING:
     from edgepilot.service.local_service import ServiceState
@@ -127,6 +133,9 @@ def _runtime_dashboard_call(operation: str, payload: dict[str, Any]) -> Any:
         errors="replace",
         timeout=30,
         check=False,
+        # The service has no console of its own; without this every call would
+        # flash a new console window at the user.
+        creationflags=no_window_flags(),
     )
     try:
         response = json.loads(completed.stdout)
@@ -515,7 +524,7 @@ def _start_job(
                 errors="replace",
                 bufsize=1,
                 start_new_session=os.name != "nt",
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0,
+                creationflags=no_window_flags(subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0,
             )
         except Exception as error:
             output_file.close()
@@ -802,35 +811,99 @@ def _start_runtime_install(payload: dict[str, Any]) -> str:
     )
 
 
+def _workspace_cli_arguments(plan: dict[str, Any]) -> list[str]:
+    leg_id = plan["venue"]
+    settings = plan["settings"]
+    arguments = [
+        "--workspace-configuration", plan["configuration"],
+        "--workspace-revision", str(plan["configuration_revision"]),
+        "--workspace-digest", plan["configuration_sha256"],
+        "--starting-balance", str(settings["starting_balances"][leg_id]),
+        "--leverage", str(settings["leverages"][leg_id]),
+    ]
+    if settings["maker_fee_bps"][leg_id] is not None:
+        arguments += ["--maker-fee-bps", str(settings["maker_fee_bps"][leg_id])]
+    if settings["taker_fee_bps"][leg_id] is not None:
+        arguments += ["--taker-fee-bps", str(settings["taker_fee_bps"][leg_id])]
+    return arguments
+
+
 def _start_backtest(payload: dict[str, Any]) -> str:
     if "config" in payload:
         raise ValueError("backtests only accept saved configurations; remove config and provide preset")
-    if "days" in payload:
-        raise ValueError("backtests load days from the saved preset")
     strategy_name = str(payload.get("strategy", "")).strip()
     if not strategy_name:
         raise ValueError("strategy is required")
-    preset = _safe_config_name(str(payload.get("preset", "")).strip())
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", strategy_name):
         raise ValueError("invalid strategy")
-    venue = str(payload.get("venue", "")).strip().upper()
-    if venue and not re.fullmatch(r"[A-Z0-9_]+", venue):
-        raise ValueError("invalid venue selection")
     from edgepilot.service.runtime import active_runtime_python
-    allowed = {"strategy", "preset"} | (payload.keys() & {"confirm_runtime", "venue"})
-    if set(payload) != allowed:
-        raise ValueError("backtests accept strategy, preset, and optional venue and confirm_runtime")
+    configuration_value = payload.get("configuration")
+    workspace_mode = configuration_value is not None
+    configuration = ""
+    revision = 0
+    period_days = 0
+    expected_base_digest = ""
+    if workspace_mode:
+        if set(payload) - {"confirm_runtime"} != {
+            "strategy", "configuration", "configuration_revision", "base_config_sha256", "period_days",
+        }:
+            raise ValueError(
+                "workspace backtests require strategy, configuration, configuration_revision, base_config_sha256, period_days, and optional confirm_runtime",
+            )
+        configuration = _safe_config_name(str(configuration_value))
+        revision = payload.get("configuration_revision")
+        period_days = payload.get("period_days")
+        expected_base_digest = payload.get("base_config_sha256")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("configuration_revision must be a non-negative integer")
+        if isinstance(period_days, bool) or not isinstance(period_days, int) or period_days not in {30, 90, 365}:
+            raise ValueError("period_days must be 30, 90, or 365")
+        if not isinstance(expected_base_digest, str) or len(expected_base_digest) != 64 \
+                or any(char not in "0123456789abcdef" for char in expected_base_digest):
+            raise ValueError("base_config_sha256 is invalid")
+        preset = ""
+        venue = ""
+    else:
+        if "days" in payload:
+            raise ValueError("backtests load days from the saved preset")
+        preset = _safe_config_name(str(payload.get("preset", "")).strip())
+        venue = str(payload.get("venue", "")).strip().upper()
+        if venue and not re.fullmatch(r"[A-Z0-9_]+", venue):
+            raise ValueError("invalid venue selection")
+        allowed = {"strategy", "preset"} | (payload.keys() & {"confirm_runtime", "venue"})
+        if set(payload) != allowed:
+            raise ValueError("backtests accept strategy, preset, and optional venue and confirm_runtime")
     prepare = _runtime_prepare(payload)
 
     def command() -> list[str]:
-        request = {"strategy": strategy_name, "preset": preset}
-        if venue:
-            request["venue"] = venue
+        plan: dict[str, Any] | None = None
+        if workspace_mode:
+            workspace = strategy_workspace(strategy_name, configuration)
+            if workspace["active_configuration"]["revision"] != revision:
+                raise WorkspaceConfigurationConflictError(
+                    f"configuration changed: expected revision {revision}, current revision {workspace['active_configuration']['revision']}",
+                )
+            if workspace["active_configuration"]["base_config_sha256"] != expected_base_digest:
+                raise WorkspaceConfigurationConflictError("configuration package changed after review")
+            from edgepilot.strategies.workspace import resolved_workspace_plan
+            plan = resolved_workspace_plan(workspace, period_days=period_days)
+            request = {
+                "strategy": strategy_name,
+                "preset": plan["base_preset"],
+                "venue": plan["venue"],
+                "period_days": period_days,
+            }
+        else:
+            request = {"strategy": strategy_name, "preset": preset}
+            if venue:
+                request["venue"] = venue
         prepared = _runtime_dashboard_call("prepare_backtest", request)
         arguments = [str(active_runtime_python()), "-m", "edgepilot.cli", "backtest", prepared["strategy"],
                      "--preset", prepared["preset"], "--start", prepared["start"], "--end", prepared["end"]]
         if prepared.get("venue"):
             arguments += ["--venue", prepared["venue"]]
+        if plan is not None:
+            arguments += _workspace_cli_arguments(plan)
         return arguments
     return _start_job(
         kind="backtest",
@@ -901,6 +974,29 @@ def _start_trading(payload: dict[str, Any]) -> str:
         raise ValueError("mode must be paper, demo, or live")
     if mode == "live" and payload.get("confirm_live") is not True:
         raise ValueError("live trading requires explicit confirmation")
+    configuration_value = payload.get("configuration")
+    workspace_mode = configuration_value is not None
+    configuration = ""
+    revision = 0
+    expected_base_digest = ""
+    if workspace_mode:
+        allowed = {"mode", "strategy", "configuration", "configuration_revision", "base_config_sha256"}
+        if mode == "live":
+            allowed.add("confirm_live")
+        if "confirm_runtime" in payload:
+            allowed.add("confirm_runtime")
+        if set(payload) != allowed:
+            raise ValueError(
+                "workspace trading requires mode, strategy, configuration, configuration_revision, and required confirmations",
+            )
+        configuration = _safe_config_name(str(configuration_value))
+        revision = payload.get("configuration_revision")
+        expected_base_digest = payload.get("base_config_sha256")
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
+            raise ValueError("configuration_revision must be a non-negative integer")
+        if not isinstance(expected_base_digest, str) or len(expected_base_digest) != 64 \
+                or any(char not in "0123456789abcdef" for char in expected_base_digest):
+            raise ValueError("base_config_sha256 is invalid")
     requested_venue = payload.get("venue")
     venue: str | None = None
     if requested_venue is not None:
@@ -924,13 +1020,13 @@ def _start_trading(payload: dict[str, Any]) -> str:
             raise ValueError(f"unknown run: {resolved_run_id}") from exc
         safe_run_id = resolved_run_id
     else:
-        if venue is None:
+        if venue is None and not workspace_mode:
             raise ValueError("select one venue")
         strategy_name = str(payload.get("strategy", "")).strip()
         preset_value = str(payload.get("preset", "")).strip()
-        if not strategy_name or not preset_value:
+        if not strategy_name or (not preset_value and not workspace_mode):
             raise ValueError("a saved run or strategy configuration is required")
-        preset = _safe_config_name(preset_value)
+        preset = _safe_config_name(preset_value) if not workspace_mode else ""
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", strategy_name):
             raise ValueError("invalid strategy")
 
@@ -941,9 +1037,26 @@ def _start_trading(payload: dict[str, Any]) -> str:
             arguments = ["-m", "edgepilot.cli", mode, "--run", safe_run_id]
         else:
             assert strategy_name is not None and preset is not None
-            arguments = ["-m", "edgepilot.cli", mode, "--strategy", strategy_name, "--preset", preset]
-            assert venue is not None
-            arguments.extend(["--venue", venue])
+            plan: dict[str, Any] | None = None
+            selected_preset = preset
+            selected_venue = venue
+            if workspace_mode:
+                workspace = strategy_workspace(strategy_name, configuration)
+                if workspace["active_configuration"]["revision"] != revision:
+                    raise WorkspaceConfigurationConflictError(
+                        f"configuration changed: expected revision {revision}, current revision {workspace['active_configuration']['revision']}",
+                    )
+                if workspace["active_configuration"]["base_config_sha256"] != expected_base_digest:
+                    raise WorkspaceConfigurationConflictError("configuration package changed after review")
+                from edgepilot.strategies.workspace import resolved_workspace_plan
+                plan = resolved_workspace_plan(workspace)
+                selected_preset = plan["base_preset"]
+                selected_venue = plan["venue"]
+            arguments = ["-m", "edgepilot.cli", mode, "--strategy", strategy_name, "--preset", selected_preset]
+            assert selected_venue is not None
+            arguments.extend(["--venue", selected_venue])
+            if plan is not None:
+                arguments += _workspace_cli_arguments(plan)
         if mode == "live":
             arguments.append("--confirm-live")
         return [str(active_runtime_python()), *arguments]
@@ -956,6 +1069,65 @@ def _start_trading(payload: dict[str, Any]) -> str:
         starting_message="启动交易",
         exclusive_kinds=TRADING_MODES,
     )
+
+
+def _deployment_preflight(strategy: str, configuration: str, revision: int, mode: str) -> dict[str, Any]:
+    if mode not in {"demo", "live"}:
+        raise ValueError("mode must be demo or live")
+    workspace = strategy_workspace(strategy, configuration)
+    if workspace["active_configuration"]["revision"] != revision:
+        raise WorkspaceConfigurationConflictError(
+            f"configuration changed: expected revision {revision}, current revision {workspace['active_configuration']['revision']}",
+        )
+    from edgepilot.strategies.workspace import resolved_workspace_plan
+    plan = resolved_workspace_plan(workspace)
+    from edgepilot.service.runtime import runtime_status
+    if not runtime_status().get("installed"):
+        return {
+            "ready": False,
+            "runtime_required": True,
+            "mode": mode,
+            "configuration": configuration,
+            "configuration_revision": revision,
+            "target_id": plan["target_id"],
+            "venue_model": plan["venue_model"],
+            "legs": [{
+                "venue": plan["venue"],
+                "adapter_supported": False,
+                "credentials_ready": False,
+                "missing_credentials": [],
+            }],
+            "leverage": {"status": "account_managed"},
+        }
+    records = _runtime_dashboard_call("credentials", {})
+    if not isinstance(records, list):
+        raise ValueError("invalid credentials response")
+    record = next((item for item in records if isinstance(item, dict) and item.get("venue") == plan["venue"]), None)
+    fields = record.get("modes", {}).get(mode, []) if isinstance(record, dict) and isinstance(record.get("modes"), dict) else []
+    if not isinstance(fields, list):
+        raise ValueError("invalid credentials response")
+    missing = [
+        str(field.get("label") or field.get("field") or "credential")
+        for field in fields
+        if isinstance(field, dict) and field.get("required") is True and field.get("configured") is not True
+    ]
+    adapter_supported = record is not None
+    return {
+        "ready": adapter_supported and not missing,
+        "runtime_required": False,
+        "mode": mode,
+        "configuration": configuration,
+        "configuration_revision": revision,
+        "target_id": plan["target_id"],
+        "venue_model": plan["venue_model"],
+        "legs": [{
+            "venue": plan["venue"],
+            "adapter_supported": adapter_supported,
+            "credentials_ready": adapter_supported and not missing,
+            "missing_credentials": missing,
+        }],
+        "leverage": {"status": "account_managed"},
+    }
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -1153,6 +1325,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "name": route.params[1],
                     "venue": venue,
                 }))
+            if route is not None and route.name == "strategy_workspace":
+                query = parse_qs(parsed.query)
+                locale = normalize_supported_locale(query.get("locale", ["en"])[0]) or "en"
+                configuration = query.get("configuration", ["default"])[0]
+                return _json(self, strategy_workspace(route.params[0], configuration, locale))
+            if route is not None and route.name == "strategy_deployment_preflight":
+                query = parse_qs(parsed.query)
+                configuration = query.get("configuration", ["default"])[0]
+                revision_value = query.get("revision", [""])[0]
+                if not revision_value:
+                    raise ValueError("revision is required")
+                revision = int(revision_value)
+                if revision < 0:
+                    raise ValueError("revision must be non-negative")
+                mode = query.get("mode", [""])[0]
+                return _json(self, _deployment_preflight(route.params[0], configuration, revision, mode))
             if route is not None and route.name == "strategy_detail":
                 return _json(self, _runtime_dashboard_call("strategy_detail", {
                     "strategy": route.params[0],
@@ -1385,6 +1573,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _json(self, _claim_legacy_state())
             if self.path == "/api/backtests":
                 return _json(self, {"job_id": _start_backtest(payload)}, 202)
+            if route is not None and route.name == "strategy_configurations":
+                if set(payload) != {"name", "base_configuration", "target_id", "settings"}:
+                    raise ValueError(
+                        "configuration create requires name, base_configuration, target_id, and settings",
+                    )
+                locale = normalize_supported_locale(parse_qs(parsed.query).get("locale", ["en"])[0]) or "en"
+                values = create_workspace_configuration(
+                    route.params[0],
+                    str(payload["name"]),
+                    base_configuration=str(payload["base_configuration"]),
+                    target_id=str(payload["target_id"]),
+                    settings=payload["settings"],
+                    locale=locale,
+                )
+                return _json(self, values, 201)
             if route is not None and route.name == "strategy_config":
                 if set(payload) != {"config"}:
                     raise ValueError("configuration request body must contain only config")
@@ -1422,6 +1625,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return _error(self, "TRADING_RUN_ACTIVE", str(exc), 409, **exc.public_details())
         except ConfigConflictError as exc:
             return _error(self, "CONFLICT", str(exc), 409)
+        except WorkspaceConfigurationConflictError as exc:
+            return _error(self, "CONFIGURATION_CHANGED", str(exc), 409)
         except FileNotFoundError:
             return _error(self, "NOT_FOUND", "not found", 404)
         except ModuleNotFoundError as exc:
@@ -1446,7 +1651,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         clear_bound_account_key()
         try:
-            route = match_route("PUT", self.path)
+            parsed = urlparse(self.path)
+            route = match_route("PUT", parsed.path)
             if not self._valid_write():
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
             if not self._require_business_auth():
@@ -1458,7 +1664,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise TypeError("request body must be a JSON object")
             if route is None or route.name != "strategy_config":
-                return _error(self, "NOT_FOUND", "not found", 404)
+                if route is None or route.name != "strategy_configuration":
+                    return _error(self, "NOT_FOUND", "not found", 404)
+                if set(payload) != {"expected_revision", "target_id", "settings"}:
+                    raise ValueError(
+                        "configuration update requires expected_revision, target_id, and settings",
+                    )
+                expected = payload["expected_revision"]
+                if isinstance(expected, bool) or not isinstance(expected, int) or expected < 1:
+                    raise ValueError("expected_revision must be a positive integer")
+                values = update_workspace_configuration(
+                    route.params[0],
+                    route.params[1],
+                    expected_revision=expected,
+                    target_id=str(payload["target_id"]),
+                    settings=payload["settings"],
+                    locale=normalize_supported_locale(parse_qs(parsed.query).get("locale", ["en"])[0]) or "en",
+                )
+                return _json(self, values)
             if set(payload) != {"config"}:
                 raise ValueError("configuration request body must contain only config")
             values = _runtime_dashboard_call("update_strategy_config", {
@@ -1469,6 +1692,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return _json(self, {"saved": route.params[1], "config": values})
         except ConfigConflictError as exc:
             return _error(self, "CONFLICT", str(exc), 409)
+        except WorkspaceConfigurationConflictError as exc:
+            return _error(self, "CONFIGURATION_CHANGED", str(exc), 409)
         except FileNotFoundError:
             return _error(self, "NOT_FOUND", "not found", 404)
         except ModuleNotFoundError:
@@ -1486,10 +1711,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _error(self, "CSRF_REJECTED", "invalid Host, Origin, or CSRF token", 403)
             if not self._require_business_auth():
                 return
-            if self.headers.get("X-EdgePilot-Confirm") != "delete":
-                return _error(self, "CONFIRMATION_REQUIRED", "deletion requires an explicit confirmation", 400)
             parsed = urlparse(self.path)
             route = match_route("DELETE", parsed.path)
+            confirmation = self.headers.get("X-EdgePilot-Confirm")
+            expected_confirmation = "reset" if route is not None and route.name == "strategy_configuration" else "delete"
+            if confirmation != expected_confirmation:
+                return _error(self, "CONFIRMATION_REQUIRED", f"operation requires X-EdgePilot-Confirm: {expected_confirmation}", 400)
+            if route is not None and route.name == "strategy_configuration":
+                query = parse_qs(parsed.query)
+                expected_value = query.get("expected_revision", [""])[0]
+                expected = int(expected_value) if expected_value else None
+                values = reset_workspace_configuration(
+                    route.params[0],
+                    route.params[1],
+                    expected_revision=expected,
+                    locale=normalize_supported_locale(query.get("locale", ["en"])[0]) or "en",
+                )
+                return _json(self, values)
             if route is not None and route.name == "marketplace_history":
                 from edgepilot.marketplace_client.client import clear_installation_history
                 return _json(self, clear_installation_history(route.params[0]))
@@ -1505,6 +1743,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return _error(self, "NOT_FOUND", "not found", 404)
         except FileNotFoundError:
             return _error(self, "NOT_FOUND", "not found", 404)
+        except WorkspaceConfigurationConflictError as exc:
+            return _error(self, "CONFIGURATION_CHANGED", str(exc), 409)
         except (ValueError, OSError) as exc:
             return _error(self, "VALIDATION_FAILED", str(exc), 400)
 

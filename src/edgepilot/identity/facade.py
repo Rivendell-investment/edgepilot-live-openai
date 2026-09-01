@@ -24,6 +24,7 @@ import webbrowser
 import uuid
 
 from edgepilot.platform.file_lock import FileLock
+from edgepilot.platform.process import no_window_flags
 from edgepilot.marketplace_client.origin import marketplace_origin
 try:
     import keyring
@@ -203,7 +204,7 @@ def _validate_requested_chain(path: Path) -> None:
 @lru_cache(maxsize=1)
 def _windows_sid() -> str:
     try:
-        result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5, check=True)
+        result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, timeout=5, check=True, creationflags=no_window_flags())
     except (OSError, subprocess.SubprocessError) as exc:
         raise _credential_store_error("windows_sid", exc) from exc
     match = __import__("re").search(r"S-1-[0-9-]+", result.stdout)
@@ -218,11 +219,11 @@ def _secure_windows_acl(path: Path, *, directory: bool, stage: str = "windows_ac
     sid = _windows_sid()
     grant = f"*{sid}:{'(OI)(CI)' if directory else ''}(F)"
     try:
-        subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", grant], capture_output=True, timeout=10, check=True)
+        subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", grant], capture_output=True, timeout=10, check=True, creationflags=no_window_flags())
     except (OSError, subprocess.SubprocessError) as exc:
         raise _credential_store_error(f"{stage}_apply", exc) from exc
     try:
-        subprocess.run(["icacls", str(path), "/verify"], capture_output=True, timeout=10, check=True)
+        subprocess.run(["icacls", str(path), "/verify"], capture_output=True, timeout=10, check=True, creationflags=no_window_flags())
     except (OSError, subprocess.SubprocessError) as exc:
         raise _credential_store_error(f"{stage}_verify", exc) from exc
 

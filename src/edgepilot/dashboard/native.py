@@ -83,11 +83,18 @@ def prepare_backtest(payload: dict[str, Any]) -> dict[str, str]:
     venue = str(payload.get("venue", "")).strip().upper()
     resolve_preset(values, venue)  # reject an unsupported venue before starting a job
     backtest = preset_backtest_values(values)
-    days = int(backtest.get("days", 365))
-    if not 1 <= days <= 5000:
-        raise ValueError("Preset backtest.days must be between 1 and 5000")
+    requested_days = payload.get("period_days")
+    if requested_days is None:
+        preset_days = int(backtest.get("days", 365))
+        if not 1 <= preset_days <= 5000:
+            raise ValueError("Preset backtest.days must be between 1 and 5000")
+        days = min(preset_days, 90)
+    else:
+        if isinstance(requested_days, bool) or not isinstance(requested_days, int) or requested_days not in {30, 90, 365}:
+            raise ValueError("period_days must be 30, 90, or 365")
+        days = requested_days
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=min(days, 90))
+    start = end - timedelta(days=days)
     return {
         "strategy": strategy.name,
         "preset": preset_name,
