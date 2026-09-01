@@ -12,21 +12,20 @@ import re
 import signal
 import shutil
 import subprocess
-import sys
 import secrets
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, Thread
-from typing import Any, Callable
-from urllib.parse import parse_qs, urlparse
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import ParseResult, parse_qs, urlparse
 
 from edgepilot.dashboard.common import ConfigConflictError
 from edgepilot.dashboard.common import safe_config_name
 from edgepilot.dashboard.common import safe_directory
 from edgepilot.platform.env_file import read_env
-from edgepilot.marketplace_client.client import MarketplaceRequestError, install_package
+from edgepilot.marketplace_client.client import MarketplaceRequestError
 from edgepilot.platform.paths import ACCOUNT_KEY_ENV
 from edgepilot.platform.paths import account_credentials_path
 from edgepilot.platform.paths import active_account_key
@@ -35,7 +34,6 @@ from edgepilot.platform.paths import clear_bound_account_key
 from edgepilot.platform.paths import state_root
 from edgepilot.platform.paths import find_run_directory
 from edgepilot.platform.paths import iter_run_directories
-from edgepilot.platform.paths import strategy_runs_path
 from edgepilot.platform.paths import strategies_state_root
 from edgepilot.execution.run_state import request_emergency_stop
 from edgepilot.execution.run_state import load_execution
@@ -49,7 +47,7 @@ from edgepilot.execution.policy import ensure_trading_slot_available
 from edgepilot.platform.logging import configure_logging
 from edgepilot.platform.locale import SUPPORTED_LANGUAGES, normalize_supported_locale
 from edgepilot.marketplace_client.origin import marketplace_origin
-from edgepilot import auth
+from edgepilot.identity import facade as auth
 from edgepilot.application.account_migration import LegacyStateConflict
 from edgepilot.application.account_migration import claim_legacy_state
 from edgepilot.application.account_migration import legacy_has_active_runs
@@ -61,6 +59,9 @@ from edgepilot.dashboard.queries import strategy_content
 from edgepilot.dashboard.queries import strategy_records
 from edgepilot.dashboard import job_supervisor
 from edgepilot.dashboard.routes import match_route
+
+if TYPE_CHECKING:
+    from edgepilot.service.local_service import ServiceState
 
 
 def parse_time(value: str) -> datetime:
@@ -431,7 +432,10 @@ def _start_job(
             if prepare is not None:
                 prepare(job_id)
             phase = "command_resolution"
-            actual_command = command() if callable(command) else command
+            if command is None or isinstance(command, list):
+                actual_command = command
+            else:
+                actual_command = command()
             with JOBS_LOCK:
                 JOBS[job_id].update(
                     stage=starting_stage,
@@ -538,11 +542,12 @@ def _start_job(
             return
         output_file.close()
         with JOBS_LOCK:
-            process_pid = getattr(process, "pid", None)
+            process_pid_value: object = getattr(process, "pid", None)
+            process_pid = process_pid_value if isinstance(process_pid_value, int) else None
             JOBS[job_id].update(
                 _process=process,
-                pid=process_pid if type(process_pid) is int else None,
-                process_start_token=process_start_token(process_pid) if type(process_pid) is int else None,
+                pid=process_pid,
+                process_start_token=process_start_token(process_pid) if process_pid is not None else None,
                 python_executable=str(actual_command[0]) if actual_command else None,
                 output_path=str(output_path),
                 service_instance_id=job_supervisor.JOB_STORE_IDENTITY.get("instance_nonce"),
@@ -570,7 +575,7 @@ def _start_job(
 
         # Test doubles may still expose stdout. Real children write to the
         # durable log and are tailed through a separate descriptor.
-        process_stdout = getattr(process, "stdout", None)
+        process_stdout = process.stdout
         if process_stdout is not None:
             for line in process_stdout:
                 consume(line)
@@ -644,6 +649,10 @@ def _safe_run_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]{8,80}", value):
         raise ValueError("invalid run id")
     return value
+
+
+def _truthy_text(value: object) -> str | None:
+    return str(value) if value else None
 
 
 def _safe_directory(parent: Path, name: str) -> Path:
@@ -804,19 +813,25 @@ def _start_backtest(payload: dict[str, Any]) -> str:
     preset = _safe_config_name(str(payload.get("preset", "")).strip())
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", strategy_name):
         raise ValueError("invalid strategy")
+    venue = str(payload.get("venue", "")).strip().upper()
+    if venue and not re.fullmatch(r"[A-Z0-9_]+", venue):
+        raise ValueError("invalid venue selection")
     from edgepilot.service.runtime import active_runtime_python
-    allowed = {"strategy", "preset", "confirm_runtime"} if "confirm_runtime" in payload else {"strategy", "preset"}
+    allowed = {"strategy", "preset"} | (payload.keys() & {"confirm_runtime", "venue"})
     if set(payload) != allowed:
-        raise ValueError("backtests accept strategy, preset, and optional confirm_runtime")
+        raise ValueError("backtests accept strategy, preset, and optional venue and confirm_runtime")
     prepare = _runtime_prepare(payload)
 
     def command() -> list[str]:
-        prepared = _runtime_dashboard_call("prepare_backtest", {
-            "strategy": strategy_name,
-            "preset": preset,
-        })
-        return [str(active_runtime_python()), "-m", "edgepilot.cli", "backtest", prepared["strategy"],
-                "--preset", prepared["preset"], "--start", prepared["start"], "--end", prepared["end"]]
+        request = {"strategy": strategy_name, "preset": preset}
+        if venue:
+            request["venue"] = venue
+        prepared = _runtime_dashboard_call("prepare_backtest", request)
+        arguments = [str(active_runtime_python()), "-m", "edgepilot.cli", "backtest", prepared["strategy"],
+                     "--preset", prepared["preset"], "--start", prepared["start"], "--end", prepared["end"]]
+        if prepared.get("venue"):
+            arguments += ["--venue", prepared["venue"]]
+        return arguments
     return _start_job(
         kind="backtest",
         command=command,
@@ -889,21 +904,25 @@ def _start_trading(payload: dict[str, Any]) -> str:
     requested_venue = payload.get("venue")
     venue: str | None = None
     if requested_venue is not None:
-        venue = str(requested_venue).strip().upper() if isinstance(requested_venue, str) else ""
-        if not re.fullmatch(r"[A-Z0-9_]+", venue):
+        if not isinstance(requested_venue, str):
             raise ValueError("invalid venue selection")
-    run_id = payload.get("run_id")
+        normalized_venue = requested_venue.strip().upper()
+        if not re.fullmatch(r"[A-Z0-9_]+", normalized_venue):
+            raise ValueError("invalid venue selection")
+        venue = normalized_venue
+    run_id = _truthy_text(payload.get("run_id"))
     safe_run_id: str | None = None
     strategy_name: str | None = None
     preset: str | None = None
     if run_id:
         if venue is not None:
             raise ValueError("venue selection requires a strategy configuration, not an exact saved run")
-        safe_run_id = _safe_run_id(str(run_id))
+        resolved_run_id = _safe_run_id(run_id)
         try:
-            find_run_directory(safe_run_id)
+            find_run_directory(resolved_run_id)
         except FileNotFoundError as exc:
-            raise ValueError(f"unknown run: {safe_run_id}") from exc
+            raise ValueError(f"unknown run: {resolved_run_id}") from exc
+        safe_run_id = resolved_run_id
     else:
         if venue is None:
             raise ValueError("select one venue")
@@ -939,10 +958,18 @@ def _start_trading(payload: dict[str, Any]) -> str:
     )
 
 
+class DashboardHTTPServer(ThreadingHTTPServer):
+    edgepilot_csrf: str
+    edgepilot_language: str | None
+    edgepilot_identity: dict[str, Any]
+    edgepilot_host_plugin_version: str | None
+    edgepilot_service_state: ServiceState | None
+
+
 class DashboardHandler(BaseHTTPRequestHandler):
     server_version = "EdgePilotDashboard/1.0"
 
-    def log_message(self, _format: str, *args: Any) -> None:
+    def log_message(self, format: str, *args: Any) -> None:
         path = urlparse(self.path).path
         if path.startswith("/auth/google/handoff/"):
             path = "/auth/google/handoff/:token"
@@ -963,13 +990,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _valid_write(self) -> bool:
         expected = getattr(self.server, "edgepilot_csrf", "")
-        return self._valid_host() and self.headers.get("Origin") == self._origin() and secrets.compare_digest(self.headers.get("X-EdgePilot-CSRF", ""), expected)
+        csrf = self.headers.get("X-EdgePilot-CSRF", "")
+        return (
+            self._valid_host()
+            and self.headers.get("Origin") == self._origin()
+            and isinstance(csrf, str)
+            and isinstance(expected, str)
+            and secrets.compare_digest(csrf, expected)
+        )
 
     def _valid_instance(self) -> bool:
         identity = getattr(self.server, "edgepilot_identity", {})
         nonce = identity.get("instance_nonce") if isinstance(identity, dict) else None
-        return self._valid_host() and isinstance(nonce, str) and secrets.compare_digest(
-            self.headers.get("X-EdgePilot-Instance", ""), nonce,
+        instance = self.headers.get("X-EdgePilot-Instance", "")
+        return (
+            self._valid_host()
+            and isinstance(instance, str)
+            and isinstance(nonce, str)
+            and secrets.compare_digest(instance, nonce)
         )
 
     def _auth_required(self) -> None:
@@ -994,7 +1032,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         clear_bound_account_key()
-        parsed = urlparse(self.path)
+        parsed: ParseResult = urlparse(self.path)
         route = match_route("GET", parsed.path)
         try:
             if parsed.path.startswith("/api/") and not self._valid_host():
@@ -1044,7 +1082,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/":
                 return self._asset("app/index.html", "text/html; charset=utf-8")
             if parsed.path.startswith("/assets/"):
-                return self._asset(parsed.path.removeprefix("/assets/"), None)
+                asset_path = parsed.path.removeprefix("/assets/")
+                if not isinstance(asset_path, str):
+                    raise TypeError("asset path must be text")
+                return self._asset(asset_path, None)
             if parsed.path == "/api/config":
                 return _json(self, _dashboard_config(getattr(self.server, "edgepilot_language", None)))
             if parsed.path == "/api/bootstrap":
@@ -1052,7 +1093,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/health":
                 identity = getattr(self.server, "edgepilot_identity", None)
                 if isinstance(identity, dict):
-                    if not secrets.compare_digest(self.headers.get("X-EdgePilot-Instance", ""), str(identity.get("instance_nonce", ""))):
+                    instance = self.headers.get("X-EdgePilot-Instance", "")
+                    nonce = identity.get("instance_nonce")
+                    if not isinstance(instance, str) or not isinstance(nonce, str) or not secrets.compare_digest(instance, nonce):
                         return _error(self, "INSTANCE_MISMATCH", "Dashboard instance does not match", 403)
                     return _json(self, identity)
                 return _json(self, {"ok": True})
@@ -1072,11 +1115,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
             if parsed.path == "/api/marketplace/strategies":
                 from edgepilot.marketplace_client.client import guest_search, search
-                query = parse_qs(parsed.query)
+                query: dict[str, list[str]] = parse_qs(parsed.query)
                 page = int(query.get("page", ["1"])[0])
                 page_size = int(query.get("page_size", ["30"])[0])
                 client = search if auth.status().get("authenticated") else guest_search
                 return _json(self, client(query=query.get("q", [""])[0], risk_profile=query.get("risk_profile", [""])[0],
+                    venue=query.get("venue", [""])[0],
                     min_capacity_usd=float(query["min_capacity_usd"][0]) if query.get("min_capacity_usd") else None,
                     sort=query.get("sort", ["published"])[0], locale=query.get("locale", [""])[0], page=page, page_size=page_size))
             if route is not None and route.name == "marketplace_versions":
@@ -1085,7 +1129,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return _json(self, client(route.params[0]))
             if route is not None and route.name == "marketplace_detail":
                 from edgepilot.marketplace_client.client import guest_inspect, inspect
-                query = parse_qs(parsed.query)
+                query: dict[str, list[str]] = parse_qs(parsed.query)
                 client = inspect if auth.status().get("authenticated") else guest_inspect
                 return _json(self, client(route.params[0], route.params[1], locale=query.get("locale", [""])[0]))
             if parsed.path.startswith("/api/") and not self._require_business_auth():
@@ -1101,9 +1145,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 locale = normalize_supported_locale(query.get("locale", ["en"])[0]) or "en"
                 return _json(self, _strategy_records(locale))
             if route is not None and route.name == "strategy_config":
+                venue = parse_qs(parsed.query).get("venue", [""])[0].strip().upper()
+                if venue and not re.fullmatch(r"[A-Z0-9_]+", venue):
+                    raise ValueError("invalid venue selection")
                 return _json(self, _runtime_dashboard_call("strategy_config", {
                     "strategy": route.params[0],
                     "name": route.params[1],
+                    "venue": venue,
                 }))
             if route is not None and route.name == "strategy_detail":
                 return _json(self, _runtime_dashboard_call("strategy_detail", {
@@ -1498,12 +1546,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def create_server(host: str, port: int, *, language: str | None = None) -> ThreadingHTTPServer:
+def _dashboard_handler(
+    request: Any,
+    client_address: Any,
+    server: DashboardHTTPServer,
+) -> BaseHTTPRequestHandler:
+    return DashboardHandler(request, client_address, server)
+
+
+def create_server(host: str, port: int, *, language: str | None = None) -> DashboardHTTPServer:
     if host != "127.0.0.1":
         raise ValueError("Dashboard must bind to 127.0.0.1")
-    server = ThreadingHTTPServer((host, port), DashboardHandler)
-    server.edgepilot_language = normalize_supported_locale(language)  # type: ignore[attr-defined]
-    server.edgepilot_csrf = secrets.token_urlsafe(32)  # type: ignore[attr-defined]
+    server = DashboardHTTPServer((host, port), _dashboard_handler)
+    server.edgepilot_language = normalize_supported_locale(language)
+    server.edgepilot_csrf = secrets.token_urlsafe(32)
     return server
 
 

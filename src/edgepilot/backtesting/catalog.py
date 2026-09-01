@@ -89,8 +89,12 @@ def _binance_request_window(
     last_close_ns = (end_ns // interval_ns) * interval_ns
     if first_close_ns > last_close_ns:
         raise ValueError("Binance request period contains no complete bar close")
+    # Weekly, monthly, and multi-day Binance klines use venue-native open
+    # boundaries which need not align with Unix-epoch multiples. Their close
+    # is normalized below into the canonical slot, so include one leading
+    # interval that may contain the first requested canonical close.
     return (
-        (first_close_ns - interval_ns) // 1_000_000,
+        (first_close_ns - 2 * interval_ns) // 1_000_000,
         (last_close_ns - interval_ns) // 1_000_000,
         first_close_ns,
         last_close_ns,
@@ -820,8 +824,14 @@ async def _pull_digifinex_bars(
                 # matching engine rejects bars whose precision differs from the
                 # instrument, so re-quantize every field before persisting.
                 for field in ("open", "high", "low", "close"):
-                    values[field] = f"{Decimal(values[field]):.{instrument.price_precision}f}"
-                values["volume"] = f"{Decimal(values['volume']):.{instrument.size_precision}f}"
+                    price = values[field]
+                    if not isinstance(price, str):
+                        raise TypeError(f"Bar.to_dict returned non-string {field}")
+                    values[field] = f"{Decimal(price):.{instrument.price_precision}f}"
+                volume = values["volume"]
+                if not isinstance(volume, str):
+                    raise TypeError("Bar.to_dict returned non-string volume")
+                values["volume"] = f"{Decimal(volume):.{instrument.size_precision}f}"
                 normalized_bars.append(Bar.from_dict(values))
             if normalized_bars:
                 catalog.write_data(normalized_bars)

@@ -38,7 +38,7 @@ from edgepilot.execution.run_state import unregister_running
 from edgepilot.execution.policy import claim_trading_slot
 from edgepilot.platform.values import parse_assignments
 from edgepilot.platform.logging import configure_logging
-from edgepilot import auth
+from edgepilot.identity import facade as auth
 
 
 UTC = timezone.utc
@@ -56,7 +56,7 @@ def _lazy_callable(module_name: str, attribute: str) -> Callable[..., Any]:
 
 
 execute_backtest = _lazy_callable("edgepilot.backtesting.backtest", "execute_backtest")
-parse_time = _lazy_callable("edgepilot.backtesting.catalog", "parse_time")
+_parse_time = _lazy_callable("edgepilot.backtesting.catalog", "parse_time")
 pull_data = _lazy_callable("edgepilot.backtesting.catalog", "pull_data")
 resolve_adapter = _lazy_callable("edgepilot.strategies.discovery", "resolve_adapter")
 resolve_strategy = _lazy_callable("edgepilot.strategies.discovery", "resolve_strategy")
@@ -70,8 +70,18 @@ preset_names = _lazy_callable("edgepilot.strategies.presets", "preset_names")
 preset_strategy_values = _lazy_callable("edgepilot.strategies.presets", "preset_strategy_values")
 preset_venues = _lazy_callable("edgepilot.strategies.presets", "preset_venues")
 public_adapter_options = _lazy_callable("edgepilot.strategies.presets", "public_adapter_options")
+preset_venue_options = _lazy_callable("edgepilot.strategies.presets", "preset_venue_options")
+resolve_preset = _lazy_callable("edgepilot.strategies.presets", "resolve_preset")
 resolve_strategy_parameters = _lazy_callable("edgepilot.strategies.presets", "resolve_strategy_parameters")
 execute_trading = _lazy_callable("edgepilot.execution.trading", "execute_trading")
+
+
+def parse_time(value: str) -> datetime:
+    """Parse a timestamp lazily while preserving the typed CLI boundary."""
+    parsed = _parse_time(value)
+    if not isinstance(parsed, datetime):
+        raise TypeError("parse_time must return datetime")
+    return parsed
 
 
 def _period(args: argparse.Namespace, *, default_days: int = 365) -> tuple[datetime, datetime]:
@@ -148,12 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("strategy", help="Installed strategy name or import path")
     backtest.add_argument("--config-path", help="Explicit StrategyConfig import path")
     backtest.add_argument("--preset", help="Named strategy configuration; defaults to 'default'")
+    backtest.add_argument("--venue", help="Backtest the preset on this venue; defaults to its own")
     backtest.add_argument(
         "--set",
         action="append",
         default=[],
         metavar="KEY=VALUE",
         help="Override a native strategy setting; repeat as needed",
+    )
+    backtest.add_argument(
+        "--skip-chart",
+        action="store_true",
+        help="Skip backtest.png while retaining JSON and CSV artifacts",
     )
     _add_period(backtest, default_days=None)
 
@@ -168,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         source.add_argument("--run", dest="run_id", help="Reuse an exact saved run configuration")
         source.add_argument("--strategy", help="Start directly from an installed strategy")
         trading.add_argument("--preset", help="Named strategy configuration; defaults to 'default'")
-        trading.add_argument("--venue", help="Run only the market configured for this venue")
+        trading.add_argument("--venue", help="Trade the preset on this venue; defaults to its own")
         trading.add_argument("--dry-run", action="store_true", help="Validate without connecting")
         if mode == "live":
             trading.add_argument("--confirm-live", action="store_true", help="Required before real orders are enabled")
@@ -328,12 +344,19 @@ def _run_venues(preset: dict) -> tuple[Any, ...]:
         "liquidation_enabled",
         "liquidation_trigger_ratio",
         "liquidation_cancel_open_orders",
+        "adapter_options",
     }
     for name, settings in preset_venues(preset).items():
+        nested_adapter_options = settings.get("adapter_options", {})
+        if not isinstance(nested_adapter_options, dict):
+            raise TypeError(f"Venue adapter_options for {name} must be an object")
         venues.append(
             VenueRequest(
                 adapter=resolve_adapter(name),
-                adapter_options={key: value for key, value in settings.items() if key not in reserved},
+                adapter_options={
+                    **{key: value for key, value in settings.items() if key not in reserved},
+                    **nested_adapter_options,
+                },
                 starting_balance=float(settings.get("starting_balance", 100_000.0)),
                 base_currency=str(settings.get("base_currency", "USDT")),
                 account_type=str(settings.get("account_type", "MARGIN")),
@@ -356,6 +379,7 @@ def _backtest(args: argparse.Namespace) -> int:
 
     strategy = resolve_strategy(args.strategy, args.config_path)
     preset_name, preset = load_preset(strategy, args.preset)
+    preset = resolve_preset(preset, getattr(args, "venue", None))
     backtest_values = preset_backtest_values(preset)
     start, end = _period(args, default_days=int(backtest_values.get("days", 365)))
     strategy_values = preset_strategy_values(preset)
@@ -377,11 +401,13 @@ def _backtest(args: argparse.Namespace) -> int:
             # but do not let that obsolete field disable data preparation.
             download=True,
             export_artifacts=bool(backtest_values.get("export_artifacts", True)),
+            export_chart=not args.skip_chart,
             preset_name=preset_name,
         ),
     )
     print(json.dumps({"run_id": run_id, "metrics": metrics}, indent=2))
-    print(f"Chart: {strategy_runs_path(strategy.name) / run_id / 'backtest.png'}")
+    if not args.skip_chart:
+        print(f"Chart: {strategy_runs_path(strategy.name) / run_id / 'backtest.png'}")
     return 0
 
 
@@ -438,6 +464,9 @@ def _trade(args: argparse.Namespace, mode: str) -> int:
     else:
         strategy = resolve_strategy(args.strategy)
         preset_name, preset = load_preset(strategy, args.preset)
+        # Reduce first so a variant venue reaches _select_trading_venue as an ordinary
+        # single-venue record; that check then still guards presets without variants.
+        preset = resolve_preset(preset, args.venue)
         strategy_values = preset_strategy_values(preset)
         resolved = resolve_strategy_parameters(strategy, strategy_values)
         markets = _run_markets(preset)

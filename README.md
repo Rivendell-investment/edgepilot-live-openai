@@ -5,6 +5,11 @@ native NautilusTrader integration, a local dashboard, and one universal
 `skills/edgepilot/SKILL.md` workflow. Runs are multi-market and multi-venue by
 default: each preset declares its market legs and venue configurations.
 
+The repository-wide publication, catalog, recommendation, installation,
+backtest, and paper/demo/live state machine is defined in the repository-root
+authority at `docs/strategy-catalog-search-recommendation.md`.
+This README remains the Live user and packaging guide.
+
 ## Install with Codex
 
 When you attach this extracted plugin directory to a Codex task, send the whole
@@ -206,6 +211,11 @@ an EdgePilot account and a token with `marketplace:install` permission. The
 separate Research client remains account-free and does not send a token or
 machine identifier, although the cloud service records the full client IP for
 Research downloads.
+Marketplace pagination defaults to 15 strategies per page and lets users select
+15, 30, 50, or 100. Changing the page size, search, sort, or compatible-exchange
+filter returns to page one; search and filter changes retain the selected page
+size for the current Dashboard session. Live and Research use the same controls
+and option set, while keeping their independent localhost clients and state.
 Marketplace packages are reviewed and installed as code locally, while their
 cloud metadata and ZIP remain in the marketplace service. Agents can use the
 same catalog with `edgepilot marketplace search`, `inspect`, and `install`.

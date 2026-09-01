@@ -8,6 +8,14 @@ from edgepilot.strategies.discovery import StrategyDescriptor
 from edgepilot.strategies.discovery import instantiate_config_class
 from edgepilot.strategies.discovery import strategies_root
 
+# Venue variants are defined once in the shared core so Live and Research reduce a
+# preset the same way.  A divergence here would let one of them run a venue the
+# other cannot, which is exactly the failure the shared module exists to prevent.
+from edgepilot_core.backtest.presets import benchmark_venue  # noqa: F401
+from edgepilot_core.backtest.presets import preset_venue_options  # noqa: F401
+from edgepilot_core.backtest.presets import resolve_preset  # noqa: F401
+from edgepilot_core.backtest.presets import validate_venue_variants  # noqa: F401
+
 
 def _configs_path(strategy: StrategyDescriptor) -> Path:
     return strategies_root() / strategy.name / "configs"
