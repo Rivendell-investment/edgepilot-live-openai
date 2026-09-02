@@ -49,12 +49,9 @@ active work, an unverifiable old service, a destination conflict or recovery
 required, report that exact condition and do not copy credentials or kill a
 process by name or port.
 
-After plugin files are delivered, say that installation is complete. When the
-host exposes task creation, use it to create and start a fresh Codex task with
-the documented first-use prompt; the installation request is explicit
-authorization for that action. Do not use task handoff, which moves an existing
-task without creating a fresh MCP/tool context. If task creation is unavailable,
-ask the user to create the task and provide the prompt for copying. A full Codex restart is not required when the
+After plugin files are delivered, say that installation is complete and ask the
+user to create a new Codex task. Provide the documented localized first-use
+prompt for copying. A full Codex restart is not required when the
 verified service preflight returned `not_running` or safely stopped the old
 service and the new task's `verify_activation` result is `ready`. Restart Codex only if a verified old service remains, the new task does not
 expose the installed MCP, or its reported MCP version does not match the installed

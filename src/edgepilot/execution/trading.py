@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ from nautilus_trader.config import LoggingConfig
 from nautilus_trader.config import TradingNodeConfig
 from nautilus_trader.live.node import TradingNode
 from nautilus_trader.model.events.position import PositionClosed
+from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.identifiers import Venue
 
 from edgepilot.strategies.discovery import AdapterDescriptor
@@ -61,6 +63,43 @@ SANDBOX_EXEC_CONFIG = (
 SANDBOX_EXEC_FACTORY = (
     "nautilus_trader.adapters.sandbox.factory:SandboxLiveExecClientFactory"
 )
+
+
+def _binance_futures_leverages(
+    venue_record: dict[str, Any],
+    venue_markets: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Map saved EdgePilot leverage values to Binance's raw target symbols."""
+    from nautilus_trader.adapters.binance.common.symbol import BinanceSymbol
+
+    default = venue_record.get("default_leverage", 1.0)
+    overrides = venue_record.get("leverages")
+    if not isinstance(overrides, dict):
+        overrides = {}
+    result: dict[str, int] = {}
+    for market in venue_markets:
+        instrument_id = str(market["instrument_id"])
+        value = overrides.get(instrument_id, default)
+        try:
+            leverage = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Binance futures leverage must be an integer from 1 to 125 "
+                f"for {instrument_id}, found {value!r}",
+            ) from exc
+        if (
+            isinstance(value, bool)
+            or not math.isfinite(leverage)
+            or not leverage.is_integer()
+            or not 1 <= leverage <= 125
+        ):
+            raise ValueError(
+                "Binance futures leverage must be an integer from 1 to 125 "
+                f"for {instrument_id}, found {value!r}",
+            )
+        symbol = str(BinanceSymbol(InstrumentId.from_str(instrument_id).symbol.value))
+        result[symbol] = int(leverage)
+    return result
 
 
 def _frame_rows(frame: Any, *, limit: int = 100) -> list[dict[str, Any]]:
@@ -357,6 +396,16 @@ def execute_trading(
             exec_factory_path = adapter.exec_factory_path
             exec_options = dict(data_options)
             apply_proxy_url(exec_options, exec_config_path)
+            if (
+                adapter.name == "BINANCE"
+                and str(venue_record["account_type"]).upper()
+                in {"USDT_FUTURES", "COIN_FUTURES"}
+                and config_accepts_field(exec_config_path, "futures_leverages")
+            ):
+                exec_options["futures_leverages"] = _binance_futures_leverages(
+                    venue_record,
+                    venue_markets,
+                )
             for field, value in credential_options(adapter, mode, exec_config_path).items():
                 exec_options.setdefault(field, value)
             exec_clients[adapter.name] = instantiate_config(exec_config_path, exec_options)

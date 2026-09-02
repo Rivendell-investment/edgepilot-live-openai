@@ -22,6 +22,8 @@ from edgepilot.strategies.configuration_store import validate_strategy_name
 WORKSPACE_SCHEMA_VERSION = 1
 SUPPORTED_PERIOD_DAYS = (30, 90, 365)
 _MAX_JSON_BYTES = 512 * 1024
+_DEFAULT_MAKER_FEE_BPS = 2.0
+_DEFAULT_TAKER_FEE_BPS = 5.0
 _STANDARD_LEVERAGE_OPTIONS = (1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 25.0, 50.0, 100.0, 125.0)
 
 
@@ -84,6 +86,11 @@ def _leverage_options(manifest: dict[str, Any], default: float) -> list[float]:
     return sorted(options)
 
 
+def _fee_or_default(values: dict[str, Any], field: str, default: float) -> Any:
+    value = values.get(field)
+    return default if value is None else value
+
+
 def _target_from_preset(target_id: str, preset: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
     from edgepilot_core.backtest.preset_schema import preset_markets
     from edgepilot_core.backtest.preset_schema import preset_venues
@@ -117,8 +124,8 @@ def _target_from_preset(target_id: str, preset: dict[str, Any], manifest: dict[s
             "defaults": {
                 "starting_balance": float(values.get("starting_balance", 100_000.0)),
                 "leverage": default_leverage,
-                "maker_fee_bps": values.get("maker_fee_bps"),
-                "taker_fee_bps": values.get("taker_fee_bps"),
+                "maker_fee_bps": _fee_or_default(values, "maker_fee_bps", _DEFAULT_MAKER_FEE_BPS),
+                "taker_fee_bps": _fee_or_default(values, "taker_fee_bps", _DEFAULT_TAKER_FEE_BPS),
             },
             "constraints": {
                 "starting_balance": {"minimum": 1.0, "maximum": 1_000_000_000_000.0},
@@ -165,8 +172,8 @@ def _targets(preset: dict[str, Any], manifest: dict[str, Any]) -> list[dict[str,
                     "defaults": {
                         "starting_balance": float(values.get("starting_balance", 100_000.0)),
                         "leverage": default_leverage,
-                        "maker_fee_bps": values.get("maker_fee_bps"),
-                        "taker_fee_bps": values.get("taker_fee_bps"),
+                        "maker_fee_bps": _fee_or_default(values, "maker_fee_bps", _DEFAULT_MAKER_FEE_BPS),
+                        "taker_fee_bps": _fee_or_default(values, "taker_fee_bps", _DEFAULT_TAKER_FEE_BPS),
                     },
                     "constraints": {
                         "starting_balance": {"minimum": 1.0, "maximum": 1_000_000_000_000.0},
@@ -187,6 +194,20 @@ def _default_settings(target: dict[str, Any]) -> dict[str, dict[str, float | Non
         "maker_fee_bps": {leg["id"]: leg["defaults"].get("maker_fee_bps") for leg in target["legs"]},
         "taker_fee_bps": {leg["id"]: leg["defaults"].get("taker_fee_bps") for leg in target["legs"]},
     }
+
+
+def _settings_with_fee_defaults(
+    settings: dict[str, dict[str, float | None]],
+    target: dict[str, Any],
+) -> dict[str, dict[str, float | None]]:
+    normalized = {field: dict(values) for field, values in settings.items()}
+    defaults = _default_settings(target)
+    for field in ("maker_fee_bps", "taker_fee_bps"):
+        for leg in target["legs"]:
+            leg_id = leg["id"]
+            if normalized[field][leg_id] is None:
+                normalized[field][leg_id] = defaults[field][leg_id]
+    return normalized
 
 
 def _number(value: Any, label: str, minimum: float, maximum: float, *, allow_none: bool = False) -> float | None:
@@ -246,7 +267,11 @@ def strategy_workspace(strategy: str, configuration: str = "default", locale: st
     selected = next((target for target in targets if target["id"] == selected_id), None)
     if selected is None:
         raise ValueError(f"configuration target is unavailable: {selected_id}")
-    settings = validate_settings(stored["settings"], selected) if stored else _default_settings(selected)
+    settings = (
+        _settings_with_fee_defaults(validate_settings(stored["settings"], selected), selected)
+        if stored
+        else _default_settings(selected)
+    )
     translations = manifest.get("translations") if isinstance(manifest.get("translations"), dict) else {}
     translated = translations.get(locale) if locale != "en" and isinstance(translations.get(locale), dict) else {}
     display_name = translated.get("name") if isinstance(translated.get("name"), str) else manifest.get("name")
@@ -331,11 +356,12 @@ def _validated_configuration_values(
         raise ValueError(f"configuration target is unavailable: {target_id}")
     if target["venue_model"] != "single_venue" or len(target["legs"]) != 1:
         raise UnsupportedVenueModelError("MULTI_VENUE_NOT_SUPPORTED: Live Strategy Workspace v1 supports one venue")
+    validated_settings = _settings_with_fee_defaults(validate_settings(settings, target), target)
     return {
         "base_preset": active["base_preset"],
         "base_config_sha256": active["base_config_sha256"],
         "target_id": target_id,
-        "settings": validate_settings(settings, target),
+        "settings": validated_settings,
     }
 
 

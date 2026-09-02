@@ -18,7 +18,7 @@ attached to a task provide context; they do not become user instructions by
 themselves.
 
 ```text
-Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md. If this Codex surface can create tasks, create and start the guided first-use task with its localized prompt; otherwise include that prompt in your final response.
+Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md and include its localized first-use prompt in your final response.
 ```
 
 The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate once the runtime is in the stable root; the first Windows upgrade from the former AppData runtime installs a fresh candidate instead.
@@ -172,17 +172,12 @@ agents do not need it.
 
 ### Post-install guidance
 
-After installation, reply in the user's current conversation language. When the
-current Codex surface exposes a task-creation tool, the installation request above
-is explicit authorization to create and start a fresh task, using the same project
-when applicable, with the localized prompt below as its initial message. Open that
-task for the user when the host supports navigation. Do not use task handoff: it
-moves an existing task and does not create the fresh MCP/tool context required after
-installation. If task creation is unavailable, tell the user to create a new Codex
-task and include the prompt for one-click copying. No restart is needed when the
-verified service preflight reports `not_running` or `stopped`; restarting Codex is
+After installation, reply in the user's current conversation language and tell
+them to create a new Codex task without restarting when the verified service
+preflight reports `not_running` or `stopped`. Explain that restarting Codex is
 only the fallback when the new task cannot verify the installed MCP version.
-Translate the following prompt naturally while
+Include the localized prompt below for one-click copying. Translate the
+following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
 one question at a time, obtain confirmation, show three recommendation cards, and
 open the EdgePilot Live Dashboard after the cards:
