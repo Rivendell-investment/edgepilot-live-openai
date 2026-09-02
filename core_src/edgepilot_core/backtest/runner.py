@@ -149,8 +149,17 @@ def _prepare_fee_override_catalog(
     ``_resolve_instrument_fees`` cannot write through to the shared catalog when
     the instrument layout is unfamiliar.
     """
-    if target.exists():
+    # ``tempfile.mkdtemp`` (used on Windows) returns an already-created empty
+    # directory.  Do not remove and immediately recreate that directory: on
+    # Windows the deletion can be observed asynchronously by the filesystem
+    # (or an antivirus/indexer), leaving subsequent ``copytree``/``copy2``
+    # calls with WinError 3 even though the source catalog is valid.  A stale
+    # POSIX run-local overlay is still removed before rebuilding it.
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        target.unlink()
+    elif target.is_dir() and any(target.iterdir()):
         shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
     source = source.resolve()
     src_data = source / "data"
     if not src_data.is_dir():

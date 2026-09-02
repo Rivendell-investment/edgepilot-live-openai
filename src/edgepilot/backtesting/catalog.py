@@ -105,9 +105,12 @@ def _client_config(
     adapter: AdapterDescriptor,
     options: dict[str, Any],
     instrument_id: str,
+    default_environment: str | None = None,
 ):
     config_cls = resolve_path(adapter.data_config_path)
     values = dict(options)
+    if default_environment is not None:
+        values.setdefault("environment", default_environment)
     if "instrument_provider" in get_type_hints(config_cls):
         values.setdefault(
             "instrument_provider",
@@ -759,7 +762,15 @@ async def _pull_digifinex_bars(
         request.add_header("User-Agent", "edgepilot-catalog")
         return urlopen(request, timeout=timeout)  # noqa: S310 - client validates http(s)
 
-    config = _client_config(adapter, adapter_options, instrument_id)
+    # DigiFinex's native config defaults to its VPN-only TEST host. Catalog
+    # downloads are public-data reads, so their safe default is the public LIVE
+    # endpoint; an explicit TEST option remains available for controlled tests.
+    config = _client_config(
+        adapter,
+        adapter_options,
+        instrument_id,
+        default_environment="LIVE",
+    )
     client = DigifinexHttpClient(
         api_key=config.api_key,
         api_secret=config.api_secret,

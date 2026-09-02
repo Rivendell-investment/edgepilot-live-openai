@@ -32,10 +32,17 @@ endpoint, so the seven answers and three cards do not require login. Installing 
 selected package and using account or trading capabilities still require the
 applicable authenticated session and confirmation.
 
-The Live monitor enriches each open position with mark-to-market unrealized P&L
-from NautilusTrader's cached quote when one is available. A missing quote leaves
-that position's value unavailable without hiding the position or other runtime
-reports; account-level unrealized P&L remains the venue-reported aggregate.
+The Live execution monitor subscribes to quote ticks for every configured target
+instrument independently of the installed strategy, then enriches each open
+position with mark-to-market unrealized P&L from NautilusTrader's cached bid/ask.
+NautilusTrader deduplicates this monitoring subscription when a strategy already
+uses the same quotes. Before the first quote arrives, the runtime snapshot keeps
+the position and reports that market data is pending instead of silently dropping
+the value or flooding the native log; account-level unrealized P&L remains the
+venue-reported aggregate. In the Accounts table, balances and initial margin are
+projected per currency. A venue-level unrealized P&L aggregate is displayed only
+on its explicit account reporting currency and is never copied onto other asset
+rows.
 
 The plugin cache contains no credentials or trading data. User strategies, market
 data, credentials, runs, and Dashboard service state are stored in

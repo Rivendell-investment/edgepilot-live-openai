@@ -12,7 +12,10 @@ from threading import Lock
 from threading import Thread
 from typing import Any
 
+from nautilus_trader.common.actor import Actor
 from nautilus_trader.common.config import resolve_path
+from nautilus_trader.config import ActorConfig
+from nautilus_trader.config import ImportableActorConfig
 from nautilus_trader.config import ImportableStrategyConfig
 from nautilus_trader.config import LiveDataEngineConfig
 from nautilus_trader.config import LoggingConfig
@@ -63,6 +66,53 @@ SANDBOX_EXEC_CONFIG = (
 SANDBOX_EXEC_FACTORY = (
     "nautilus_trader.adapters.sandbox.factory:SandboxLiveExecClientFactory"
 )
+
+
+class _UnrealizedPnlQuoteMonitorConfig(ActorConfig, kw_only=True, frozen=True):
+    """Target instruments whose quotes feed the read-only Live monitor."""
+
+    instrument_ids: list[str]
+
+
+class _UnrealizedPnlQuoteMonitor(Actor):
+    """Own quote subscriptions needed by runtime P&L reporting.
+
+    The actor is separate from user strategies so a bar-only strategy still
+    produces current mark-to-market P&L. Nautilus' DataEngine deduplicates the
+    upstream subscription when another actor or strategy already uses quotes.
+    """
+
+    def __init__(self, config: _UnrealizedPnlQuoteMonitorConfig) -> None:
+        super().__init__(config)
+        self._instrument_ids = tuple(
+            InstrumentId.from_str(value)
+            for value in dict.fromkeys(config.instrument_ids)
+        )
+
+    def on_start(self) -> None:
+        for instrument_id in self._instrument_ids:
+            self.subscribe_quote_ticks(instrument_id)
+
+    def on_stop(self) -> None:
+        for instrument_id in self._instrument_ids:
+            self.unsubscribe_quote_ticks(instrument_id)
+
+
+def _runtime_quote_monitor_config(
+    markets: list[dict[str, Any]],
+) -> ImportableActorConfig:
+    """Build one importable quote monitor for all configured target markets."""
+    instrument_ids = list(
+        dict.fromkeys(
+            str(InstrumentId.from_str(str(market["instrument_id"])))
+            for market in markets
+        ),
+    )
+    return ImportableActorConfig(
+        actor_path="edgepilot.execution.trading:_UnrealizedPnlQuoteMonitor",
+        config_path="edgepilot.execution.trading:_UnrealizedPnlQuoteMonitorConfig",
+        config={"instrument_ids": instrument_ids},
+    )
 
 
 def _binance_futures_leverages(
@@ -123,6 +173,12 @@ def _positions_report_with_unrealized_pnl(
     errors: list[str] = []
     for position in node.cache.positions_open():
         try:
+            if node.cache.quote_tick(position.instrument_id) is None:
+                errors.append(
+                    f"position_unrealized_pnl_pending:{position.id}: "
+                    f"waiting for quote {position.instrument_id}",
+                )
+                continue
             unrealized_pnl = node.cache.calculate_unrealized_pnl(position)
         except Exception as exc:
             errors.append(f"position_unrealized_pnl:{position.id}: {exc}")
@@ -182,10 +238,15 @@ def _write_runtime_snapshot(
     for venue_record in record["venues"]:
         venue_name = str(venue_record["adapter"])
         try:
-            accounts[venue_name] = _frame_rows(
+            account_rows = _frame_rows(
                 node.trader.generate_account_report(venue=Venue(venue_name)),
                 limit=20,
             )
+            reporting_currency = venue_record.get("base_currency")
+            if isinstance(reporting_currency, str) and reporting_currency.strip():
+                for row in account_rows:
+                    row["account_reporting_currency"] = reporting_currency.upper()
+            accounts[venue_name] = account_rows
         except Exception as exc:  # An account may not be available during startup.
             accounts[venue_name] = []
             errors.append(f"{venue_name}: {exc}")
@@ -419,6 +480,7 @@ def execute_trading(
         config=strategy["parameters"],
     )
     config = TradingNodeConfig(
+        actors=[_runtime_quote_monitor_config(markets)],
         strategies=[strategy_config],
         data_clients=data_clients,
         exec_clients=exec_clients,
