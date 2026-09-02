@@ -5,6 +5,11 @@ native NautilusTrader integration, a local dashboard, and one universal
 `skills/edgepilot/SKILL.md` workflow. Runs are multi-market and multi-venue by
 default: each preset declares its market legs and venue configurations.
 
+The repository-wide publication, catalog, recommendation, installation,
+backtest, and paper/demo/live state machine is defined in the repository-root
+authority at `docs/strategy-catalog-search-recommendation.md`.
+This README remains the Live user and packaging guide.
+
 ## Install with Codex
 
 When you attach this extracted plugin directory to a Codex task, send the whole
@@ -13,10 +18,10 @@ attached to a task provide context; they do not become user instructions by
 themselves.
 
 ```text
-Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md. If this Codex surface can create tasks, create and start the guided first-use task with its localized prompt; otherwise include that prompt in your final response.
+Install this EdgePilot Live plugin. After installation, read the "Post-install guidance" section in README.md and include its localized first-use prompt in your final response.
 ```
 
-The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate.
+The lightweight local MCP connects to the single-instance Live service on the first Dashboard operation; `edgepilot ui` and the browser use that same service without native dependencies. Chat, browser handoff and browser heartbeat all use one typed expiring-lease model; active jobs keep the service alive independently of a Codex chat. Starting the MCP protocol itself does not start the Dashboard service. The agent creates a verified virtual environment and installs native dependencies only on the first confirmed runtime-dependent operation or after its Python/native dependency contract changes. Ordinary MCP, UI and plugin-code upgrades reuse that native runtime and update only the installed EdgePilot package through a verified candidate once the runtime is in the stable root; the first Windows upgrade from the former AppData runtime installs a fresh candidate instead.
 
 The Codex plugin exposes one first-use route: verify activation, collect one
 preference at a time, wait for confirmation, render three recommendation cards,
@@ -27,22 +32,45 @@ endpoint, so the seven answers and three cards do not require login. Installing 
 selected package and using account or trading capabilities still require the
 applicable authenticated session and confirmation.
 
-The Live monitor enriches each open position with mark-to-market unrealized P&L
-from NautilusTrader's cached quote when one is available. A missing quote leaves
-that position's value unavailable without hiding the position or other runtime
-reports; account-level unrealized P&L remains the venue-reported aggregate.
+The Live execution monitor subscribes to quote ticks for every configured target
+instrument independently of the installed strategy, then enriches each open
+position with mark-to-market unrealized P&L from NautilusTrader's cached bid/ask.
+NautilusTrader deduplicates this monitoring subscription when a strategy already
+uses the same quotes. Before the first quote arrives, the runtime snapshot keeps
+the position and reports that market data is pending instead of silently dropping
+the value or flooding the native log; account-level unrealized P&L remains the
+venue-reported aggregate. In the Accounts table, balances and initial margin are
+projected per currency. A venue-level unrealized P&L aggregate is displayed only
+on its explicit account reporting currency and is never copied onto other asset
+rows.
 
-The plugin cache contains no credentials or trading data. Runtime state is stored
-in `~/.edgepilot/` on macOS/Linux or `%APPDATA%\\EdgePilot` on Windows, with
-`EDGEPILOT_HOME` available as an override. Signed-in users keep installed
+The plugin cache contains no credentials or trading data. User strategies, market
+data, credentials, runs, and Dashboard service state are stored in
+`~/.edgepilot/` on every supported platform (on Windows this is
+`%USERPROFILE%\\.edgepilot`), with `EDGEPILOT_HOME` available as an override.
+This keeps the path stable when a Microsoft Store host virtualizes `AppData`;
+the Windows compatibility and legacy-state boundary is documented in
+`../docs/windows-live-path-compatibility.md`. Signed-in users keep installed
 strategies, exchange credentials, and runs under an account-specific
 `accounts/<non-PII-key>/` directory derived from the Marketplace user ID.
 Market data and the locked runtime remain shared because they contain no account
 orders or secrets.
 
+On the first Windows upgrade from the former `%APPDATA%\EdgePilot` root, the
+maintenance entry point safely stops a service verified from that old root and
+moves authentication metadata, accounts, strategies, runs and catalog into
+`%USERPROFILE%\.edgepilot`. Each entry is renamed atomically on the user-profile
+volume; an interruption resumes from a local migration record and a normal
+failure rolls completed entries back. The migration never merges with existing
+new-root user state and never moves the separate locked runtime, logs or service
+records. The old runtime remains untouched but is not reused; the next confirmed
+runtime operation installs it under the stable profile root. A configured
+`EDGEPILOT_HOME` remains an explicit opt-out.
+
 EdgePilot Live has one fixed localhost address: `http://127.0.0.1:8787`.
 It never falls back to a random port. Install, repair, upgrade and uninstall
-first stop only the service authenticated by EdgePilot's private service record;
+first stop only services authenticated by EdgePilot's private service records in
+the current root and, during the Windows path transition, the former AppData root;
 active runs and jobs block maintenance, while an unfinished login can be
 restarted after activation. A different program on 8787 is reported as a port
 conflict and is never terminated automatically.
@@ -72,9 +100,12 @@ There is no global runs directory. Market data remains shared in
 Published records are generated by the same native backtest command as local
 records, including fills, positions, timeseries, and the PNG chart.
 
-Backtests automatically download missing bars before execution. Legacy presets may still contain
+Backtests automatically download missing bars before execution. On Windows, the writable catalog
+used temporarily for fee overrides is created under the system temporary directory and removed
+after the run, avoiding the deeply nested account/strategy/run path; macOS and Linux retain the
+run-local temporary catalog. Legacy presets may still contain
 `backtest.download`, but the field no longer disables automatic data preparation. Normal installs use
-`~/.edgepilot/catalog/` on macOS/Linux and `%APPDATA%\\EdgePilot\\catalog` on Windows. Repository
+`~/.edgepilot/catalog/` on every supported platform. Repository
 development with `EDGEPILOT_HOME="$PWD"` instead uses `$PWD/catalog/`; do not copy market data into
 the plugin or strategy package. Binance Futures reports kline request bounds by open time while
 EdgePilot catalogs external bars by canonical close time. EdgePilot therefore shifts a missing
@@ -113,8 +144,10 @@ When the verified service preflight reports `not_running` or safely stops the ol
 service and the new task's `verify_activation` result is `ready`, no full Codex restart is required. Restart Codex only if a verified old service remains, the
 new task does not expose the installed MCP, or the reported MCP version differs
 from the installed version. The package `BUILD.json` exposes this conditional
-`host_activation` contract. Upgrade and repair
-preserve `~/.edgepilot` (Windows: `%APPDATA%\\EdgePilot`) unless the user
+`host_activation` contract. Upgrade and repair preserve `~/.edgepilot` (Windows:
+`%USERPROFILE%\\.edgepilot`). On Windows, this release and later releases install the locked
+runtime in that stable profile root instead of reusing the former
+`%APPDATA%\\EdgePilot` runtime; the legacy bytes remain untouched unless the user
 explicitly requests complete data removal. Before replacing plugin files, the
 agent runs the candidate package's verified service stopper:
 
@@ -133,9 +166,9 @@ python3 -m venv ~/.edgepilot/.venv
 ~/.edgepilot/.venv/bin/edgepilot --help
 ```
 
-On Windows, create `%APPDATA%\\EdgePilot\\.venv` with `py -m venv`, install
+On Windows, create `%USERPROFILE%\\.edgepilot\\.venv` with `py -m venv`, install
 the `edgepilot` directory with that environment's `pip`, then use
-`%APPDATA%\\EdgePilot\\.venv\\Scripts\\edgepilot.exe`.
+`%USERPROFILE%\\.edgepilot\\.venv\\Scripts\\edgepilot.exe`.
 
 `pip install -e` is an editable install: the virtual environment uses the
 Python source at the given plugin path, rather than copying it into the
@@ -146,17 +179,12 @@ agents do not need it.
 
 ### Post-install guidance
 
-After installation, reply in the user's current conversation language. When the
-current Codex surface exposes a task-creation tool, the installation request above
-is explicit authorization to create and start a fresh task, using the same project
-when applicable, with the localized prompt below as its initial message. Open that
-task for the user when the host supports navigation. Do not use task handoff: it
-moves an existing task and does not create the fresh MCP/tool context required after
-installation. If task creation is unavailable, tell the user to create a new Codex
-task and include the prompt for one-click copying. No restart is needed when the
-verified service preflight reports `not_running` or `stopped`; restarting Codex is
+After installation, reply in the user's current conversation language and tell
+them to create a new Codex task without restarting when the verified service
+preflight reports `not_running` or `stopped`. Explain that restarting Codex is
 only the fallback when the new task cannot verify the installed MCP version.
-Translate the following prompt naturally while
+Include the localized prompt below for one-click copying. Translate the
+following prompt naturally while
 preserving the exact `@EdgePilot` mention and its request to ask about preferences
 one question at a time, obtain confirmation, show three recommendation cards, and
 open the EdgePilot Live Dashboard after the cards:
@@ -165,7 +193,7 @@ open the EdgePilot Live Dashboard after the cards:
 @EdgePilot Help me choose a suitable trading strategy. Ask about my preferences one question at a time, then show three strategy recommendation cards after I confirm them. Please open the EdgePilot Live Dashboard at the same time.
 ```
 
-The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly, using the verified URL returned by the current MCP. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
+The new task completes the questionnaire first. After confirmation it renders the three recommendation cards and calls `open_dashboard` directly with the same `locale` used for `recommend_strategies`, so the verified URL opens the Dashboard in that language. The user does not need to send another Dashboard command. If the host blocks automatic navigation, the tool result still provides the verified clickable URL. The onboarding flow does not install or rebuild the native runtime.
 
 ## Use
 
@@ -206,6 +234,11 @@ an EdgePilot account and a token with `marketplace:install` permission. The
 separate Research client remains account-free and does not send a token or
 machine identifier, although the cloud service records the full client IP for
 Research downloads.
+Marketplace pagination defaults to 15 strategies per page and lets users select
+15, 30, 50, or 100. Changing the page size, search, sort, or compatible-exchange
+filter returns to page one; search and filter changes retain the selected page
+size for the current Dashboard session. Live and Research use the same controls
+and option set, while keeping their independent localhost clients and state.
 Marketplace packages are reviewed and installed as code locally, while their
 cloud metadata and ZIP remain in the marketplace service. Agents can use the
 same catalog with `edgepilot marketplace search`, `inspect`, and `install`.

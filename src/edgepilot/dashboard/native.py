@@ -24,7 +24,9 @@ from edgepilot.strategies.presets import preset_backtest_values
 from edgepilot.strategies.presets import preset_markets
 from edgepilot.strategies.presets import preset_names
 from edgepilot.strategies.presets import preset_strategy_values
+from edgepilot.strategies.presets import preset_venue_options
 from edgepilot.strategies.presets import preset_venues
+from edgepilot.strategies.presets import resolve_preset
 from edgepilot.strategies.presets import resolve_strategy_parameters
 
 
@@ -35,16 +37,39 @@ LOGGER = logging.getLogger("edgepilot.dashboard.native")
 def strategy_config(payload: dict[str, Any]) -> dict[str, Any]:
     strategy = resolve_strategy(str(payload.get("strategy", "")))
     name, values = load_preset(strategy, safe_config_name(str(payload.get("name", ""))))
-    return {"strategy": strategy.name, "name": name, "config": values}
+    venue = str(payload.get("venue", "")).strip().upper()
+    options = preset_venue_options(values) if values else []
+    return {
+        "strategy": strategy.name,
+        "name": name,
+        # Always report which venue the returned config describes, so the caller never
+        # has to infer it from the config it just received.
+        "venue": venue or (options[0] if options else None),
+        "venues": options,
+        "config": resolve_preset(values, venue) if values else values,
+    }
+
+
+def _venue_options(strategy: Any, name: str) -> list[str]:
+    """Never let one unreadable preset take down the whole detail response."""
+    try:
+        _, values = load_preset(strategy, name)
+        return preset_venue_options(values)
+    except (OSError, ValueError, TypeError):
+        return []
 
 
 def strategy_detail(payload: dict[str, Any]) -> dict[str, Any]:
     strategy = resolve_strategy(str(payload.get("strategy", "")))
+    names = preset_names(strategy)
     return {
         "name": strategy.name,
         "strategy_path": strategy.strategy_path,
         "config_path": strategy.config_path,
-        "presets": preset_names(strategy),
+        "presets": names,
+        # Parallel to ``presets`` rather than reshaping it: the CLI still consumes the
+        # plain list (application/cli.py:251,260).
+        "preset_venues": {name: _venue_options(strategy, name) for name in names},
         "config_schema": strategy.config_cls.json_schema(),
     }
 
@@ -55,15 +80,25 @@ def prepare_backtest(payload: dict[str, Any]) -> dict[str, str]:
     if requested_preset not in preset_names(strategy):
         raise ValueError(f"unknown preset: {requested_preset}")
     preset_name, values = load_preset(strategy, requested_preset)
+    venue = str(payload.get("venue", "")).strip().upper()
+    resolve_preset(values, venue)  # reject an unsupported venue before starting a job
     backtest = preset_backtest_values(values)
-    days = int(backtest.get("days", 365))
-    if not 1 <= days <= 5000:
-        raise ValueError("Preset backtest.days must be between 1 and 5000")
+    requested_days = payload.get("period_days")
+    if requested_days is None:
+        preset_days = int(backtest.get("days", 365))
+        if not 1 <= preset_days <= 5000:
+            raise ValueError("Preset backtest.days must be between 1 and 5000")
+        days = min(preset_days, 90)
+    else:
+        if isinstance(requested_days, bool) or not isinstance(requested_days, int) or requested_days not in {30, 90, 365}:
+            raise ValueError("period_days must be 30, 90, or 365")
+        days = requested_days
     end = datetime.now(timezone.utc)
-    start = end - timedelta(days=min(days, 90))
+    start = end - timedelta(days=days)
     return {
         "strategy": strategy.name,
         "preset": preset_name,
+        "venue": venue,
         "start": start.isoformat(),
         "end": end.isoformat(),
     }
@@ -181,6 +216,15 @@ def validated_strategy_config(strategy_name: str, config_name: str, values: Any)
     if not isinstance(values, dict):
         raise ValueError("configuration must be a JSON object")
     _reject_secret_values(values)
+    # Venue variants belong to the published package, not to configurations saved here:
+    # a user config is always the single-venue snapshot of whatever was on screen.
+    # Without this the unknown key would survive ``{**values, ...}`` below and land on
+    # disk unvalidated.
+    if "venue_variants" in preset_backtest_values(values):
+        raise ValueError(
+            "a saved configuration covers one venue; switch venue before saving instead of "
+            "copying the package's venue variants",
+        )
     strategy_values = _without_none(resolve_strategy_parameters(strategy, preset_strategy_values(values)))
     markets = preset_markets(values)
     venues = preset_venues(values)

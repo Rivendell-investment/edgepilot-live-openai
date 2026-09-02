@@ -176,6 +176,21 @@ def _run_is_active(run_dir: Path) -> bool:
         return False
     if pid <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) on Windows terminates the target process and raises
+        # OSError (WinError 87) for stale PIDs, so probe via OpenProcess instead.
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
     try:
         os.kill(pid, 0)
     except PermissionError:

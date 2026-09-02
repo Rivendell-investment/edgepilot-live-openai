@@ -1,5 +1,24 @@
 import { spawn, spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { basename, dirname, join, parse, resolve } from "node:path";
+
+function hostBundledPython() {
+  // When the host app launches us with its bundled Node (for example the Codex
+  // runtime at .../dependencies/node/bin/node), prefer the Python that ships in
+  // the same runtime bundle over whatever the user PATH happens to resolve.
+  let current = dirname(process.execPath);
+  const { root } = parse(current);
+  while (current !== root) {
+    if (basename(current) === "dependencies") {
+      const candidates = process.platform === "win32"
+        ? [join(current, "python", "python.exe")]
+        : [join(current, "python", "bin", "python3"), join(current, "python", "bin", "python")];
+      return candidates.find((candidate) => existsSync(candidate)) ?? null;
+    }
+    current = dirname(current);
+  }
+  return null;
+}
 
 const moduleName = process.argv[2];
 const sourceRoot = process.argv[3];
@@ -23,6 +42,10 @@ env.PYTHONPATH = resolve(process.cwd(), sourceRoot);
 const candidates = process.platform === "win32"
   ? [["py", ["-3"], ["-3", "-m", moduleName]], ["python", [], ["-m", moduleName]], ["python3", [], ["-m", moduleName]]]
   : [["python3", [], ["-m", moduleName]], ["python", [], ["-m", moduleName]]];
+const bundledPython = hostBundledPython();
+if (bundledPython) {
+  candidates.unshift([bundledPython, [], ["-m", moduleName]]);
+}
 let activeChild;
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

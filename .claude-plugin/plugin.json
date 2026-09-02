@@ -1,6 +1,6 @@
 {
   "name": "edgepilot",
-  "version": "0.11.53",
+  "version": "0.12.2",
   "description": "Local-first trading strategy workflows powered by NautilusTrader.",
   "author": {
     "name": "EdgePilot"

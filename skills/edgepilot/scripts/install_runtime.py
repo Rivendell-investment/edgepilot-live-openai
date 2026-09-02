@@ -106,9 +106,6 @@ def default_venv_dir() -> Path:
     override = os.environ.get("EDGEPILOT_VENV")
     if override:
         return Path(override).expanduser()
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / "EdgePilot" / ".venv"
     return Path.home() / ".edgepilot" / ".venv"
 
 
@@ -199,9 +196,6 @@ def read_python_version(python_bin: Path | str) -> tuple[int, int]:
 
 
 def uv_bin_dir() -> Path:
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / "EdgePilot" / "bin"
     return Path.home() / ".edgepilot" / "bin"
 
 

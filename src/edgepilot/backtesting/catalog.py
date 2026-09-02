@@ -89,8 +89,12 @@ def _binance_request_window(
     last_close_ns = (end_ns // interval_ns) * interval_ns
     if first_close_ns > last_close_ns:
         raise ValueError("Binance request period contains no complete bar close")
+    # Weekly, monthly, and multi-day Binance klines use venue-native open
+    # boundaries which need not align with Unix-epoch multiples. Their close
+    # is normalized below into the canonical slot, so include one leading
+    # interval that may contain the first requested canonical close.
     return (
-        (first_close_ns - interval_ns) // 1_000_000,
+        (first_close_ns - 2 * interval_ns) // 1_000_000,
         (last_close_ns - interval_ns) // 1_000_000,
         first_close_ns,
         last_close_ns,
@@ -101,9 +105,12 @@ def _client_config(
     adapter: AdapterDescriptor,
     options: dict[str, Any],
     instrument_id: str,
+    default_environment: str | None = None,
 ):
     config_cls = resolve_path(adapter.data_config_path)
     values = dict(options)
+    if default_environment is not None:
+        values.setdefault("environment", default_environment)
     if "instrument_provider" in get_type_hints(config_cls):
         values.setdefault(
             "instrument_provider",
@@ -755,7 +762,15 @@ async def _pull_digifinex_bars(
         request.add_header("User-Agent", "edgepilot-catalog")
         return urlopen(request, timeout=timeout)  # noqa: S310 - client validates http(s)
 
-    config = _client_config(adapter, adapter_options, instrument_id)
+    # DigiFinex's native config defaults to its VPN-only TEST host. Catalog
+    # downloads are public-data reads, so their safe default is the public LIVE
+    # endpoint; an explicit TEST option remains available for controlled tests.
+    config = _client_config(
+        adapter,
+        adapter_options,
+        instrument_id,
+        default_environment="LIVE",
+    )
     client = DigifinexHttpClient(
         api_key=config.api_key,
         api_secret=config.api_secret,
@@ -820,8 +835,14 @@ async def _pull_digifinex_bars(
                 # matching engine rejects bars whose precision differs from the
                 # instrument, so re-quantize every field before persisting.
                 for field in ("open", "high", "low", "close"):
-                    values[field] = f"{Decimal(values[field]):.{instrument.price_precision}f}"
-                values["volume"] = f"{Decimal(values['volume']):.{instrument.size_precision}f}"
+                    price = values[field]
+                    if not isinstance(price, str):
+                        raise TypeError(f"Bar.to_dict returned non-string {field}")
+                    values[field] = f"{Decimal(price):.{instrument.price_precision}f}"
+                volume = values["volume"]
+                if not isinstance(volume, str):
+                    raise TypeError("Bar.to_dict returned non-string volume")
+                values["volume"] = f"{Decimal(volume):.{instrument.size_precision}f}"
                 normalized_bars.append(Bar.from_dict(values))
             if normalized_bars:
                 catalog.write_data(normalized_bars)

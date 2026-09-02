@@ -83,12 +83,18 @@ def strategy_records(
             marketplace = read_json(package / ".marketplace.json", None)
             configs = package / "configs"
             presets = sorted(path.stem for path in configs.glob("*.json")) if configs.is_dir() else []
+            default = read_json(configs / "default.json", {}) if configs.is_dir() else {}
+            backtest = default.get("backtest") if isinstance(default, dict) else None
+            venues = backtest.get("venues") if isinstance(backtest, dict) else None
+            venue_count = len(venues) if isinstance(venues, dict) else 0
             records.append(
                 {
                     "name": package.name,
                     "presets": presets,
                     "source": "marketplace" if marketplace else "local",
                     "marketplace": marketplace,
+                    "venue_model": "multi_venue" if venue_count > 1 else "single_venue" if venue_count == 1 else None,
+                    "venue_model_supported": venue_count == 1,
                 }
                 | strategy_content(package, package.name, locale, read_json),
             )

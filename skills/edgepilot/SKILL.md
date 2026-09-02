@@ -24,24 +24,34 @@ single-service maintenance operations. EdgePilot Live owns the fixed loopback
 address `127.0.0.1:8787`; never scan for another port or accept an ephemeral
 fallback. Before replacing or removing an installed build, run the candidate
 package's `skills/edgepilot/scripts/stop_local_service.py --force`. That helper
-stops only a service authenticated by EdgePilot's owner-only service record and
-health identity, refuses while runs or jobs are active, and rechecks the PID's
-birth token before forced termination. If another product owns 8787, do not stop
-it; report `EDGEPILOT_PORT_IN_USE` and ask the user to resolve the conflict.
+stops only services authenticated by EdgePilot's owner-only service record and
+health identity in the current root and, during a Windows path upgrade, the
+former `%APPDATA%\EdgePilot` root. It refuses while runs or jobs are active and
+rechecks the PID's birth token before forced termination. If another product
+owns 8787, do not stop it; report `EDGEPILOT_PORT_IN_USE` and ask the user to
+resolve the conflict.
 
 Reinstall and upgrade preserve `~/.edgepilot` (Windows:
-`%APPDATA%\\EdgePilot`) by default, including accounts, credentials, strategies,
-runs, catalog and runtime. Delete that state only when the user explicitly asks
+`%USERPROFILE%\\.edgepilot`) by default, including accounts, credentials,
+strategies, runs and catalog. On Windows, preserve but do not reuse the former
+`%APPDATA%\\EdgePilot` runtime; install the replacement under the stable profile
+root after runtime confirmation. Delete that state only when the user explicitly asks
 for a complete data removal. An unfinished Dashboard email or Google login may
 be canceled by maintenance and restarted after activation; never force-stop an
 active run or job through this maintenance flow.
 
-After plugin files are delivered, say that installation is complete. When the
-host exposes task creation, use it to create and start a fresh Codex task with
-the documented first-use prompt; the installation request is explicit
-authorization for that action. Do not use task handoff, which moves an existing
-task without creating a fresh MCP/tool context. If task creation is unavailable,
-ask the user to create the task and provide the prompt for copying. A full Codex restart is not required when the
+On Windows, a first upgrade from the former `%APPDATA%\EdgePilot` root
+automatically migrates authentication metadata, accounts, strategies, runs and
+catalog only when the new root has no corresponding user state. The migration
+uses a recoverable local record and atomic same-volume moves; it keeps the locked
+runtime at its existing path without reusing it and never merges conflicts. If migration reports
+active work, an unverifiable old service, a destination conflict or recovery
+required, report that exact condition and do not copy credentials or kill a
+process by name or port.
+
+After plugin files are delivered, say that installation is complete and ask the
+user to create a new Codex task. Provide the documented localized first-use
+prompt for copying. A full Codex restart is not required when the
 verified service preflight returned `not_running` or safely stopped the old
 service and the new task's `verify_activation` result is `ready`. Restart Codex only if a verified old service remains, the new task does not
 expose the installed MCP, or its reported MCP version does not match the installed
@@ -59,6 +69,9 @@ loopback URL; verify that it is `http://127.0.0.1:8787`, and never scan ports or
 the same persistent run records, timeseries, fills, positions, runtime
 snapshots, and PNG artifacts as the CLI; do not create a second backtest or
 execution implementation for the UI.
+When onboarding opens the Dashboard, call `open_dashboard` with the same `locale` used for `recommend_strategies`;
+for another Dashboard request, pass the canonical current conversation locale when it is supported. The returned URL
+owns this per-open language choice; do not store it in shared service state.
 
 The default website uses renewable chat and browser leases internally. Do not
 expose those implementation terms in normal conversation. When the Dashboard is
@@ -236,7 +249,7 @@ python3 <plugin-root>/skills/edgepilot/scripts/install_runtime.py <plugin-root>
 ```
 
 On Windows use `py -3` or `python` instead of `python3` when needed. The installer selects
-`%APPDATA%\\EdgePilot\\.venv` automatically.
+`%USERPROFILE%\\.edgepilot\\.venv` automatically.
 
 The hosted custom `nautilus_trader` wheel is required. Official PyPI `nautilus_trader` is a
 different build: later EdgePilot Live adapters, backtests, and imports will fail if you install
@@ -491,8 +504,8 @@ Read backtest defaults from the preset's `backtest` object. Use a rolling `days`
 user supplies exact `--start` and `--end` timestamps. The command always downloads missing bars,
 then runs native `BacktestNode` and writes the artifacts below. Legacy presets may still contain
 `backtest.download`, but that field no longer disables automatic data preparation. Normal installs
-share data under `~/.edgepilot/catalog/` on
-macOS/Linux or `%APPDATA%\\EdgePilot\\catalog` on Windows. Only repository development with
+share data under `~/.edgepilot/catalog/` on every supported platform (Windows:
+`%USERPROFILE%\\.edgepilot\\catalog`). Only repository development with
 `EDGEPILOT_HOME="$PWD"` uses `$PWD/catalog/`. Market data never belongs in a plugin or strategy ZIP.
 
 - `run.json`: complete reproducible configuration plus headline metrics;
@@ -592,7 +605,7 @@ running list; do not invent heartbeat or connection-state layers.
 - Use Nautilus `ImportableStrategyConfig`, `BacktestNode`, `TradingNode`, native adapters, native catalog objects, analyzer, and reports.
 - Do not add exchange adapters, strategy registries, deployment layers, runtime frameworks, or alternate data and fee models.
 - Store generated state only in the stable user state directory (`~/.edgepilot/` on macOS/Linux or
-  `%APPDATA%\\EdgePilot\\` on Windows; `EDGEPILOT_HOME` overrides it), including all strategies,
+  `%USERPROFILE%\\.edgepilot\\` on Windows; `EDGEPILOT_HOME` overrides it), including all strategies,
   their configs and runs, credentials, and downloaded data.
 - When developing against this git checkout, set `EDGEPILOT_HOME` to the repository root so the
   CLI reads `strategies/` here. If there is no Marketplace session, also set

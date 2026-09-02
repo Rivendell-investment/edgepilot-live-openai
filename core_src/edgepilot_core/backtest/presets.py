@@ -5,6 +5,20 @@ from pathlib import Path
 from typing import Any
 
 from edgepilot_core.backtest.discovery import StrategyDescriptor, instantiate_config_class
+# Structure and venue rules live in a module free of engine imports so the Dashboard
+# and Research HTTP layers can apply the same ones without loading NautilusTrader.
+from edgepilot_core.backtest.preset_schema import VARIANT_SECTIONS  # noqa: F401
+from edgepilot_core.backtest.preset_schema import VARIANT_STRATEGY_SUFFIXES  # noqa: F401
+from edgepilot_core.backtest.preset_schema import VENUE_VARIANTS_KEY  # noqa: F401
+from edgepilot_core.backtest.preset_schema import benchmark_venue  # noqa: F401
+from edgepilot_core.backtest.preset_schema import preset_backtest_values  # noqa: F401
+from edgepilot_core.backtest.preset_schema import preset_markets  # noqa: F401
+from edgepilot_core.backtest.preset_schema import preset_strategy_values  # noqa: F401
+from edgepilot_core.backtest.preset_schema import preset_venue_options  # noqa: F401
+from edgepilot_core.backtest.preset_schema import preset_venues  # noqa: F401
+from edgepilot_core.backtest.preset_schema import public_adapter_options  # noqa: F401
+from edgepilot_core.backtest.preset_schema import resolve_preset  # noqa: F401
+from edgepilot_core.backtest.preset_schema import validate_venue_variants  # noqa: F401
 
 
 def preset_names(root: Path, strategy: StrategyDescriptor) -> list[str]:
@@ -28,49 +42,3 @@ def load_preset(root: Path, strategy: StrategyDescriptor, name: str | None) -> t
 
 def resolve_strategy_parameters(strategy: StrategyDescriptor, values: dict[str, Any]) -> dict[str, Any]:
     return json.loads(instantiate_config_class(strategy.config_cls, values).json())
-
-
-def preset_strategy_values(preset: dict[str, Any]) -> dict[str, Any]:
-    values = preset.get("strategy", preset)
-    if not isinstance(values, dict):
-        raise TypeError("Preset 'strategy' must be a JSON object")
-    return dict(values)
-
-
-def preset_backtest_values(preset: dict[str, Any]) -> dict[str, Any]:
-    values = preset.get("backtest", {})
-    if not isinstance(values, dict):
-        raise TypeError("Preset 'backtest' must be a JSON object")
-    return dict(values)
-
-
-def preset_markets(preset: dict[str, Any]) -> list[dict[str, Any]]:
-    values = preset_backtest_values(preset).get("markets")
-    if not isinstance(values, list) or not values:
-        raise ValueError("Preset backtest.markets must be a non-empty array")
-    result = []
-    for market in values:
-        if not isinstance(market, dict):
-            raise TypeError("Each backtest market must be an object")
-        missing = {"instrument_id", "bar_type", "venue"} - market.keys()
-        if missing:
-            raise ValueError(f"Market is missing required fields: {sorted(missing)}")
-        result.append(dict(market))
-    return result
-
-
-def preset_venues(preset: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    values = preset_backtest_values(preset).get("venues")
-    if not isinstance(values, dict) or not values:
-        raise ValueError("Preset backtest.venues must be a non-empty object")
-    result = {}
-    for name, settings in values.items():
-        if not isinstance(settings, dict):
-            raise TypeError(f"Venue settings for {name} must be an object")
-        result[str(name).upper()] = dict(settings)
-    return result
-
-
-def public_adapter_options(values: dict[str, Any]) -> dict[str, Any]:
-    secrets = ("api_key", "api_secret", "passphrase", "password", "private_key", "secret", "token")
-    return {key: value for key, value in values.items() if not any(part in key.lower() for part in secrets)}

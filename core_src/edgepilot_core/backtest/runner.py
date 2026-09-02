@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Callable
 
 from nautilus_trader.analysis import MaxDrawdown
@@ -58,7 +59,7 @@ def execute_local_backtest(
         for venue in request.venues
     )
     catalog_path = request.catalog_path
-    temporary_catalog = run_dir / ".catalog"
+    temporary_catalog = _temporary_catalog_path(run_dir) if overrides_fees else run_dir / ".catalog"
     node: BacktestNode | None = None
     try:
         if overrides_fees:
@@ -129,6 +130,13 @@ def execute_local_backtest(
 _READ_ONLY_DATA_KINDS = frozenset({"bar"})
 
 
+def _temporary_catalog_path(run_dir: Path) -> Path:
+    """Return a disposable fee overlay path without deep Windows run nesting."""
+    if os.name == "nt":
+        return Path(tempfile.mkdtemp(prefix="epc-"))
+    return run_dir / ".catalog"
+
+
 def _prepare_fee_override_catalog(
     source: Path,
     target: Path,
@@ -141,8 +149,17 @@ def _prepare_fee_override_catalog(
     ``_resolve_instrument_fees`` cannot write through to the shared catalog when
     the instrument layout is unfamiliar.
     """
-    if target.exists():
+    # ``tempfile.mkdtemp`` (used on Windows) returns an already-created empty
+    # directory.  Do not remove and immediately recreate that directory: on
+    # Windows the deletion can be observed asynchronously by the filesystem
+    # (or an antivirus/indexer), leaving subsequent ``copytree``/``copy2``
+    # calls with WinError 3 even though the source catalog is valid.  A stale
+    # POSIX run-local overlay is still removed before rebuilding it.
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        target.unlink()
+    elif target.is_dir() and any(target.iterdir()):
         shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
     source = source.resolve()
     src_data = source / "data"
     if not src_data.is_dir():
@@ -178,6 +195,9 @@ def _create_windows_junction(source: Path, target: Path) -> None:
             check=True,
             capture_output=True,
             text=True,
+            # Backtests run under the console-less local service; without this
+            # every junction would flash a cmd.exe window at the user.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         detail = getattr(exc, "stderr", None) or str(exc)

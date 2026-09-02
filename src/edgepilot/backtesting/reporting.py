@@ -16,7 +16,6 @@ from matplotlib.ticker import StrMethodFormatter
 import numpy as np
 import pandas as pd
 from nautilus_trader.backtest.engine import BacktestEngine
-from edgepilot_core.backtest.metrics import collect_metrics
 from nautilus_trader.model.data import BarType
 from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
@@ -52,6 +51,7 @@ def export_reports(
     start: Any,
     end: Any,
     starting_balance: float,
+    export_chart: bool = True,
 ) -> None:
     """Export queryable native results and one focused visual report."""
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -107,13 +107,14 @@ def export_reports(
         ),
         encoding="utf-8",
     )
-    _export_chart(
-        markets=markets,
-        series=series,
-        metrics=metrics,
-        output_png=run_dir / "backtest.png",
-        starting_balance=starting_balance,
-    )
+    if export_chart:
+        _export_chart(
+            markets=markets,
+            series=series,
+            metrics=metrics,
+            output_png=run_dir / "backtest.png",
+            starting_balance=starting_balance,
+        )
 
 
 def _load_market(

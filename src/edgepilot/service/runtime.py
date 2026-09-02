@@ -23,9 +23,6 @@ def runtime_venv() -> Path:
     override = os.environ.get("EDGEPILOT_VENV")
     if override:
         return Path(override).expanduser().resolve()
-    if os.name == "nt":
-        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        return Path(base) / "EdgePilot" / ".venv"
     return Path.home() / ".edgepilot" / ".venv"
 
 

@@ -2,34 +2,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
-import json
+from functools import partial
 import logging
 from pathlib import Path
 from time import monotonic
 from typing import Any
 from typing import get_type_hints
 
-from nautilus_trader.analysis import MaxDrawdown
-from nautilus_trader.backtest.config import BacktestDataConfig
-from nautilus_trader.backtest.config import BacktestEngineConfig
-from nautilus_trader.backtest.config import BacktestRunConfig
-from nautilus_trader.backtest.config import BacktestVenueConfig
-from nautilus_trader.backtest.node import BacktestNode
 from nautilus_trader.common.config import resolve_path
-from nautilus_trader.config import ImportableStrategyConfig
-from nautilus_trader.config import LoggingConfig
-from nautilus_trader.model.data import Bar
-from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
 from edgepilot.backtesting.catalog import missing_bar_intervals
 from edgepilot.backtesting.catalog import pull_data
-from edgepilot.strategies.discovery import StrategyDescriptor
 from edgepilot.backtesting.models import MarketRequest
 from edgepilot.backtesting.models import VenueRequest
-from edgepilot.strategies.presets import public_adapter_options
-from edgepilot.strategies.presets import resolve_strategy_parameters
 from edgepilot.backtesting.reporting import export_reports
+from edgepilot.strategies.discovery import StrategyDescriptor
 from edgepilot_core.backtest.models import BacktestRequest as CoreBacktestRequest
 from edgepilot_core.backtest.models import MarketRequest as CoreMarketRequest
 from edgepilot_core.backtest.models import VenueRequest as CoreVenueRequest
@@ -51,6 +38,7 @@ class BacktestRequest:
     runs_path: Path
     download: bool = True  # Accepted for legacy callers; missing data is always downloaded.
     export_artifacts: bool = True
+    export_chart: bool = True
     preset_name: str | None = None
 
 
@@ -70,7 +58,7 @@ def _download_adapter_options(venue: VenueRequest) -> dict[str, Any]:
 def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
     started = monotonic()
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    LOGGER.info("backtest started", extra={"event": "backtest.started", "run_id": run_id, "params": {"strategy": request.strategy.name, "preset": request.preset_name, "start": request.start.isoformat(), "end": request.end.isoformat(), "markets": [market.__dict__ for market in request.markets], "export_artifacts": request.export_artifacts}})
+    LOGGER.info("backtest started", extra={"event": "backtest.started", "run_id": run_id, "params": {"strategy": request.strategy.name, "preset": request.preset_name, "start": request.start.isoformat(), "end": request.end.isoformat(), "markets": [market.__dict__ for market in request.markets], "export_artifacts": request.export_artifacts, "export_chart": request.export_chart}})
     if not request.markets:
         raise ValueError("A backtest requires at least one market")
     venue_by_name = {venue.adapter.name: venue for venue in request.venues}
@@ -151,7 +139,8 @@ def execute_backtest(request: BacktestRequest) -> tuple[str, dict[str, Any]]:
     run_id, metrics = execute_local_backtest(
         core_request,
         run_id=run_id,
-        report_exporter=export_reports if request.export_artifacts else None,
+        report_exporter=partial(export_reports, export_chart=request.export_chart)
+        if request.export_artifacts else None,
     )
     LOGGER.info("backtest completed", extra={"event": "backtest.completed", "run_id": run_id, "result": "success", "duration_ms": round((monotonic() - started) * 1000), "params": {"strategy": request.strategy.name, "metrics": metrics, "run_directory": str(request.runs_path / run_id)}})
     return run_id, metrics

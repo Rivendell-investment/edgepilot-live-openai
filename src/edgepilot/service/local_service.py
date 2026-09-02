@@ -26,19 +26,28 @@ from threading import Event, Lock, Thread
 from typing import Any
 
 from edgepilot import __version__
+from edgepilot.application.windows_state_migration import (
+    complete_persistent_registration,
+    migrate_windows_state,
+    migration_required,
+    persistent_registration_pending,
+)
 from edgepilot.platform.logging import configure_logging
 from edgepilot.service.build_identity import (
     plugin_content_digest as _plugin_content_digest,
     verified_plugin_content_digest as _verified_plugin_content_digest,
 )
-from edgepilot.platform.paths import state_root
+from edgepilot.platform.paths import state_root, windows_legacy_state_root
 
 
 SERVICE_PROTOCOL = 1
 SERVICE_SCHEMA = 2
 SERVICE_RECORD = "local-dashboard.json"
-SERVICE_LOCK = "local-dashboard.lock"
-START_LOCK = "local-dashboard-start.lock"
+# Legacy locks may be owned by an expired MSIX sandbox identity.  A new
+# generation leaves those diagnostic artifacts untouched and relies on the
+# verified service record plus the fixed listener port to exclude a live v1.
+SERVICE_LOCK = "local-dashboard-v2.lock"
+START_LOCK = "local-dashboard-start-v2.lock"
 PERSISTENT_MARKER = "background-dashboard/enabled.json"
 PENDING_GENERATION = "local-dashboard.pending.json"
 SERVICE_ID = "capital.rivendell.edgepilot.live.dashboard"
@@ -90,9 +99,9 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def _read_json(path: Path) -> Any:
-    if not path.is_file() or path.stat().st_size > 256 * 1024:
-        return None
     try:
+        if not path.is_file() or path.stat().st_size > 256 * 1024:
+            return None
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError):
         return None
@@ -376,6 +385,7 @@ def _process_environment() -> dict[str, str]:
         core = root.parent / "edgepilot-core" / "src"
     environment = dict(os.environ)
     environment.pop("PYTHONHOME", None)
+    environment["EDGEPILOT_HOME"] = str(state_root())
     environment["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(core)))
     return environment
 
@@ -453,6 +463,7 @@ active=json.loads((root/'active.json').read_text(encoding='utf-8'))
 generation=(root/'installations'/active['build_id']).resolve()
 if generation.parent != (root/'installations').resolve(): raise SystemExit('unsafe EdgePilot generation')
 sys.path[:0]=[str(generation/'src'),str(generation/'core_src')]
+os.environ['EDGEPILOT_HOME']=str(root.parent)
 os.environ['EDGEPILOT_ACTIVE_BUILD_ID']=active['build_id']
 runpy.run_module('edgepilot.local_service',run_name='__main__')
 """
@@ -480,6 +491,7 @@ def activate_persistent_generation(root: Path | None = None) -> dict[str, Any]:
 def enable_persistent_service() -> dict[str, Any]:
     from edgepilot_core.persistent_service import register_launcher
 
+    _prepare_windows_state_transition(timeout=5.0)
     root = state_root()
     marker_path = root / PERSISTENT_MARKER
     previous_marker = marker_path.read_bytes() if marker_path.is_file() else None
@@ -515,6 +527,7 @@ def enable_persistent_service() -> dict[str, Any]:
 def disable_persistent_service() -> dict[str, Any]:
     from edgepilot_core.persistent_service import unregister_launcher
 
+    _prepare_windows_state_transition(timeout=5.0)
     root = state_root()
     record = trusted_service(read_service_record(root))
     status = service_request(record, "GET", "/api/process/status") if record is not None else None
@@ -533,10 +546,21 @@ def _wait_for_exit(pid: int, timeout: float) -> bool:
 
 
 def stop_verified_service(*, force: bool = False, timeout: float = 5.0) -> dict[str, Any]:
-    """Stop only the service authenticated by the owner-only service record."""
+    """Stop verified services in both the current and pre-migration roots."""
+    current_root = state_root()
+    results = [_stop_verified_service_at(current_root, force=force, timeout=timeout)]
+    legacy_root = windows_legacy_state_root()
+    if legacy_root is not None and not _same_root(current_root, legacy_root):
+        results.append(_stop_verified_service_at(legacy_root, force=force, timeout=timeout))
+    selected = next((result for result in results if result.get("stopped")), results[0])
+    _prepare_windows_state_transition(timeout=timeout)
+    return selected
+
+
+def _stop_verified_service_at(root: Path, *, force: bool, timeout: float) -> dict[str, Any]:
+    """Stop only the service authenticated by one owner-only service record."""
     from edgepilot.execution.run_state import process_start_token
 
-    root = state_root()
     record = trusted_service(read_service_record(root))
     if record is None:
         return {"stopped": False, "reason": "not_running"}
@@ -572,6 +596,55 @@ def stop_verified_service(*, force: bool = False, timeout: float = 5.0) -> dict[
         if not _wait_for_exit(pid, min(2.0, timeout)):
             raise RuntimeError("EDGEPILOT_SERVICE_FORCE_STOP_FAILED: the verified EdgePilot service is still running")
     return {"stopped": True, "forced": True, "pid": pid}
+
+
+def _same_root(first: Path, second: Path) -> bool:
+    return os.path.normcase(str(first.expanduser().absolute())) == os.path.normcase(
+        str(second.expanduser().absolute())
+    )
+
+
+def _prepare_windows_state_transition(*, timeout: float) -> None:
+    legacy_root = windows_legacy_state_root()
+    root = state_root()
+    if legacy_root is None or _same_root(root, legacy_root):
+        return
+    legacy_record = read_service_record(legacy_root)
+    trusted_legacy = trusted_service(legacy_record)
+    if trusted_legacy is not None:
+        _stop_verified_service_at(legacy_root, force=False, timeout=timeout)
+    elif isinstance(legacy_record, dict) and pid_exists(legacy_record.get("pid")):
+        raise RuntimeError(
+            "EDGEPILOT_LEGACY_SERVICE_UNVERIFIED: close the old EdgePilot Live service before upgrading"
+        )
+    try:
+        required = migration_required(legacy_root, root)
+    except PermissionError:
+        LOGGER.warning("legacy Windows state is inaccessible", extra={
+            "event": "local_service.windows_state_transition.skipped",
+            "result": "legacy_root_inaccessible",
+        })
+        return
+    if not required:
+        return
+    current = trusted_service(read_service_record(root))
+    if current is not None:
+        raise RuntimeError(
+            "EDGEPILOT_STATE_MIGRATION_ACTIVE_SERVICE: stop the new EdgePilot Live service before migration"
+        )
+    migrate_windows_state(legacy_root, root)
+
+
+def _complete_windows_persistent_transition(root: Path) -> None:
+    if not persistent_registration_pending(root):
+        return
+    from edgepilot_core.persistent_service import register_launcher, unregister_launcher
+
+    legacy_root = windows_legacy_state_root()
+    if legacy_root is not None:
+        unregister_launcher(legacy_root / "background-dashboard", SERVICE_ID, WINDOWS_TASK)
+    register_launcher(root / "background-dashboard", SERVICE_ID, WINDOWS_TASK, restart=False)
+    complete_persistent_registration(root)
 
 
 def _spawn_service(root: Path, port: int) -> None:
@@ -724,10 +797,12 @@ def _sync_persistent_generation(root: Path, build_id: str) -> None:
 
 def reconcile_existing_service(*, timeout: float = 5.0) -> dict[str, Any] | None:
     """Retire an idle older generation without starting a Dashboard."""
+    _prepare_windows_state_transition(timeout=timeout)
     root = state_root()
     root.mkdir(parents=True, exist_ok=True)
     build_id = verified_plugin_build_id()
     _sync_persistent_generation(root, build_id)
+    _complete_windows_persistent_transition(root)
     current = read_service_record(root)
     exact = trusted_service(current, expected_build_id=build_id)
     if exact is not None:
@@ -740,10 +815,12 @@ def reconcile_existing_service(*, timeout: float = 5.0) -> dict[str, Any] | None
 
 def ensure_service(*, port: int = FIXED_PORT, timeout: float = 10.0) -> dict[str, Any]:
     started = time.monotonic()
+    _prepare_windows_state_transition(timeout=timeout)
     root = state_root()
     root.mkdir(parents=True, exist_ok=True)
     build_id = verified_plugin_build_id()
     _sync_persistent_generation(root, build_id)
+    _complete_windows_persistent_transition(root)
     current = read_service_record(root)
     exact = trusted_service(current, expected_build_id=build_id)
     if exact is not None:
