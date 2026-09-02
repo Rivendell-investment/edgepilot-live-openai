@@ -19,9 +19,22 @@ def state_root() -> Path:
     if configured:
         return Path(configured).expanduser()
     if os.name == "nt":
-        app_data = os.environ.get("APPDATA")
-        return (Path(app_data) if app_data else Path.home()) / "EdgePilot"
+        # Microsoft Store/MSIX hosts virtualize AppData into a deep package-local
+        # path which changes again when the background service runs outside the
+        # package.  The profile root is stable across both process contexts and
+        # also leaves substantially more of the legacy Win32 path budget.
+        return Path.home() / ".edgepilot"
     return Path.home() / ".edgepilot"
+
+
+def windows_legacy_state_root() -> Path | None:
+    """Return the pre-0.12 Windows state root when automatic migration applies."""
+    if os.name != "nt" or "EDGEPILOT_HOME" in os.environ:
+        return None
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return Path(appdata).expanduser() / "EdgePilot"
 
 
 def account_key_for_user(user_id: str, origin: str) -> str:

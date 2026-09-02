@@ -435,9 +435,19 @@ def sync_pending_installations(*, token: str, user_id: str) -> None:
         read_items=_read_pending_unlocked,
         write_items=_write_pending_unlocked,
         request=_request,
-        read_credentials=_read_unlocked,
-        refresh_credentials=_refresh_unlocked,
+        read_credentials=_read_credentials_for_outbox,
+        refresh_credentials=_refresh_credentials_for_outbox,
     )
+
+
+def _read_credentials_for_outbox() -> dict[str, Any] | None:
+    with _credential_lock():
+        return _read_unlocked()
+
+
+def _refresh_credentials_for_outbox(credentials: dict[str, Any]) -> dict[str, Any]:
+    with _credential_lock():
+        return _refresh_unlocked(_read_unlocked() or credentials)
 
 
 def _save_unlocked(path: Path, tokens: dict[str, Any], user: dict[str, Any] | None = None,
@@ -916,7 +926,11 @@ def authorize_backtest() -> None:
         raise AuthError("ADMIN_AUTH_INVALID")
 
 
-def status(*, validate_remote: bool = False) -> dict[str, Any]:
+def status(
+    *,
+    validate_remote: bool = False,
+    maintain_installations: bool = True,
+) -> dict[str, Any]:
     try:
         path, _ = _paths()
         with _credential_lock():
@@ -972,7 +986,11 @@ def status(*, validate_remote: bool = False) -> dict[str, Any]:
             activate_account(user["id"], marketplace_origin())
             result = {"authenticated": True, "user": user, "access_expires_at": credentials.get("access_expires_at"), "credential_storage": credentials.get("storage")}
         user = result.get("user")
-        if isinstance(user, dict) and isinstance(user.get("id"), str):
+        if (
+            maintain_installations
+            and isinstance(user, dict)
+            and isinstance(user.get("id"), str)
+        ):
             try:
                 reconcile_prepared_installations(user["id"])
                 sync_pending_installations(token=str(credentials["access_token"]), user_id=user["id"])

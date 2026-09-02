@@ -99,6 +99,7 @@ def _plugin_environment(account_key: str | None = None) -> dict[str, str]:
     if not core.is_dir():
         core = root.parent / "edgepilot-core" / "src"
     environment = dict(os.environ)
+    environment["EDGEPILOT_HOME"] = str(state_root())
     for name in tuple(environment):
         if _EXCHANGE_CREDENTIAL_NAME.fullmatch(name):
             environment.pop(name, None)
@@ -1186,7 +1187,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         _error(self, "AUTH_REQUIRED", "Sign in to use EdgePilot.", 401, login={"action": "open_browser"})
 
     def _require_business_auth(self) -> bool:
-        state = auth.status()
+        state = auth.status(maintain_installations=False)
         if state.get("authenticated"):
             bind_account_key(active_account_key())
             return True
@@ -1290,19 +1291,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 query: dict[str, list[str]] = parse_qs(parsed.query)
                 page = int(query.get("page", ["1"])[0])
                 page_size = int(query.get("page_size", ["30"])[0])
-                client = search if auth.status().get("authenticated") else guest_search
+                client = search if auth.status(maintain_installations=False).get("authenticated") else guest_search
                 return _json(self, client(query=query.get("q", [""])[0], risk_profile=query.get("risk_profile", [""])[0],
                     venue=query.get("venue", [""])[0],
                     min_capacity_usd=float(query["min_capacity_usd"][0]) if query.get("min_capacity_usd") else None,
                     sort=query.get("sort", ["published"])[0], locale=query.get("locale", [""])[0], page=page, page_size=page_size))
             if route is not None and route.name == "marketplace_versions":
                 from edgepilot.marketplace_client.client import guest_versions, versions
-                client = versions if auth.status().get("authenticated") else guest_versions
+                client = versions if auth.status(maintain_installations=False).get("authenticated") else guest_versions
                 return _json(self, client(route.params[0]))
             if route is not None and route.name == "marketplace_detail":
                 from edgepilot.marketplace_client.client import guest_inspect, inspect
                 query: dict[str, list[str]] = parse_qs(parsed.query)
-                client = inspect if auth.status().get("authenticated") else guest_inspect
+                client = inspect if auth.status(maintain_installations=False).get("authenticated") else guest_inspect
                 return _json(self, client(route.params[0], route.params[1], locale=query.get("locale", [""])[0]))
             if parsed.path.startswith("/api/") and not self._require_business_auth():
                 return
@@ -1471,7 +1472,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 record_behavior_event(payload)
                 return _json(self, {"accepted": True}, 202)
             if parsed.path == "/api/auth/status":
-                state = auth.status()
+                state = auth.status(maintain_installations=False)
                 reason = str(state.get("reason", ""))
                 if not state.get("authenticated") and reason in {"CREDENTIAL_STORE_ERROR", "AUTH_SERVICE_UNAVAILABLE"}:
                     return _error(self, reason, "authentication is temporarily unavailable", 503, retryable=True)
@@ -1539,7 +1540,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict) or not set(payload).issubset({"local_only", "all"}):
                     raise ValueError("logout accepts only local_only and all")
-                state = auth.status()
+                state = auth.status(maintain_installations=False)
                 with ACCOUNT_SESSION_LOCK:
                     if state.get("authenticated") and _active_account_work():
                         return _error(self, "ACTIVE_WORK", "stop active runs and jobs before signing out", 409)
@@ -1557,7 +1558,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 payload = json.loads(self.rfile.read(length) or b"{}")
                 if not isinstance(payload, dict):
                     raise TypeError("request body must be a JSON object")
-                if auth.status().get("authenticated"):
+                if auth.status(maintain_installations=False).get("authenticated"):
                     from edgepilot.marketplace_client.client import recommend
                     return _json(self, recommend(payload))
                 from edgepilot.marketplace_client.client import guest_recommend

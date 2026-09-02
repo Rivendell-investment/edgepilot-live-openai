@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Callable
 
 from nautilus_trader.analysis import MaxDrawdown
@@ -58,7 +59,7 @@ def execute_local_backtest(
         for venue in request.venues
     )
     catalog_path = request.catalog_path
-    temporary_catalog = run_dir / ".catalog"
+    temporary_catalog = _temporary_catalog_path(run_dir) if overrides_fees else run_dir / ".catalog"
     node: BacktestNode | None = None
     try:
         if overrides_fees:
@@ -127,6 +128,13 @@ def execute_local_backtest(
 
 # Fee rewrite only mutates instrument parquet. Bar (and similar) data stays shared.
 _READ_ONLY_DATA_KINDS = frozenset({"bar"})
+
+
+def _temporary_catalog_path(run_dir: Path) -> Path:
+    """Return a disposable fee overlay path without deep Windows run nesting."""
+    if os.name == "nt":
+        return Path(tempfile.mkdtemp(prefix="epc-"))
+    return run_dir / ".catalog"
 
 
 def _prepare_fee_override_catalog(
