@@ -1,6 +1,6 @@
 {
   "name": "edgepilot",
-  "version": "0.12.2",
+  "version": "0.12.3",
   "description": "Local-first trading strategy workflows powered by NautilusTrader.",
   "author": {
     "name": "Rivendell Holdings Investment Limited"

@@ -89,7 +89,7 @@ DOWNLOAD_USER_AGENT = DOWNLOAD_USER_AGENT.format(version=_plugin_version())
 #   {base}/manifest.json
 #   {base}/nautilus_trader-<ver>-<tag>.whl
 #   {base}/SHA256SUMS
-DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260831"
+DEFAULT_WHEEL_BASE_URL = "https://pub-159c6bd6a09646de8b4b871989755240.r2.dev/runtime/nautilus_trader/1.228.0/20260903"
 
 
 @dataclass(frozen=True)
