@@ -39,6 +39,34 @@ catalog search. For “open”, “start” or “launch EdgePilot”, ensure Ru
 call `edgepilot_dashboard_open`; return its loopback URL and never spawn a legacy Dashboard
 directly.
 
+## First-use onboarding
+
+Run this flow only when the user selects a setup/recommendation starter prompt or explicitly
+asks for onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` or `zh-TW`).
+Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
+must go directly to that outcome and must not force the questionnaire.
+
+1. Call `edgepilot_runtime_status`. If it is `not_installed` or `stopped`, tell the user
+   once that the product Runtime will be downloaded or started, then call
+   `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
+   On an error, report the stable error and stop; offer repair without silently running it.
+2. Only after `state=ready` and `connection_ready=true`, call
+   `edgepilot_dashboard_open` once and return its loopback URL.
+3. Ask these seven preferences one at a time, in order, using the exact values accepted by
+   the recommendation tool: `profit_style`, `holding_period`, `pain_point`,
+   `max_drawdown_pct`, `trading_mode`, `allocation_band`, `universe`. If the user already
+   supplied an answer, retain it and ask only the next missing preference.
+4. After all seven, summarize the selected values in the user's language and ask for one
+   explicit confirmation. Do not call recommendation before confirmation.
+5. Call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
+   confirmed values and the matching locale. Present exactly the three owner-ranked choices:
+   best fit, relatively steadier and more aggressive, preserving versions, evidence,
+   trade-offs and warnings.
+
+Onboarding never installs a recommended strategy without selection and never starts paper,
+demo or live execution. Authentication remains Dashboard-only and every existing live
+confirmation gate remains unchanged.
+
 For strategy work, prefer the Runtime workflow hints. The normal dependency order is
 catalog search/recommend, exact inspect, install, configuration resolve, backtest start,
 durable job status and result get. Keep the selected slug/version and all returned digests
