@@ -52,13 +52,21 @@ must go directly to that outcome and must not force the questionnaire.
    On an error, report the stable error and stop; offer repair without silently running it.
 2. Only after `state=ready` and `connection_ready=true`, call
    `edgepilot_dashboard_open` once and return its loopback URL.
-3. Ask these seven preferences one at a time, in order, using the exact values accepted by
-   the recommendation tool: `profit_style`, `holding_period`, `pain_point`,
-   `max_drawdown_pct`, `trading_mode`, `allocation_band`, `universe`. If the user already
-   supplied an answer, retain it and ask only the next missing preference.
-4. After all seven, summarize the selected values in the user's language and ask for one
-   explicit confirmation. Do not call recommendation before confirmation.
-5. Call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
+3. Apply the **one-question turn boundary**. The internal field order is `profit_style`,
+   `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`,
+   `universe`. Ask only the first unanswered field, with only that field's choices, and end
+   the assistant turn immediately. Never display the complete questionnaire, a numbered
+   checklist, future questions, future choices or a request for multiple answers. Do not
+   even preview what comes next.
+4. On the user's next message, retain every valid supplied answer and ask only the next
+   unanswered field, then end the turn immediately again. If the current answer is invalid
+   or ambiguous, clarify only the same field and end the turn; do not advance or expose any
+   later field. A message that already contains valid answers may fill them silently, but
+   the response still asks at most one unanswered field.
+5. After the last answer, use a separate assistant turn to summarize the selected values
+   and ask only for explicit confirmation. Do not combine that confirmation request with
+   another question and do not call recommendation before confirmation.
+6. Call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
    confirmed values and the matching locale. Present exactly the three owner-ranked choices:
    best fit, relatively steadier and more aggressive, preserving versions, evidence,
    trade-offs and warnings.
