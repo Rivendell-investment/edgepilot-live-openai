@@ -51,8 +51,12 @@ must go directly to that outcome and must not force the questionnaire.
    `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
    On an error, report the stable error and stop; offer repair without silently running it.
 2. Only after `state=ready` and `connection_ready=true`, call
-   `edgepilot_dashboard_open` once and return its loopback URL.
-3. Apply the **one-question turn boundary**. The internal field order is `profit_style`,
+   `edgepilot_dashboard_open` once and return its loopback URL. Then call
+   `edgepilot_onboarding_open` once with the current locale. When the host renders its MCP
+   App, stop and let the user complete all seven choices, review them and request the
+   owner-computed recommendation in that one mounted App.
+3. If the host cannot render the onboarding App, apply the **one-question turn boundary**
+   as the formal fallback. The internal field order is `profit_style`,
    `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`,
    `universe`. Ask only the first unanswered field, with only that field's choices, and end
    the assistant turn immediately. Never display the complete questionnaire, a numbered
@@ -66,7 +70,7 @@ must go directly to that outcome and must not force the questionnaire.
 5. After the last answer, use a separate assistant turn to summarize the selected values
    and ask only for explicit confirmation. Do not combine that confirmation request with
    another question and do not call recommendation before confirmation.
-6. Call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
+6. In the textual fallback, call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
    confirmed values and the matching locale. Present exactly the three owner-ranked choices:
    best fit, relatively steadier and more aggressive, preserving versions, evidence,
    trade-offs and warnings.

@@ -7,9 +7,11 @@ import { dirname, isAbsolute, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const MAX_MESSAGE_BYTES = 256 * 1024;
+const MAX_RESOURCE_BYTES = 768 * 1024;
 const MAX_CHANNEL_BYTES = 512 * 1024;
 const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
   "edgepilot_tool_search",
@@ -62,6 +64,12 @@ async function handleRequest(request) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
     if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", argumentsValue));
+    if (name === "edgepilot_onboarding_open") {
+      const locale = argumentsValue.locale;
+      if (!new Set(["en", "ko", "zh-CN", "zh-TW"]).has(locale)) throw new BridgeError("invalid_locale");
+      if (await healthyConnection() === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
+      return resultResponse(id, toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }));
+    }
     if (name === "edgepilot_dashboard_open") {
       requireEmpty(argumentsValue);
       return resultResponse(id, await executeHostOperation("dashboard.open", {}));
@@ -110,15 +118,15 @@ const LIFECYCLE_HANDLERS = {
 };
 
 async function listTools() {
-  const lifecycle = lifecycleTools();
   const connection = await healthyConnection();
+  const lifecycle = lifecycleTools(connection?.runtime_id ?? null);
   if (connection === null) return lifecycle;
   const response = await forward(connection, { jsonrpc: "2.0", id: "bridge-tools", method: "tools/list", params: {} });
   const tools = response?.result?.tools;
   return Array.isArray(tools) ? [...lifecycle, ...tools] : lifecycle;
 }
 
-function lifecycleTools() {
+function lifecycleTools(runtimeId = null) {
   const emptyInput = { type: "object", properties: {}, required: [], additionalProperties: false };
   const output = {
     type: "object",
@@ -147,6 +155,19 @@ function lifecycleTools() {
     name, title, description, inputSchema: emptyInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: !readOnly },
   }));
+  tools.push({
+    name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
+    description: "Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.",
+    inputSchema: { type: "object", properties: { locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] } }, required: ["locale"], additionalProperties: false },
+    outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" } }, required: ["schema", "profile", "locale", "questionnaire_version"], additionalProperties: false },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    ...(runtimeId === null ? {} : {
+      _meta: {
+        ui: { resourceUri: onboardingResourceUri(runtimeId) },
+        "openai/outputTemplate": onboardingResourceUri(runtimeId),
+      },
+    }),
+  });
   tools.push({
     name: "edgepilot_strategy_recommend", title: "Recommend Strategies",
     description: "Return profile-scoped strategy recommendations from the Runtime owner.",
@@ -274,7 +295,8 @@ async function forward(connection, request) {
     });
     if (response.status === 202) return null;
     const body = await response.text();
-    if (Buffer.byteLength(body, "utf8") > MAX_MESSAGE_BYTES) throw new BridgeError("response_too_large");
+    const maximum = request.method === "resources/read" ? MAX_RESOURCE_BYTES : MAX_MESSAGE_BYTES;
+    if (Buffer.byteLength(body, "utf8") > maximum) throw new BridgeError("response_too_large");
     if (!response.ok) throw new BridgeError(`host_http_${response.status}`);
     return JSON.parse(body);
   } catch (error) {
