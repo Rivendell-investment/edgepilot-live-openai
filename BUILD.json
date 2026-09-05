@@ -1,1 +1,0 @@
-{"build_id":"bdff1d1e31eb6d5e30871d3583627a1f8ee666a38118da8915f93d7466e0cff9","host_activation":{"action":"new_task_then_verify","fallback_action":"restart","host":"codex","required_after_install":true,"restart_when":["verified_old_service_remains","activation_version_mismatch"]},"host_plugin_version":"0.12.3","product_version":"0.12.3","schema_version":1,"service_protocol":1}
