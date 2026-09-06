@@ -1,14 +1,1 @@
-{
-  "mcpServers": {
-    "edgepilot-live": {
-      "type": "stdio",
-      "command": "node",
-      "args": ["./resolver.mjs", "live"],
-      "cwd": ".",
-      "enabled": true,
-      "env_vars": [],
-      "startup_timeout_sec": 180,
-      "tool_timeout_sec": 120
-    }
-  }
-}
+{"mcpServers":{"edgepilot-live":{"args":["./resolver.mjs","live"],"command":"node","cwd":".","enabled":true,"env":{"EDGEPILOT_ENV":"production"},"env_vars":[],"startup_timeout_sec":180,"tool_timeout_sec":120,"type":"stdio"}}}

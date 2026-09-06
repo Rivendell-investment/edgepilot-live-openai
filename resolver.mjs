@@ -218,14 +218,15 @@ async function runLifecycle(command) {
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = await ensureBootstrap(channelUrl, runtimeHome);
   const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion, "--expected-product-version", delivery.expected_product_version];
-  const channel = new URL(channelUrl);
-  args.push("--environment", channel.protocol === "http:" && new Set(["127.0.0.1", "localhost", "::1"]).has(channel.hostname) ? "local" : "production");
+  args.push("--environment", delivery.environment);
   if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
+  if (process.env.EDGEPILOT_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.EDGEPILOT_LIVE_STATE_ROOT);
+  if (process.env.EDGEPILOT_RESEARCH_STATE_ROOT) args.push("--research-state-root", process.env.EDGEPILOT_RESEARCH_STATE_ROOT);
   const completed = spawnSync(process.execPath, args, {
     encoding: "utf8",
     windowsHide: true,
     timeout: 300_000,
-    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_MARKETPLACE_ORIGIN", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]).has(key.toUpperCase()))),
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_MARKETPLACE_ORIGIN", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "EDGEPILOT_LIVE_STATE_ROOT", "EDGEPILOT_RESEARCH_STATE_ROOT"]).has(key.toUpperCase()))),
   });
   if (completed.error?.code === "ETIMEDOUT") throw new BridgeError("runtime_timeout");
   if (completed.status !== 0) {
@@ -240,18 +241,20 @@ async function runLifecycle(command) {
 async function runtimeStatus() {
   const runtimeId = readInstalledRuntimeId();
   const bootstrap = configuredBootstrapPath();
-  const connection = await healthyConnection();
+  const expectedProductVersion = readDelivery().expected_product_version;
+  const runtimeVersion = readInstalledRuntimeVersion(runtimeId);
+  const connection = await healthyConnection(runtimeId, expectedProductVersion);
   return {
     state: connection === null ? (runtimeId === null ? "not_installed" : "stopped") : "ready",
     profile,
     version: productVersion,
     plugin_version: pluginVersion,
-    expected_product_version: readDelivery().expected_product_version,
-    runtime_version: readInstalledRuntimeVersion(runtimeId),
+    expected_product_version: expectedProductVersion,
+    runtime_version: runtimeVersion,
     runtime_id: connection?.runtime_id ?? runtimeId,
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
-    message: null,
+    message: runtimeId !== null && runtimeVersion !== expectedProductVersion ? "runtime_version_incompatible" : null,
   };
 }
 
@@ -329,9 +332,14 @@ function readConnection() {
   return connection;
 }
 
-async function healthyConnection() {
+async function healthyConnection(
+  runtimeId = readInstalledRuntimeId(),
+  expectedProductVersion = readDelivery().expected_product_version,
+) {
   const connection = readConnection();
   if (connection === null) return null;
+  if (runtimeId === null || connection.runtime_id !== runtimeId
+      || readInstalledRuntimeVersion(runtimeId) !== expectedProductVersion) return null;
   try {
     const response = await fetch(connection.endpoint, {
       method: "POST",
@@ -340,7 +348,7 @@ async function healthyConnection() {
       redirect: "error",
       signal: AbortSignal.timeout(500),
     });
-    return response.ok ? connection : null;
+    return response.ok && readInstalledRuntimeId() === runtimeId ? connection : null;
   } catch { return null; }
 }
 
@@ -368,8 +376,9 @@ function fatal(code) {
 function readDelivery() {
   let value;
   try { value = JSON.parse(readFileSync(join(root, "delivery.json"), "utf8")); } catch { throw new BridgeError("delivery_config_missing"); }
-  if (value?.schema !== "edgepilot-delivery-v2" || value.product !== profile || typeof value.channel_url !== "string" || value.compatibility !== "exact" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,expected_product_version,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
+  if (value?.schema !== "edgepilot-delivery-v3" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "exact" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
   validateDownloadUrl(value.channel_url);
+  if ((value.environment === "local") !== (new URL(value.channel_url).hostname === "127.0.0.1")) throw new BridgeError("delivery_environment_invalid");
   if (value.marketplace_origin !== null) validateDownloadUrl(value.marketplace_origin);
   return value;
 }
