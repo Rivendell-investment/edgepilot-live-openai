@@ -50,6 +50,9 @@ must go directly to that outcome and must not force the questionnaire.
    once that the product Runtime will be downloaded or started, then call
    `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
    On an error, report the stable error and stop; offer repair without silently running it.
+   If status is `stale_session` or the message is `plugin_session_stale`, do not start,
+   update or repair; tell the user to reload the app or start a new task so Codex loads the
+   compatible plugin.
 2. Only after `state=ready` and `connection_ready=true`, call
    `edgepilot_dashboard_open` once and return its loopback URL. Then call
    `edgepilot_onboarding_open` once with the current locale. When the host renders its MCP

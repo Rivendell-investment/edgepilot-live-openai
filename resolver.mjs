@@ -11,6 +11,7 @@ const MAX_RESOURCE_BYTES = 768 * 1024;
 const MAX_CHANNEL_BYTES = 512 * 1024;
 const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
@@ -23,15 +24,17 @@ const profile = process.argv[2];
 if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
 
 const root = dirname(fileURLToPath(import.meta.url));
+const pluginVersion = readPluginVersion();
+const productVersion = pluginVersion.split("+", 1)[0];
+const delivery = readDelivery();
 const configuredRoot = process.env.EDGEPILOT_PLUGIN_STATE_ROOT;
 if (configuredRoot !== undefined && !isAbsolute(configuredRoot)) fatal("invalid_connection_root");
-const runtimeDirectory = profile === "live" ? ".edgepilot-runtime-live" : ".edgepilot-runtime-research";
+if (delivery.environment === "local" && configuredRoot === undefined) fatal("local_state_root_required");
+const runtimeDirectory = `.edgepilot-runtime-${profile}-production`;
 const pluginStateRoot = configuredRoot ?? join(homedir(), runtimeDirectory, "plugins");
 const runtimeHome = configuredRoot === undefined ? join(homedir(), runtimeDirectory) : dirname(configuredRoot);
 const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`);
 const adjacentConnection = join(root, ".edgepilot-connection.json");
-const pluginVersion = readPluginVersion();
-const productVersion = pluginVersion.split("+", 1)[0];
 
 class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -131,18 +134,21 @@ function lifecycleTools(runtimeId = null) {
   const output = {
     type: "object",
     properties: {
-      state: { enum: ["ready", "stopped", "not_installed", "error"] },
+      state: { enum: ["ready", "stopped", "not_installed", "stale_session", "error"] },
       profile: { enum: ["live", "research"] },
       plugin_version: { type: "string" },
       version: { type: "string" },
       expected_product_version: { type: "string" },
       runtime_version: { type: ["string", "null"] },
+      runtime_contract_version: { type: ["string", "null"] },
       runtime_id: { type: ["string", "null"] },
       bootstrap_installed: { type: "boolean" },
       connection_ready: { type: "boolean" },
+      repair_allowed: { type: "boolean" },
+      required_action: { type: ["string", "null"] },
       message: { type: ["string", "null"] },
     },
-    required: ["state", "profile", "version", "plugin_version", "expected_product_version", "runtime_version", "runtime_id", "bootstrap_installed", "connection_ready", "message"],
+    required: ["state", "profile", "version", "plugin_version", "expected_product_version", "runtime_version", "runtime_contract_version", "runtime_id", "bootstrap_installed", "connection_ready", "repair_allowed", "required_action", "message"],
     additionalProperties: false,
   };
   const definitions = [
@@ -214,10 +220,12 @@ async function executeHostOperation(operationId, argumentsValue) {
 }
 
 async function runLifecycle(command) {
-  const delivery = readDelivery();
+  const before = await runtimeStatus();
+  if (before.state === "stale_session") return before;
+  if (new Set(["update", "repair"]).has(command) && !before.repair_allowed) return staleSession(before);
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = await ensureBootstrap(channelUrl, runtimeHome);
-  const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion, "--expected-product-version", delivery.expected_product_version];
+  const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion];
   args.push("--environment", delivery.environment);
   if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
   if (process.env.EDGEPILOT_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.EDGEPILOT_LIVE_STATE_ROOT);
@@ -231,6 +239,7 @@ async function runLifecycle(command) {
   if (completed.error?.code === "ETIMEDOUT") throw new BridgeError("runtime_timeout");
   if (completed.status !== 0) {
     const code = /^EdgePilot bootstrap: ([a-z0-9_]+)$/mu.exec(completed.stderr ?? "")?.[1] ?? "bootstrap_failed";
+    if (new Set(["plugin_incompatible", "contract_incompatible"]).has(code)) return staleSession(await runtimeStatus());
     return { ...(await runtimeStatus()), state: "error", message: code };
   }
   const connection = await healthyConnection();
@@ -241,21 +250,33 @@ async function runLifecycle(command) {
 async function runtimeStatus() {
   const runtimeId = readInstalledRuntimeId();
   const bootstrap = configuredBootstrapPath();
-  const expectedProductVersion = readDelivery().expected_product_version;
-  const runtimeVersion = readInstalledRuntimeVersion(runtimeId);
-  const connection = await healthyConnection(runtimeId, expectedProductVersion);
-  return {
-    state: connection === null ? (runtimeId === null ? "not_installed" : "stopped") : "ready",
+  const runtime = readInstalledRuntime(runtimeId);
+  const incompatible = runtime !== null && !supportsRuntimeContract(runtime.contractVersion);
+  const newerThanPlugin = runtime !== null && compareProductVersions(runtime.releaseVersion, productVersion) > 0;
+  const connection = incompatible ? null : await healthyConnection(runtimeId, runtime);
+  const base = {
     profile,
     version: productVersion,
     plugin_version: pluginVersion,
-    expected_product_version: expectedProductVersion,
-    runtime_version: runtimeVersion,
+    expected_product_version: delivery.expected_product_version,
+    runtime_version: runtime?.releaseVersion ?? null,
+    runtime_contract_version: runtimeContractLabel(runtime?.contractVersion ?? null),
     runtime_id: connection?.runtime_id ?? runtimeId,
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
-    message: runtimeId !== null && runtimeVersion !== expectedProductVersion ? "runtime_version_incompatible" : null,
   };
+  if (incompatible) return staleSession(base);
+  return {
+    ...base,
+    state: connection === null ? (runtimeId === null ? "not_installed" : "stopped") : "ready",
+    repair_allowed: !newerThanPlugin,
+    required_action: null,
+    message: runtimeId !== null && runtime === null ? "runtime_manifest_invalid" : null,
+  };
+}
+
+function staleSession(value) {
+  return { ...value, state: "stale_session", connection_ready: false, repair_allowed: false, required_action: "reload_or_new_task", message: "plugin_session_stale" };
 }
 
 function readInstalledRuntimeId() {
@@ -265,12 +286,32 @@ function readInstalledRuntimeId() {
   } catch { return null; }
 }
 
-function readInstalledRuntimeVersion(runtimeId) {
+function readInstalledRuntime(runtimeId) {
   if (runtimeId === null || !/^sha256:[0-9a-f]{64}$/.test(runtimeId)) return null;
   try {
     const manifest = JSON.parse(readFileSync(join(runtimeHome, "runtime", "releases", runtimeId.slice(7), "RUNTIME.json"), "utf8"));
-    return typeof manifest?.payload?.release_version === "string" ? manifest.payload.release_version : null;
+    const releaseVersion = manifest?.payload?.release_version;
+    const contractVersion = manifest?.payload?.contract_version;
+    if (typeof releaseVersion !== "string" || !Number.isInteger(contractVersion?.major) || !Number.isInteger(contractVersion?.minor)) return null;
+    return { releaseVersion, contractVersion };
   } catch { return null; }
+}
+
+function supportsRuntimeContract(value) {
+  return value?.major === SUPPORTED_RUNTIME_CONTRACT.major && value.minor <= SUPPORTED_RUNTIME_CONTRACT.minor;
+}
+
+function runtimeContractLabel(value) {
+  return value === null ? null : `${value.major}.${value.minor}`;
+}
+
+function compareProductVersions(left, right) {
+  const parse = (value) => /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)/.exec(value)?.slice(1).map(Number) ?? null;
+  const a = parse(left);
+  const b = parse(right);
+  if (a === null || b === null) return 0;
+  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  return 0;
 }
 
 async function forwardHost(request) {
@@ -334,12 +375,12 @@ function readConnection() {
 
 async function healthyConnection(
   runtimeId = readInstalledRuntimeId(),
-  expectedProductVersion = readDelivery().expected_product_version,
+  runtime = readInstalledRuntime(runtimeId),
 ) {
   const connection = readConnection();
   if (connection === null) return null;
   if (runtimeId === null || connection.runtime_id !== runtimeId
-      || readInstalledRuntimeVersion(runtimeId) !== expectedProductVersion) return null;
+      || runtime === null || !supportsRuntimeContract(runtime.contractVersion)) return null;
   try {
     const response = await fetch(connection.endpoint, {
       method: "POST",
@@ -376,7 +417,7 @@ function fatal(code) {
 function readDelivery() {
   let value;
   try { value = JSON.parse(readFileSync(join(root, "delivery.json"), "utf8")); } catch { throw new BridgeError("delivery_config_missing"); }
-  if (value?.schema !== "edgepilot-delivery-v3" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "exact" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
+  if (value?.schema !== "edgepilot-delivery-v1" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "contract" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
   validateDownloadUrl(value.channel_url);
   if ((value.environment === "local") !== (new URL(value.channel_url).hostname === "127.0.0.1")) throw new BridgeError("delivery_environment_invalid");
   if (value.marketplace_origin !== null) validateDownloadUrl(value.marketplace_origin);
