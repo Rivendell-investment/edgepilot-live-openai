@@ -36,6 +36,7 @@ const runtimeHome = configuredRoot === undefined ? join(homedir(), runtimeDirect
 const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`);
 const adjacentConnection = join(root, ".edgepilot-connection.json");
 let admittedRuntimeId = null;
+let bindingFailure = null;
 
 class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -244,8 +245,13 @@ async function runLifecycle(command) {
   if (completed.error?.code === "ETIMEDOUT") throw new BridgeError("runtime_timeout");
   if (completed.status !== 0) {
     const code = /^EdgePilot bootstrap: ([a-z0-9_]+)$/mu.exec(completed.stderr ?? "")?.[1] ?? "bootstrap_failed";
+    if (new Set(["runtime_identity_incompatible", "runtime_version_incompatible"]).has(code)) {
+      bindingFailure = code;
+      return runtimeStatus();
+    }
     if (new Set(["plugin_incompatible", "contract_incompatible"]).has(code)) return staleSession(await runtimeStatus());
-    return { ...(await runtimeStatus()), state: "error", message: code };
+    return { ...(await runtimeStatus()), state: "error", connection_ready: false, message: code,
+      required_action: code.startsWith("dashboard_") ? "inspect_startup_diagnostics" : null };
   }
   const connection = await healthyConnection();
   if (connection === null) return { ...(await runtimeStatus()), state: "error", message: "host_not_ready" };
@@ -282,6 +288,8 @@ async function runtimeStatus() {
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
   };
+  if (bindingFailure !== null) return { ...base, state: "stale_session", connection_ready: false,
+    repair_allowed: false, required_action: "update_plugin_and_reload", message: bindingFailure };
   if (incompatible || newerThanPlugin || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
   if (runtime !== null && !matchesRelease(runtimeId, runtime)) {
     return { ...base, state: "update_required", connection_ready: false, repair_allowed: true, required_action: "start", message: "runtime_update_required" };
@@ -420,6 +428,7 @@ function matchesRelease(runtimeId, runtime) {
 }
 
 function toolResult(value, isError = false) {
+  isError ||= value?.state === "error" || value?.state === "stale_session";
   return {
     content: [{ type: "text", text: isError ? "EdgePilot Runtime is not ready." : "EdgePilot Runtime lifecycle completed." }],
     structuredContent: value,
