@@ -7,7 +7,7 @@ description: Route strategy discovery, configuration, backtesting, paper, exchan
 
 The Node Ready Bridge always exposes `edgepilot_runtime_status`,
 `edgepilot_runtime_start`, `edgepilot_runtime_update` and `edgepilot_runtime_repair`, even
-before Runtime exists. Call status when Host tools are unavailable, then start once. When
+before Runtime exists. The bridge automatically prepares the release-bound Runtime before first business use; never treat an older compatible Runtime as ready. Call status when Host tools are unavailable, then start once. When
 Runtime is ready, use the five Host meta tools:
 
 1. `edgepilot_connection_list`
@@ -46,7 +46,7 @@ asks for onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` o
 Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
 must go directly to that outcome and must not force the questionnaire.
 
-1. Call `edgepilot_runtime_status`. If it is `not_installed` or `stopped`, tell the user
+1. Call `edgepilot_runtime_status`. If it is `not_installed`, `stopped` or `update_required`, tell the user
    once that the product Runtime will be downloaded or started, then call
    `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
    On an error, report the stable error and stop; offer repair without silently running it.

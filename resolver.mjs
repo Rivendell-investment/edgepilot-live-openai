@@ -35,6 +35,7 @@ const pluginStateRoot = configuredRoot ?? join(homedir(), runtimeDirectory, "plu
 const runtimeHome = configuredRoot === undefined ? join(homedir(), runtimeDirectory) : dirname(configuredRoot);
 const sharedConnection = join(pluginStateRoot, "connections", `${profile}.json`);
 const adjacentConnection = join(root, ".edgepilot-connection.json");
+let admittedRuntimeId = null;
 
 class BridgeError extends Error {
   constructor(code) { super(code); this.code = code; }
@@ -66,6 +67,10 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
+    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open"].includes(name))) {
+      const ready = await ensureForUse();
+      if (ready !== null) return resultResponse(id, toolResult(ready, true));
+    }
     if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", argumentsValue));
     if (name === "edgepilot_onboarding_open") {
       const locale = argumentsValue.locale;
@@ -80,9 +85,6 @@ async function handleRequest(request) {
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
       const response = resultResponse(id, toolResult(result));
-      if (name !== "edgepilot_runtime_status" && result.state === "ready") {
-        setTimeout(() => writeResponse({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }), 0);
-      }
       return response;
     }
     if (!HOST_TOOL_NAMES.has(name)) return errorResponse(id, -32601, "tool_not_found");
@@ -134,7 +136,7 @@ function lifecycleTools(runtimeId = null) {
   const output = {
     type: "object",
     properties: {
-      state: { enum: ["ready", "stopped", "not_installed", "stale_session", "error"] },
+      state: { enum: ["ready", "stopped", "not_installed", "update_required", "stale_session", "error"] },
       profile: { enum: ["live", "research"] },
       plugin_version: { type: "string" },
       version: { type: "string" },
@@ -226,6 +228,8 @@ async function runLifecycle(command) {
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = await ensureBootstrap(channelUrl, runtimeHome);
   const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion];
+  args.push("--expected-product-version", productVersion);
+  for (const runtimeId of delivery.expected_runtime_ids) args.push("--expected-runtime-id", runtimeId);
   args.push("--environment", delivery.environment);
   if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
   if (process.env.EDGEPILOT_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.EDGEPILOT_LIVE_STATE_ROOT);
@@ -233,7 +237,8 @@ async function runLifecycle(command) {
   const completed = spawnSync(process.execPath, args, {
     encoding: "utf8",
     windowsHide: true,
-    timeout: 300_000,
+    // Keep below the 21-minute MCP tool budget so the final status can return.
+    timeout: 20 * 60_000,
     env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_MARKETPLACE_ORIGIN", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "EDGEPILOT_LIVE_STATE_ROOT", "EDGEPILOT_RESEARCH_STATE_ROOT"]).has(key.toUpperCase()))),
   });
   if (completed.error?.code === "ETIMEDOUT") throw new BridgeError("runtime_timeout");
@@ -244,7 +249,19 @@ async function runLifecycle(command) {
   }
   const connection = await healthyConnection();
   if (connection === null) return { ...(await runtimeStatus()), state: "error", message: "host_not_ready" };
-  return { ...(await runtimeStatus()), state: "ready", connection_ready: true, message: null };
+  admittedRuntimeId = connection.runtime_id;
+  const result = await runtimeStatus();
+  if (result.state !== "ready") return { ...result, message: result.message ?? "host_not_ready" };
+  setTimeout(() => writeResponse({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }), 0);
+  return result;
+}
+
+async function ensureForUse() {
+  const status = await runtimeStatus();
+  if (status.state === "stale_session") return status;
+  if (status.state === "ready") { admittedRuntimeId = status.runtime_id; return null; }
+  const result = await runLifecycle("ensure-start");
+  return result.state === "ready" ? null : result;
 }
 
 async function runtimeStatus() {
@@ -265,7 +282,10 @@ async function runtimeStatus() {
     bootstrap_installed: existsSync(bootstrap),
     connection_ready: connection !== null,
   };
-  if (incompatible) return staleSession(base);
+  if (incompatible || newerThanPlugin || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
+  if (runtime !== null && !matchesRelease(runtimeId, runtime)) {
+    return { ...base, state: "update_required", connection_ready: false, repair_allowed: true, required_action: "start", message: "runtime_update_required" };
+  }
   return {
     ...base,
     state: connection === null ? (runtimeId === null ? "not_installed" : "stopped") : "ready",
@@ -332,6 +352,7 @@ async function forward(connection, request) {
         "Authorization": ["Bearer", connection.bearer_token].join(" "),
         "Content-Type": "application/json",
         "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        "X-EdgePilot-Runtime-ID": connection.runtime_id,
       },
       body: JSON.stringify(request),
       signal: controller.signal,
@@ -380,17 +401,22 @@ async function healthyConnection(
   const connection = readConnection();
   if (connection === null) return null;
   if (runtimeId === null || connection.runtime_id !== runtimeId
-      || runtime === null || !supportsRuntimeContract(runtime.contractVersion)) return null;
+      || runtime === null || !supportsRuntimeContract(runtime.contractVersion) || !matchesRelease(runtimeId, runtime)) return null;
   try {
     const response = await fetch(connection.endpoint, {
       method: "POST",
-      headers: { "Authorization": ["Bearer", connection.bearer_token].join(" "), "Content-Type": "application/json", "MCP-Protocol-Version": MCP_PROTOCOL_VERSION },
-      body: JSON.stringify({ jsonrpc: "2.0", id: "bridge-probe", method: "ping", params: {} }),
+      headers: { "Authorization": ["Bearer", connection.bearer_token].join(" "), "Content-Type": "application/json", "MCP-Protocol-Version": MCP_PROTOCOL_VERSION, "X-EdgePilot-Runtime-ID": runtimeId },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "bridge-probe", method: "initialize", params: { protocolVersion: MCP_PROTOCOL_VERSION } }),
       redirect: "error",
       signal: AbortSignal.timeout(500),
     });
-    return response.ok && readInstalledRuntimeId() === runtimeId ? connection : null;
+    const body = response.ok ? await response.json() : null;
+    return body?.result?.serverInfo?.runtimeId === runtimeId && body.result.serverInfo.runtimeReady !== false && readInstalledRuntimeId() === runtimeId ? connection : null;
   } catch { return null; }
+}
+
+function matchesRelease(runtimeId, runtime) {
+  return runtime.releaseVersion === productVersion && (delivery.expected_runtime_ids.length === 0 || delivery.expected_runtime_ids.includes(runtimeId));
 }
 
 function toolResult(value, isError = false) {
@@ -417,7 +443,9 @@ function fatal(code) {
 function readDelivery() {
   let value;
   try { value = JSON.parse(readFileSync(join(root, "delivery.json"), "utf8")); } catch { throw new BridgeError("delivery_config_missing"); }
-  if (value?.schema !== "edgepilot-delivery-v1" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "contract" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
+  if (value?.schema !== "edgepilot-delivery-v1" || value.product !== profile || !new Set(["local", "production"]).has(value.environment) || typeof value.channel_url !== "string" || value.compatibility !== "release" || value.expected_product_version !== productVersion || Object.keys(value).sort().join(",") !== "channel_url,compatibility,environment,expected_product_version,expected_runtime_ids,marketplace_origin,product,schema" || (profile === "live" ? typeof value.marketplace_origin !== "string" : value.marketplace_origin !== null)) throw new BridgeError("delivery_config_invalid");
+  if (!Array.isArray(value.expected_runtime_ids) || value.expected_runtime_ids.some((id) => typeof id !== "string" || !/^sha256:[0-9a-f]{64}$/.test(id)) || new Set(value.expected_runtime_ids).size !== value.expected_runtime_ids.length) throw new BridgeError("delivery_config_invalid");
+  if (value.expected_runtime_ids.length === 0 && productVersion !== "0.0.0" && !existsSync(join(root, ".edgepilot-connection.json"))) throw new BridgeError("runtime_binding_missing");
   validateDownloadUrl(value.channel_url);
   if ((value.environment === "local") !== (new URL(value.channel_url).hostname === "127.0.0.1")) throw new BridgeError("delivery_environment_invalid");
   if (value.marketplace_origin !== null) validateDownloadUrl(value.marketplace_origin);
