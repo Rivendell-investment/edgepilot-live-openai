@@ -81,6 +81,10 @@ must go directly to that outcome and must not force the questionnaire.
    `edgepilot_onboarding_open` once with the current locale. When the host renders its MCP
    App, stop and let the user complete all seven choices, review them and request the
    owner-computed recommendation in that one mounted App.
+   A successful tool response only means the Runtime is ready; it does not prove that the
+   App rendered. If no App is visible, continue directly to step 3 in this same turn.
+   Never end with only "installed", "ready" or "please open a new task" after successful
+   first installation, and never repeat installation to recover missing presentation.
 3. If the host cannot render the onboarding App, apply the **one-question turn boundary**
    as the formal fallback. The internal field order is `profit_style`,
    `holding_period`, `pain_point`, `max_drawdown_pct`, `trading_mode`, `allocation_band`,

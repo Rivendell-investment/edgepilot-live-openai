@@ -76,7 +76,10 @@ async function handleRequest(request) {
       const locale = argumentsValue.locale;
       if (!new Set(["en", "ko", "zh-CN", "zh-TW"]).has(locale)) throw new BridgeError("invalid_locale");
       if (await healthyConnection() === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
-      return resultResponse(id, toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }));
+      return resultResponse(id, {
+        ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }),
+        content: [{ type: "text", text: "Onboarding is ready. If the App is visible, let the user complete it. If it is not visible, ask only the first unanswered onboarding question in the user's language and end the turn; do not treat this response as proof that the App rendered." }],
+      });
     }
     if (name === "edgepilot_dashboard_open") {
       requireEmpty(argumentsValue);
@@ -142,11 +145,25 @@ const LIFECYCLE_HANDLERS = {
 
 async function listTools() {
   const connection = await healthyConnection();
-  const lifecycle = lifecycleTools(connection?.runtime_id ?? null);
+  const lifecycle = lifecycleTools(connection?.runtime_id ?? coldOnboardingRuntimeId());
   if (connection === null) return lifecycle;
   const response = await forward(connection, { jsonrpc: "2.0", id: "bridge-tools", method: "tools/list", params: {} });
   const tools = response?.result?.tools;
   return Array.isArray(tools) ? [...lifecycle, ...tools] : lifecycle;
+}
+
+// Pin discovery to release metadata before installation, without starting the Runtime.
+// Never choose an arbitrary platform from a multi-Runtime release binding.
+function coldOnboardingRuntimeId() {
+  if (bindingFailure !== null) return null;
+  const installedId = readInstalledRuntimeId();
+  if (installedId !== null) {
+    const runtime = readInstalledRuntime(installedId);
+    return runtime !== null && supportsRuntimeContract(runtime.contractVersion)
+      && matchesRelease(installedId, runtime)
+      && (admittedRuntimeId === null || admittedRuntimeId === installedId) ? installedId : null;
+  }
+  return delivery.expected_runtime_ids.length === 1 ? delivery.expected_runtime_ids[0] : null;
 }
 
 function lifecycleTools(runtimeId = null) {
@@ -287,7 +304,10 @@ async function runLifecycle(command, managementArguments = {}) {
   admittedRuntimeId = connection.runtime_id;
   const result = await runtimeStatus();
   if (result.state !== "ready") return { ...result, message: result.message ?? "host_not_ready" };
-  setTimeout(() => writeResponse({ jsonrpc: "2.0", method: "notifications/tools/list_changed" }), 0);
+  setTimeout(() => {
+    writeResponse({ jsonrpc: "2.0", method: "notifications/tools/list_changed" });
+    writeResponse({ jsonrpc: "2.0", method: "notifications/resources/list_changed" });
+  }, 0);
   return result;
 }
 
