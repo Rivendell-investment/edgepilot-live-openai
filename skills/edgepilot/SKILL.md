@@ -39,6 +39,29 @@ catalog search. For “open”, “start” or “launch EdgePilot”, ensure Ru
 call `edgepilot_dashboard_open`; return its loopback URL and never spawn a legacy Dashboard
 directly.
 
+## Upgrade recovery
+
+Runtime upgrades are forward-only. When `runtime_pinned` occurs, call
+`edgepilot_runtime_blockers` to inspect the exact old jobs; this does not require a ready
+Dashboard or matching business Runtime. A stored `running` value alone is not proof that a
+process is alive. Report owner-computed evidence. Never edit/delete task files or an old
+Runtime to clear a pin, and never recommend repeated repair for the same active-job blocker.
+
+Only when the user explicitly asks to stop the identified job, call
+`edgepilot_runtime_stop_job` with its exact `job_ref`, `account_ref` and one stable idempotency
+key. Continue from returned state; `unknown` is not successful cancellation or permission to
+restart trading. Once blockers clear, resume the bound Runtime start/update. A pending
+operation survives chat disconnect; inspect status instead of starting a duplicate. This
+management stop does not promise order cancellation or position closure.
+
+When `live_reconciliation_required` is returned, inspect Runtime blockers. For a confirmed exited job with an unknown outcome, the user may explicitly confirm that
+they have reviewed outstanding orders and positions. Only then call
+`edgepilot_runtime_review_job` with the exact job/account/evidence digest from blocker
+inspection and `acknowledgement=orders_and_positions_reviewed`. This records the user's
+review; it does not assert exchange verification or convert history to success. Never infer
+this confirmation from an upgrade, delete, repair or generic yes request. New trading still
+requires all normal prepare/start confirmations and execution checks.
+
 ## First-use onboarding
 
 Run this flow only when the user selects a setup/recommendation starter prompt or explicitly
@@ -49,7 +72,7 @@ must go directly to that outcome and must not force the questionnaire.
 1. Call `edgepilot_runtime_status`. If it is `not_installed`, `stopped` or `update_required`, tell the user
    once that the product Runtime will be downloaded or started, then call
    `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
-   On an error, report the stable error and stop; offer repair without silently running it.
+   On an error, report the stable error. For `runtime_pinned`, follow Upgrade recovery; for other errors, offer the indicated recovery without looping.
    If status is `stale_session` or the message is `plugin_session_stale`, do not start,
    update or repair; tell the user to reload the app or start a new task so Codex loads the
    compatible plugin.

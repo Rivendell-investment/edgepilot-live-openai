@@ -1,14 +1,13 @@
-import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { closeSync, openSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_RESOURCE_BYTES = 768 * 1024;
-const MAX_CHANNEL_BYTES = 512 * 1024;
 const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
@@ -105,6 +104,24 @@ async function handleRequest(request) {
 }
 
 const LIFECYCLE_HANDLERS = {
+  edgepilot_runtime_blockers: async (argumentsValue) => {
+    requireEmpty(argumentsValue);
+    if (profile !== "live") throw new BridgeError("tool_not_found");
+    return runLifecycle("runtime-blockers");
+  },
+  edgepilot_runtime_review_job: async (value) => {
+    if (profile !== "live" || Object.keys(value).sort().join(",") !== "account_ref,acknowledgement,evidence_digest,job_ref"
+        || !/^[0-9a-f]{64}$/.test(value.account_ref) || !/^job_[A-Za-z0-9_-]{20,128}$/.test(value.job_ref)
+        || !/^sha256:[0-9a-f]{64}$/.test(value.evidence_digest) || value.acknowledgement !== "orders_and_positions_reviewed") throw new BridgeError("invalid_tool_call");
+    return runLifecycle("review-job", { "job-ref": value.job_ref, "account-ref": value.account_ref,
+      "evidence-digest": value.evidence_digest, acknowledgement: value.acknowledgement });
+  },
+  edgepilot_runtime_stop_job: async (value) => {
+    if (profile !== "live" || Object.keys(value).sort().join(",") !== "account_ref,idempotency_key,job_ref"
+        || !/^[0-9a-f]{64}$/.test(value.account_ref) || !/^job_[A-Za-z0-9_-]{20,128}$/.test(value.job_ref)
+        || typeof value.idempotency_key !== "string" || !/^[\x20-\x7e]{16,128}$/.test(value.idempotency_key)) throw new BridgeError("invalid_tool_call");
+    return runLifecycle("stop-job", { "job-ref": value.job_ref, "account-ref": value.account_ref, "idempotency-key": value.idempotency_key });
+  },
   edgepilot_runtime_status: async (argumentsValue) => {
     requireEmpty(argumentsValue);
     return await runtimeStatus();
@@ -146,6 +163,7 @@ function lifecycleTools(runtimeId = null) {
       runtime_contract_version: { type: ["string", "null"] },
       runtime_id: { type: ["string", "null"] },
       bootstrap_installed: { type: "boolean" },
+      lifecycle: { type: ["object", "null"] },
       connection_ready: { type: "boolean" },
       repair_allowed: { type: "boolean" },
       required_action: { type: ["string", "null"] },
@@ -164,6 +182,18 @@ function lifecycleTools(runtimeId = null) {
     name, title, description, inputSchema: emptyInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: !readOnly },
   }));
+  if (profile === "live") {
+    tools.push({ name: "edgepilot_runtime_blockers", title: "Inspect Runtime Blockers", description: "Inspect old Live jobs even when plugin and Runtime versions differ. May prepare the fixed Runtime maintenance executable; never starts trading.", inputSchema: emptyInput,
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } });
+    tools.push({ name: "edgepilot_runtime_review_job", title: "Record Operator Review", description: "Only after the user explicitly confirms reviewing the identified stopped job's outstanding orders and positions, record that review against its current evidence digest. Keeps the unknown outcome; never starts trading or changes exchange state.",
+      inputSchema: { type: "object", additionalProperties: false, required: ["job_ref", "account_ref", "evidence_digest", "acknowledgement"], properties: {
+        job_ref: { type: "string", pattern: "^job_[A-Za-z0-9_-]{20,128}$" }, account_ref: { type: "string", pattern: "^[0-9a-f]{64}$" }, evidence_digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }, acknowledgement: { const: "orders_and_positions_reviewed" } } },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } });
+    tools.push({ name: "edgepilot_runtime_stop_job", title: "Stop Runtime Job", description: "Stop one explicitly selected Live job using its exact account and job identity. Requires the user's request to stop that job; does not imply order cancellation or position closure.",
+      inputSchema: { type: "object", additionalProperties: false, required: ["job_ref", "account_ref", "idempotency_key"], properties: {
+        job_ref: { type: "string", pattern: "^job_[A-Za-z0-9_-]{20,128}$" }, account_ref: { type: "string", pattern: "^[0-9a-f]{64}$" }, idempotency_key: { type: "string", minLength: 16, maxLength: 128 } } },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } });
+  }
   tools.push({
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
     description: "Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.",
@@ -222,12 +252,13 @@ async function executeHostOperation(operationId, argumentsValue) {
   return execute.result;
 }
 
-async function runLifecycle(command) {
+async function runLifecycle(command, managementArguments = {}) {
+  const management = ["runtime-blockers", "stop-job", "review-job"].includes(command);
   const before = await runtimeStatus();
-  if (before.state === "stale_session") return before;
+  if (!management && before.state === "stale_session") return before;
   if (new Set(["update", "repair"]).has(command) && !before.repair_allowed) return staleSession(before);
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
-  const bootstrap = await ensureBootstrap(channelUrl, runtimeHome);
+  const bootstrap = validateBootstrapFile(configuredBootstrapPath());
   const args = [bootstrap, command, "--runtime-home", runtimeHome, "--channel-url", channelUrl, "--product", profile, "--plugin-version", pluginVersion];
   args.push("--expected-product-version", productVersion);
   for (const runtimeId of delivery.expected_runtime_ids) args.push("--expected-runtime-id", runtimeId);
@@ -235,13 +266,8 @@ async function runLifecycle(command) {
   if (delivery.marketplace_origin !== null) args.push("--marketplace-origin", delivery.marketplace_origin);
   if (process.env.EDGEPILOT_LIVE_STATE_ROOT) args.push("--live-state-root", process.env.EDGEPILOT_LIVE_STATE_ROOT);
   if (process.env.EDGEPILOT_RESEARCH_STATE_ROOT) args.push("--research-state-root", process.env.EDGEPILOT_RESEARCH_STATE_ROOT);
-  const completed = spawnSync(process.execPath, args, {
-    encoding: "utf8",
-    windowsHide: true,
-    // Keep below the 21-minute MCP tool budget so the final status can return.
-    timeout: 20 * 60_000,
-    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_MARKETPLACE_ORIGIN", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "EDGEPILOT_LIVE_STATE_ROOT", "EDGEPILOT_RESEARCH_STATE_ROOT"]).has(key.toUpperCase()))),
-  });
+  for (const [key, value] of Object.entries(managementArguments)) args.push(`--${key}`, value);
+  const completed = await runLifecycleProcess(args);
   if (completed.error?.code === "ETIMEDOUT") throw new BridgeError("runtime_timeout");
   if (completed.status !== 0) {
     const code = /^EdgePilot bootstrap: ([a-z0-9_]+)$/mu.exec(completed.stderr ?? "")?.[1] ?? "bootstrap_failed";
@@ -251,7 +277,10 @@ async function runLifecycle(command) {
     }
     if (new Set(["plugin_incompatible", "contract_incompatible"]).has(code)) return staleSession(await runtimeStatus());
     return { ...(await runtimeStatus()), state: "error", connection_ready: false, message: code,
-      required_action: code.startsWith("dashboard_") ? "inspect_startup_diagnostics" : null };
+      required_action: code === "runtime_pinned" ? "inspect_runtime_blockers" : code.startsWith("dashboard_") ? "inspect_startup_diagnostics" : "inspect_runtime_status" };
+  }
+  if (management) {
+    try { return JSON.parse(completed.stdout); } catch { throw new BridgeError("maintenance_response_invalid"); }
   }
   const connection = await healthyConnection();
   if (connection === null) return { ...(await runtimeStatus()), state: "error", message: "host_not_ready" };
@@ -270,6 +299,17 @@ async function ensureForUse() {
   return result.state === "ready" ? null : result;
 }
 
+function lifecycleSnapshot() {
+  const path = join(runtimeHome, "runtime", "lifecycle.json");
+  if (!existsSync(path)) return null;
+  try {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 65536) return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending"].map(key => [key, value[key] ?? null]));
+  } catch { return { phase: "repair_required", last_error: "lifecycle_state_invalid" }; }
+}
+
 async function runtimeStatus() {
   const runtimeId = readInstalledRuntimeId();
   const bootstrap = configuredBootstrapPath();
@@ -279,6 +319,7 @@ async function runtimeStatus() {
   const connection = incompatible ? null : await healthyConnection(runtimeId, runtime);
   const base = {
     profile,
+    lifecycle: lifecycleSnapshot(),
     version: productVersion,
     plugin_version: pluginVersion,
     expected_product_version: delivery.expected_product_version,
@@ -474,37 +515,32 @@ function configuredBootstrapPath() {
     if (!isAbsolute(configured)) throw new BridgeError("bootstrap_path_invalid");
     return configured;
   }
-  return join(runtimeHome, "bootstrap", "bootstrap.mjs");
+  return join(root, "bootstrap.mjs");
 }
 
-async function ensureBootstrap(channelUrl, home) {
-  const configured = process.env.EDGEPILOT_BOOTSTRAP_PATH;
-  if (configured !== undefined) return validateBootstrapFile(configuredBootstrapPath());
-  const directory = join(home, "bootstrap");
-  const bootstrap = join(directory, "bootstrap.mjs");
-  let channel;
-  try { channel = await downloadJson(channelUrl, MAX_CHANNEL_BYTES); } catch {
-    if (existsSync(bootstrap)) return validateBootstrapFile(bootstrap);
-    throw new BridgeError("bootstrap_download_failed");
-  }
-  const info = channel?.bootstrap;
-  if (channel?.schema !== "edgepilot-channel-v1" || channel.product !== profile || typeof info !== "object" || info === null
-      || typeof info.url !== "string" || !Number.isSafeInteger(info.size) || info.size < 1 || info.size > MAX_BOOTSTRAP_BYTES
-      || typeof info.sha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(info.sha256)) throw new BridgeError("channel_invalid");
-  validateDownloadUrl(info.url);
-  if (existsSync(bootstrap) && digest(readFileSync(bootstrap)) === info.sha256) return validateBootstrapFile(bootstrap);
-  const bytes = await downloadBytes(info.url, info.size);
-  if (bytes.length !== info.size || digest(bytes) !== info.sha256) throw new BridgeError("bootstrap_digest_mismatch");
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const temporary = join(directory, `.bootstrap.${randomUUID()}.tmp.mjs`);
+async function runLifecycleProcess(args) {
+  const logs = join(runtimeHome, "runtime", "logs");
+  mkdirSync(logs, { recursive: true, mode: 0o700 });
+  const id = randomUUID();
+  const output = join(logs, `operation-${id}.out`), errors = join(logs, `operation-${id}.err`);
+  const out = openSync(output, "wx", 0o600), err = openSync(errors, "wx", 0o600);
+  let child;
   try {
-    writeFileSync(temporary, bytes, { flag: "wx", mode: 0o700 });
-    const checked = spawnSync(process.execPath, ["--check", temporary], { encoding: "utf8", windowsHide: true, timeout: 10_000 });
-    if (checked.status !== 0) throw new BridgeError("bootstrap_syntax_invalid");
-    renameSync(temporary, bootstrap);
-    if (process.platform !== "win32") chmodSync(bootstrap, 0o700);
-  } finally { rmSync(temporary, { force: true }); }
-  return validateBootstrapFile(bootstrap);
+    child = spawn(process.execPath, args, {
+      detached: true, stdio: ["ignore", out, err], windowsHide: true,
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]).has(key.toUpperCase()))),
+    });
+  } finally { closeSync(out); closeSync(err); }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { child.unref(); reject(new BridgeError("runtime_operation_pending")); }, 20 * 60_000);
+    child.once("error", () => { clearTimeout(timer); reject(new BridgeError("runtime_start_failed")); });
+    child.once("close", status => {
+      clearTimeout(timer);
+      const bounded = path => lstatSync(path).size <= 1024 * 1024 ? readFileSync(path, "utf8") : "";
+      resolve({ status, stdout: bounded(output), stderr: bounded(errors) });
+      rmSync(output, { force: true }); rmSync(errors, { force: true });
+    });
+  });
 }
 
 function validateBootstrapFile(path) {
@@ -514,28 +550,10 @@ function validateBootstrapFile(path) {
   return path;
 }
 
-async function downloadJson(url, maximumBytes) {
-  const bytes = await downloadBytes(url, maximumBytes);
-  try { return JSON.parse(bytes.toString("utf8")); } catch { throw new BridgeError("channel_invalid"); }
-}
-
-async function downloadBytes(url, maximumBytes) {
-  validateDownloadUrl(url);
-  const response = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new BridgeError("download_failed");
-  const bytes = Buffer.from(await response.arrayBuffer());
-  if (bytes.length < 1 || bytes.length > maximumBytes) throw new BridgeError("download_size_invalid");
-  return bytes;
-}
-
 function validateDownloadUrl(value) {
   let parsed;
   try { parsed = new URL(value); } catch { throw new BridgeError("download_url_invalid"); }
   if (!["http:", "https:"].includes(parsed.protocol) || parsed.username || parsed.password) throw new BridgeError("download_url_invalid");
-}
-
-function digest(value) {
-  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 const input = createInterface({ input: process.stdin, crlfDelay: Infinity, terminal: false });
