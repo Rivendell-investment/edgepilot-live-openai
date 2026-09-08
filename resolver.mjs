@@ -78,7 +78,7 @@ async function handleRequest(request) {
       if (await healthyConnection() === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
       return resultResponse(id, {
         ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }),
-        content: [{ type: "text", text: "Onboarding is ready. If the App is visible, let the user complete it. If it is not visible, ask only the first unanswered onboarding question in the user's language and end the turn; do not treat this response as proof that the App rendered." }],
+        content: [{ type: "text", text: "Onboarding App requested. Let the user continue in the interactive card and end this turn without repeating questionnaire choices or opening another question tool. Rendering visibility is unknown to this tool; do not claim that the App failed to appear. Use text onboarding only if the host explicitly reports App rendering unsupported/failed, or the user reports the card unusable or explicitly requests text onboarding." }],
       });
     }
     if (name === "edgepilot_dashboard_open") {
@@ -159,9 +159,13 @@ function coldOnboardingRuntimeId() {
   const installedId = readInstalledRuntimeId();
   if (installedId !== null) {
     const runtime = readInstalledRuntime(installedId);
-    return runtime !== null && supportsRuntimeContract(runtime.contractVersion)
-      && matchesRelease(installedId, runtime)
-      && (admittedRuntimeId === null || admittedRuntimeId === installedId) ? installedId : null;
+    if (runtime === null || !supportsRuntimeContract(runtime.contractVersion)
+        || compareProductVersions(runtime.releaseVersion, productVersion) > 0
+        || (admittedRuntimeId !== null && admittedRuntimeId !== installedId)) return null;
+    // An older installation still needs the target URI in the client's first tool list.
+    // This advertises presentation only; resource reads retain healthyConnection admission.
+    if (delivery.expected_runtime_ids.length === 1) return delivery.expected_runtime_ids[0];
+    return matchesRelease(installedId, runtime) ? installedId : null;
   }
   return delivery.expected_runtime_ids.length === 1 ? delivery.expected_runtime_ids[0] : null;
 }
