@@ -10,7 +10,6 @@ import {
   createWriteStream,
   existsSync,
   fstatSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -31,8 +30,16 @@ import { spawn, spawnSync } from "node:child_process";
 import { Transform, Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw } from "node:zlib";
-const { LifecycleTransaction, readLifecycleState, runLiveMaintenance, writeLifecycleState } = (() => {
+import * as __edgepilot_lifecycle_dependency_0 from "node:fs";
+import * as __edgepilot_lifecycle_dependency_1 from "node:path";
+import * as __edgepilot_lifecycle_dependency_2 from "node:crypto";
+import * as __edgepilot_lifecycle_dependency_3 from "node:child_process";
+const { LifecycleTransaction, readLifecycleState, runLiveMaintenance } = (() => {
 // Durable lifecycle journal and bounded bundled-Python maintenance transport.
+const { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } = __edgepilot_lifecycle_dependency_0;
+const { dirname, join } = __edgepilot_lifecycle_dependency_1;
+const { randomUUID } = __edgepilot_lifecycle_dependency_2;
+const { spawn } = __edgepilot_lifecycle_dependency_3;
 
 function lifecycleError(code) { return Object.assign(new Error(code), { code }); }
 
@@ -118,10 +125,14 @@ async function runLiveMaintenance({ python, liveStateRoot, runtimeId, operation 
     });
   });
 }
-return { LifecycleTransaction, readLifecycleState, runLiveMaintenance, writeLifecycleState };
+return { LifecycleTransaction, readLifecycleState, runLiveMaintenance };
 })();
+import * as __edgepilot_processes_dependency_0 from "node:child_process";
+import * as __edgepilot_processes_dependency_1 from "node:path";
 const { retireRuntimeProcesses } = (() => {
 // Retire only service processes executing the verified old Runtime interpreter.
+const { spawnSync } = __edgepilot_processes_dependency_0;
+const { resolve, join } = __edgepilot_processes_dependency_1;
 
 function processFailure(code) { return Object.assign(new Error(code), { code }); }
 
@@ -210,11 +221,15 @@ const MAX_FILES = 200_000;
 const METADATA_DOWNLOAD_TIMEOUT_MS = 120_000;
 const RUNTIME_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.2.14";
+const BOOTSTRAP_PRODUCT_VERSION = "1.2.15";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
 const LOCAL_MARKETPLACE_ORIGIN = "http://127.0.0.1:18080";
+// Finder/Explorer may materialize these files while a Runtime state directory
+// is being inspected. They are not Runtime releases and must not make a local
+// build fail; unknown entries remain fail-closed below.
+const GENERATED_FILESYSTEM_METADATA = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
 const ENVIRONMENT_PORTS = Object.freeze({
   local: Object.freeze({ live: 18787, research: 18686 }),
   production: Object.freeze({ live: 8787, research: 8686 }),
@@ -386,7 +401,8 @@ export function validateManifest(value, trustedKeys, { enforcePlatform = true } 
     ["implementation", "version", "abi", "executable", "isolated", "user_site_enabled"],
     "python_identity_invalid",
   );
-  if (python.implementation !== "cpython" || !/^3\.12\.\d+$/u.test(python.version) || python.abi !== "cp312" || python.isolated !== true || python.user_site_enabled !== false) {
+  const pythonVersion = typeof python.version === "string" ? /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.exec(python.version) : null;
+  if (python.implementation !== "cpython" || pythonVersion === null || compareNumericVersion(python.version, "3.12.0") < 0 || python.abi !== `cp${pythonVersion[1]}${pythonVersion[2]}` || python.isolated !== true || python.user_site_enabled !== false) {
     fail("python_identity_invalid", "Runtime Python identity is unsupported");
   }
   if (!Array.isArray(payload.files) || payload.files.length < 1 || payload.files.length > MAX_FILES) {
@@ -611,7 +627,7 @@ function parseZipEntries(archivePath, expected) {
       const externalAttributes = central.readUInt32LE(cursor + 38);
       let localOffset = central.readUInt32LE(cursor + 42);
       const end = cursor + 46 + nameLength + extraLength + entryCommentLength;
-      if (end > central.length || flags & 1 || ![0, 8].includes(method)) fail("archive_invalid", "Runtime ZIP entry is encrypted, truncated or unsupported");
+      if (end > central.length || (flags & 1) !== 0 || ![0, 8].includes(method)) fail("archive_invalid", "Runtime ZIP entry is encrypted, truncated or unsupported");
       const name = central.subarray(cursor + 46, cursor + 46 + nameLength).toString("utf8");
       const extra = central.subarray(cursor + 46 + nameLength, cursor + 46 + nameLength + extraLength);
       const zip64 = parseZip64(extra, uncompressedSize === 0xffffffff, compressedSize === 0xffffffff, localOffset === 0xffffffff);
@@ -783,8 +799,8 @@ async function withStateLock(stateRoot, name, action, timeoutMs = 180_000) {
       if (owner === null) {
         try { if (Date.now() - lstatSync(lock).mtimeMs < 5_000) { await new Promise((accept) => setTimeout(accept, 50)); continue; } } catch { continue; }
       }
-      const birth = Number.isSafeInteger(owner?.pid) ? processBirth(owner.pid) : null;
-      if (!Number.isSafeInteger(owner?.pid) || !processExists(owner.pid)
+      const birth = owner !== null && Number.isSafeInteger(owner.pid) ? processBirth(owner.pid) : null;
+      if (owner === null || !Number.isSafeInteger(owner.pid) || !processExists(owner.pid)
           || (typeof owner.birth === "string" && birth !== null && owner.birth !== birth)) {
         const stale = `${lock}.stale-${randomUUID()}`;
         try { renameSync(lock, stale); rmSync(stale, { recursive: true, force: true }); } catch { /* another waiter recovered it */ }
@@ -855,12 +871,23 @@ function livePinnedRuntimeIds(liveStateRoot) {
   return result;
 }
 
+function removeGeneratedFilesystemMetadata(root, errorCode) {
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    if (!GENERATED_FILESYSTEM_METADATA.has(entry.name)) continue;
+    const path = join(root, entry.name);
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) fail(errorCode, "Generated filesystem metadata is invalid");
+    rmSync(path, { force: true });
+  }
+}
+
 export async function garbageCollect({ stateRoot, liveStateRoot, pluginStateRoot = null, maximumReleases = 1, maximumBytes = 5 * 1024 ** 3, pinnedRuntimeIds = null }) {
   if (!Number.isSafeInteger(maximumReleases) || maximumReleases < 1 || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1) fail("gc_policy_invalid", "Runtime GC policy is invalid");
   return withInstallLock(stateRoot, async () => {
     const releases = join(stateRoot, "releases");
     if (!existsSync(releases)) return { removed: [], retained: [], bytes: 0 };
     await recoverRepairBackups(releases);
+    removeGeneratedFilesystemMetadata(releases, "runtime_release_root_invalid");
     const pointer = readPointer(join(stateRoot, "current.json"));
     const protectedIds = new Set([pointer.current_runtime_id, ...(pinnedRuntimeIds ?? livePinnedRuntimeIds(liveStateRoot))].filter(Boolean));
     const releaseEntries = readdirSync(releases, { withFileTypes: true });
@@ -903,6 +930,7 @@ function garbageCollectPluginStages(pluginStateRoot) {
   const stages = join(pluginStateRoot, "stages");
   if (!existsSync(stages)) return [];
   if (lstatSync(stages).isSymbolicLink() || !lstatSync(stages).isDirectory()) fail("plugin_state_invalid", "plugin stages root is invalid");
+  removeGeneratedFilesystemMetadata(stages, "plugin_state_invalid");
   const keep = new Set();
   for (const profile of ["research", "live"]) {
     try {
@@ -1111,7 +1139,7 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
       try { admission = await controlHost(pluginStateRoot, oldRuntimeId, product, "quiesce"); }
       catch (error) { if (!repair) throw error; admission = null; }
       quiesced = admission !== null;
-      if (admission?.blockers?.length) {
+      if (admission !== null && admission.blockers.length > 0) {
         transaction.advance("quiesce", { blockers: admission.blockers });
         fail("runtime_pinned", "In-flight jobs block Runtime replacement");
       }
@@ -1194,26 +1222,46 @@ export async function controlHost(pluginStateRoot, runtimeId, product, action) {
   return value;
 }
 
+export function runtimeInventoryPreflightScript() {
+  // This runs before importing any Runtime code. Keep its policy aligned with
+  // the Host verifier; declared legacy metadata is still integrity protected.
+  return [
+    "import json,pathlib,sys",
+    "root=pathlib.Path(sys.argv[1])",
+    "raw=json.loads((root/'RUNTIME.json').read_text(encoding='utf-8'))",
+    "expected={item['path'] for item in raw['payload']['files']}",
+    `generated_metadata=${JSON.stringify([...GENERATED_FILESYSTEM_METADATA])}`,
+    "def runtime_inventory():",
+    "    actual=set()",
+    "    for path in root.rglob('*'):",
+    "        relative=path.relative_to(root).as_posix()",
+    "        if path.is_symlink() or path.is_junction(): raise RuntimeError('Runtime inventory contains a link')",
+    "        if path.name in generated_metadata:",
+    "            if not path.is_file(): raise RuntimeError('Runtime metadata is not a regular file')",
+    "            if relative not in expected: continue",
+    "        if path.is_file() and relative!='RUNTIME.json': actual.add(relative)",
+    "        elif not path.is_file() and not path.is_dir(): raise RuntimeError('Runtime inventory contains a special file')",
+    "    return actual",
+    "actual=runtime_inventory()",
+    "(_ for _ in ()).throw(RuntimeError(f'Runtime inventory preflight missing={sorted(expected-actual)[:3]} extra={sorted(actual-expected)[:3]}')) if expected!=actual else None",
+  ].join("\n");
+}
+
 async function probeRuntime(runtimeRoot, manifest, stateRoot) {
   const python = safeDestination(runtimeRoot, manifest.payload.python.executable);
   const probeRoot = join(stateRoot, "probes", randomUUID());
   mkdirSync(probeRoot, { recursive: true, mode: 0o700 });
   const script = [
-    "import json,pathlib,sys",
-    "root=pathlib.Path(sys.argv[1])",
-    "raw=json.loads((root/'RUNTIME.json').read_text(encoding='utf-8'))",
-    "expected={item['path'] for item in raw['payload']['files']}",
-    "actual={path.relative_to(root).as_posix() for path in root.rglob('*') if path.is_file() and path.name!='RUNTIME.json'}",
-    "(_ for _ in ()).throw(RuntimeError(f'Runtime inventory preflight missing={sorted(expected-actual)[:3]} extra={sorted(actual-expected)[:3]}')) if expected!=actual else None",
+    runtimeInventoryPreflightScript(),
     "from edgepilot_runtime_host.contracts.runtime_manifest import RuntimeManifestEnvelope",
     "from edgepilot_runtime_host.release import RuntimeArtifactVerifier,RuntimePlatform",
     "from edgepilot_runtime_host.release.probe import RuntimeWorkerProbe",
-    "after_import={path.relative_to(root).as_posix() for path in root.rglob('*') if path.is_file() and path.name!='RUNTIME.json'}",
+    "after_import=runtime_inventory()",
     "(_ for _ in ()).throw(RuntimeError(f'Runtime import mutated tree dont_write={sys.dont_write_bytecode} extra={sorted(after_import-expected)[:10]}')) if after_import!=expected else None",
     "manifest=RuntimeManifestEnvelope.from_dict(raw)",
     "RuntimeArtifactVerifier(RuntimePlatform.current()).verify_tree(root,manifest,allow_installed_manifest=True)",
     "RuntimeWorkerProbe(pathlib.Path(sys.argv[2]),timeout=10.0)(root,manifest)",
-  ].join(";");
+  ].join("\n");
   try {
     await new Promise((accept, reject) => {
       let tail = "";
@@ -1324,29 +1372,6 @@ export async function installFromFunctionalChannel({ home, stateRoot, channelUrl
   } finally {
     for (const path of [channelPath, manifestPath, archivePath]) rmSync(path, { force: true });
   }
-}
-
-function readBootstrapConfig(home) {
-  const path = join(home, "bootstrap", "config.json");
-  let metadata;
-  let value;
-  try {
-    metadata = lstatSync(path);
-    value = JSON.parse(readFileSync(path, "utf8"));
-  } catch { fail("bootstrap_config_missing", "bootstrap installation is incomplete; reinstall EdgePilot Runtime bootstrap"); }
-  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 64 * 1024 || (process.platform !== "win32" && (metadata.mode & 0o077) !== 0)) fail("bootstrap_config_insecure", "bootstrap configuration is not owner-only");
-  exactKeys(value, ["schema", "channel", "channel_url", "trusted_keys"], "bootstrap_config_invalid");
-  if (value.schema !== "edgepilot-bootstrap-config-v1" || !["local", "production"].includes(value.channel) || !Array.isArray(value.trusted_keys) || value.trusted_keys.length < 1) fail("bootstrap_config_invalid", "bootstrap configuration differs from the installed contract");
-  validateArtifactUrl(value.channel_url, value.channel_url);
-  const keys = new Map();
-  const arguments_ = [];
-  for (const item of value.trusted_keys) {
-    exactKeys(item, ["key_id", "public_key_base64"], "bootstrap_config_invalid");
-    if (typeof item.key_id !== "string" || item.key_id.length < 1 || keys.has(item.key_id)) fail("bootstrap_config_invalid", "bootstrap trusted key identity is invalid");
-    keys.set(item.key_id, strictBase64(item.public_key_base64, 32, "bootstrap_config_invalid"));
-    arguments_.push(`${item.key_id}=${item.public_key_base64}`);
-  }
-  return { ...value, keys, arguments: arguments_ };
 }
 
 export async function installFromChannel({ home, stateRoot, config, runtimePin = null, pluginVersion = null, enforcePlatform = true, probe = probeRuntime }) {
@@ -1675,7 +1700,7 @@ async function reconciledPins(stateRoot, liveStateRoot) {
   return new Set(result.pinned_runtime_ids);
 }
 
-export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys, product }) {
+export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product }) {
   const pins = product === "live" ? await reconciledPins(stateRoot, liveStateRoot) : new Set();
   if (pins.size > 0) fail("runtime_pinned", "Runtime uninstall is blocked by active persistent jobs");
   let running = false;
@@ -1814,7 +1839,7 @@ async function cliUnlocked(arguments_) {
   }
   if (command === "gc") return { schema: "edgepilot-bootstrap-result-v1", gc: await garbageCollect({ stateRoot, liveStateRoot: product === "live" ? liveStateRoot : null, pluginStateRoot, pinnedRuntimeIds: product === "live" ? await reconciledPins(stateRoot, liveStateRoot) : [], maximumReleases: Number(option(options, "maximum-releases", "1")), maximumBytes: Number(option(options, "maximum-bytes", String(5 * 1024 ** 3))) }) };
   if (command === "uninstall") {
-    return uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: trusted.keys, product });
+    return uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product });
   }
   if (["status", "stop"].includes(command)) {
     const registered = registeredConnection(pluginStateRoot, product);
