@@ -34,11 +34,11 @@ import * as __edgepilot_lifecycle_dependency_0 from "node:fs";
 import * as __edgepilot_lifecycle_dependency_1 from "node:path";
 import * as __edgepilot_lifecycle_dependency_2 from "node:crypto";
 import * as __edgepilot_lifecycle_dependency_3 from "node:child_process";
-const { LifecycleTransaction, readLifecycleState, runLiveMaintenance } = (() => {
+const { LifecycleTransaction, readLifecycleState, writeLifecycleState, runLiveMaintenance, switchSelection, selectionCovers } = (() => {
 // Durable lifecycle journal and bounded bundled-Python maintenance transport.
 const { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } = __edgepilot_lifecycle_dependency_0;
 const { dirname, join } = __edgepilot_lifecycle_dependency_1;
-const { randomUUID } = __edgepilot_lifecycle_dependency_2;
+const { createHash, randomUUID } = __edgepilot_lifecycle_dependency_2;
 const { spawn } = __edgepilot_lifecycle_dependency_3;
 
 function lifecycleError(code) { return Object.assign(new Error(code), { code }); }
@@ -63,10 +63,20 @@ function readLifecycleState(root) {
   let state;
   try { state = JSON.parse(readFileSync(path, "utf8")); } catch { throw lifecycleError("lifecycle_state_invalid"); }
   if (state?.schema !== "edgepilot-lifecycle-v1" || !/^[0-9a-f-]{36}$/.test(state.operation_id)
-      || !["prepare", "inspect", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(state.phase)
+      || !["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(state.phase)
       || !/^\d+\.\d+\.\d+$/.test(state.target_version) || !Array.isArray(state.target_ids)
       || state.target_ids.some(id => !/^sha256:[0-9a-f]{64}$/.test(id))
       || (state.retired_directory !== undefined && !/^[0-9a-f]{64}-[0-9a-f-]{36}$/.test(state.retired_directory))) throw lifecycleError("lifecycle_state_invalid");
+  for (const selection of [state.selection, state.authorized]) {
+    if (selection == null) continue;
+    if (selection.operation_id !== state.operation_id || selection.target_version !== state.target_version
+        || !state.target_ids.includes(selection.target_runtime_id) || !/^sha256:[0-9a-f]{64}$/.test(selection.snapshot_digest)
+        || !["live", "research"].includes(selection.product) || !["local", "production"].includes(selection.environment)
+        || !Array.isArray(selection.processes) || !Array.isArray(selection.jobs)
+        || selection.processes.length > 200 || selection.jobs.length > 200
+        || selection.processes.some(item => !Number.isSafeInteger(item.pid) || item.pid <= 0 || typeof item.birth !== "string" || !item.birth))
+      throw lifecycleError("lifecycle_state_invalid");
+  }
   return state;
 }
 
@@ -80,6 +90,7 @@ class LifecycleTransaction {
       target_version: targetVersion, target_ids: targetIds, phase: "prepare", last_error: null,
       started_at: same && previous.phase !== "ready" ? previous.started_at : new Date().toISOString(),
       cutover_started: previous?.cutover_started === true && previous.phase !== "ready",
+      ...(same && previous.phase !== "ready" ? { selection: previous.selection ?? null, authorized: previous.authorized ?? null } : {}),
       updated_at: new Date().toISOString(),
       ...(previous?.retired_directory ? { retired_directory: previous.retired_directory } : {}),
     };
@@ -95,6 +106,26 @@ class LifecycleTransaction {
       interrupted_phase: interruptedPhase, last_error: /^[a-z][a-z0-9_]{0,100}$/.test(error?.code) ? error.code : "lifecycle_failed",
     });
   }
+}
+
+// The caller holds the existing lifecycle lock only while creating or checking this
+// snapshot, never while the user considers the choice.
+function switchSelection(transaction, { product, environment, runtimeId, processes, jobs }) {
+  const snapshot = { product, environment, runtime_id: runtimeId,
+    processes: [...processes].sort((a, b) => a.pid - b.pid),
+    jobs: [...jobs].sort((a, b) => a.job_ref.localeCompare(b.job_ref)) };
+  const digest = `sha256:${createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")}`;
+  const selection = { operation_id: transaction.value.operation_id, target_version: transaction.value.target_version,
+    target_runtime_id: transaction.value.target_runtime_id, snapshot_digest: digest, ...snapshot };
+  if (Buffer.byteLength(JSON.stringify(selection)) > 24 * 1024) throw lifecycleError("runtime_process_inventory_exceeded");
+  transaction.advance("awaiting_confirmation", { selection, authorized: null });
+  return selection;
+}
+
+function selectionCovers(selection, { processes, jobs }) {
+  return selection && Array.isArray(selection.processes) && Array.isArray(selection.jobs)
+    && processes.every(item => selection.processes.some(old => old.pid === item.pid && old.birth === item.birth))
+    && jobs.every(item => selection.jobs.some(old => old.job_ref === item.job_ref && old.runtime_id === item.runtime_id));
 }
 
 async function runLiveMaintenance({ python, liveStateRoot, runtimeId, operation = "inspect", jobRef, accountRef, idempotencyKey, registrationHome, evidenceDigest, acknowledgement, env }) {
@@ -125,11 +156,11 @@ async function runLiveMaintenance({ python, liveStateRoot, runtimeId, operation 
     });
   });
 }
-return { LifecycleTransaction, readLifecycleState, runLiveMaintenance };
+return { LifecycleTransaction, readLifecycleState, writeLifecycleState, runLiveMaintenance, switchSelection, selectionCovers };
 })();
 import * as __edgepilot_processes_dependency_0 from "node:child_process";
 import * as __edgepilot_processes_dependency_1 from "node:path";
-const { retireRuntimeProcesses } = (() => {
+const { snapshotRuntimeProcesses, stopAuthorizedProcesses, runtimeExecutablesInUse } = (() => {
 // Retire only service processes executing the verified old Runtime interpreter.
 const { spawnSync } = __edgepilot_processes_dependency_0;
 const { resolve, join } = __edgepilot_processes_dependency_1;
@@ -209,7 +240,81 @@ async function retireRuntimeProcesses({ python, birthOf, allowForce = false, all
   if (remaining.some(item => (item.service && (role === null || item.role === role)) || (!allowInUse && !item.service))) throw processFailure("runtime_process_in_use");
   return { retired: selected.length };
 }
-return { retireRuntimeProcesses };
+
+function processInventory() {
+  if (process.platform === "win32") {
+    const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const script = "$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {$o=Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop; if (($o.Domain+'\\'+$o.User) -eq $me) {$_ | Select-Object ProcessId,ParentProcessId,CommandLine}}) | ConvertTo-Json -Compress";
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
+    try { const value = JSON.parse(result.stdout || "[]"); return (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, parent: item.ParentProcessId, command: item.CommandLine ?? "" })); }
+    catch { throw processFailure("runtime_process_inspection_failed"); }
+  }
+  const result = spawnSync("/bin/ps", ["-u", String(process.getuid()), "-o", "pid=,ppid=,command="], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
+  if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
+  return result.stdout.split("\n").flatMap(line => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(.+)$/u.exec(line);
+    return match ? [{ pid: Number(match[1]), parent: Number(match[2]), command: match[3] }] : [];
+  });
+}
+
+function runtimeExecutablesInUse(executables) {
+  const entries = processInventory();
+  return new Set(executables.filter(executable => entries.some(entry =>
+    entry.command.startsWith(executable + " ") || entry.command.startsWith('"' + executable + '" '))));
+}
+
+function snapshotRuntimeProcesses({ python, hostPid = null, birthOf, authorized = [], inventory = processInventory }) {
+  const executable = resolve(python), entries = inventory();
+  const children = new Map();
+  for (const entry of entries) { const rows = children.get(entry.parent) ?? []; rows.push(entry); children.set(entry.parent, rows); }
+  const selected = new Map(), queue = [];
+  for (const entry of entries) {
+    const exact = entry.command.startsWith(executable + " ") || entry.command.startsWith('"' + executable + '" ');
+    const approved = authorized.some(old => old.pid === entry.pid && old.birth === birthOf(entry.pid));
+    if (entry.pid === hostPid || exact || approved) { selected.set(entry.pid, entry); queue.push(entry.pid); }
+  }
+  for (let index = 0; index < queue.length; index += 1) {
+    for (const entry of children.get(queue[index]) ?? []) {
+      if (!selected.has(entry.pid)) { selected.set(entry.pid, entry); queue.push(entry.pid); }
+    }
+  }
+  if (selected.size > 200) throw processFailure("runtime_process_inventory_exceeded");
+  return [...selected.values()].map(entry => {
+    if (!Number.isSafeInteger(entry.pid) || entry.pid <= 0 || entry.pid === process.pid) throw processFailure("runtime_process_identity_unverified");
+    const birth = birthOf(entry.pid);
+    if (!birth) throw processFailure("runtime_process_identity_unverified");
+    return { pid: entry.pid, birth, role: entry.pid === hostPid ? "host" : classifyRuntimeCommand(executable, entry.command) ?? "execution" };
+  }).sort((a, b) => a.pid - b.pid);
+}
+
+async function stopAuthorizedProcesses(processes, { birthOf, signal = (pid, kind) => process.kill(pid, kind),
+  exists = pid => { try { process.kill(pid, 0); return true; } catch (error) { if (error.code === "ESRCH") return false; throw error; } },
+  wait = milliseconds => new Promise(accept => setTimeout(accept, milliseconds)), gracefulMs = 5000, forcedMs = 2000 } = {}) {
+  const remains = item => {
+    if (!exists(item.pid)) return false;
+    const birth = birthOf(item.pid);
+    if (!birth) {
+      if (!exists(item.pid)) return false;
+      throw processFailure("runtime_process_identity_unverified");
+    }
+    return birth === item.birth;
+  };
+  // Signal children before services, then wait for the whole authorized set.
+  const selected = [...processes].sort((a, b) => (a.role === "host") - (b.role === "host"));
+  for (const item of selected) if (remains(item)) {
+    try { signal(item.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw processFailure("runtime_process_stop_failed"); }
+  }
+  let deadline = Date.now() + gracefulMs;
+  while (selected.some(remains) && Date.now() < deadline) await wait(50);
+  for (const item of selected) if (remains(item)) {
+    try { signal(item.pid, "SIGKILL"); } catch (error) { if (error.code !== "ESRCH") throw processFailure("runtime_process_stop_failed"); }
+  }
+  deadline = Date.now() + forcedMs;
+  while (selected.some(remains) && Date.now() < deadline) await wait(50);
+  if (selected.some(remains)) throw processFailure("runtime_process_stop_failed");
+}
+return { snapshotRuntimeProcesses, stopAuthorizedProcesses, runtimeExecutablesInUse };
 })();
 
 const MANIFEST_DOMAIN = Buffer.from("EdgePilot Runtime Manifest V1\0", "utf8");
@@ -221,7 +326,7 @@ const MAX_FILES = 200_000;
 const METADATA_DOWNLOAD_TIMEOUT_MS = 120_000;
 const RUNTIME_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.2.15";
+const BOOTSTRAP_PRODUCT_VERSION = "1.2.17";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -903,6 +1008,13 @@ export async function garbageCollect({ stateRoot, liveStateRoot, pluginStateRoot
       return { runtimeId: `sha256:${entry.name}`, path, bytes: directoryBytes(path), modified: metadata.mtimeMs };
     }).sort((left, right) => right.modified - left.modified);
     const keep = new Set(protectedIds);
+    const executableById = new Map(entries.filter(entry => !keep.has(entry.runtimeId)).map(entry => {
+      const manifest = validateManifest(JSON.parse(readFileSync(join(entry.path, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
+      if (manifest.runtime_id !== entry.runtimeId) fail("runtime_identity_invalid", "Cleanup Runtime identity differs");
+      return [entry.runtimeId, safeDestination(entry.path, manifest.payload.python.executable)];
+    }));
+    const inUse = executableById.size ? runtimeExecutablesInUse([...executableById.values()]) : new Set();
+    for (const [id, executable] of executableById) if (inUse.has(executable)) keep.add(id);
     for (const entry of entries) if (keep.size < maximumReleases) keep.add(entry.runtimeId);
     let retainedBytes = entries.filter((entry) => keep.has(entry.runtimeId)).reduce((sum, entry) => sum + entry.bytes, 0);
     const removed = [];
@@ -1095,10 +1207,53 @@ async function inspectPreparedJobs(prepared, liveStateRoot, operation = "reconci
     runtimeId: prepared.manifest.runtime_id, operation, env: cleanHostEnvironment(), ...options });
 }
 
-async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin, channelUrl, version, runtimeIds, repair, hostPort }) {
+async function switchHostIdentity(pluginStateRoot, product) {
+  const connection = registeredConnection(pluginStateRoot, product);
+  if (!connection || !await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), connection.runtime_id)) return null;
+  const authority = JSON.parse(readFileSync(join(pluginStateRoot, "connection-authority.json"), "utf8"));
+  const token = authority[`${product}_app`];
+  if (typeof token !== "string" || token.length < 40) fail("connection_state_invalid", "Host identity cannot be verified");
+  const endpoint = new URL(connection.endpoint); endpoint.pathname = "/host/status";
+  const response = await fetch(endpoint, { method: "POST", redirect: "error", signal: AbortSignal.timeout(2000),
+    headers: { Authorization: ["Bearer", token].join(" "), "Content-Type": "application/json" }, body: "{}" });
+  const identity = response.ok ? await response.json() : null;
+  if (identity?.runtime_id !== connection.runtime_id || !Number.isSafeInteger(identity.pid) || identity.pid <= 0)
+    fail("runtime_process_identity_unverified", "Host identity cannot be verified");
+  return identity;
+}
+
+function switchResult(transaction, state) {
+  return { schema: "edgepilot-bootstrap-result-v1", state, runtime_id: transaction.value.target_runtime_id,
+    connection_ready: false, required_action: state === "awaiting_confirmation" ? "choose_runtime_switch" : null,
+    switch: transaction.value.selection, lifecycle: transaction.value,
+    choices: ["defer", "stop_and_continue"] };
+}
+
+async function commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins }) {
+  transaction.advance("commit");
+  atomicJson(join(stateRoot, "current.json"), { schema: "edgepilot-runtime-pointer-v1", current_runtime_id: prepared.manifest.runtime_id, previous_runtime_id: null });
+  transaction.advance("ready", { blockers: [], last_error: null });
+  try {
+    await garbageCollect({ stateRoot, liveStateRoot: product === "live" ? liveStateRoot : null, pluginStateRoot,
+      pinnedRuntimeIds: pins, maximumReleases: 1 });
+    if (transaction.value.retired_directory) rmSync(join(stateRoot, "retired", transaction.value.retired_directory), { recursive: true, force: true });
+  } catch { transaction.advance("ready", { cleanup_pending: true }); }
+  return { schema: "edgepilot-bootstrap-result-v1", runtime_id: prepared.manifest.runtime_id, reused: prepared.reused, offline: prepared.reused, host: started, lifecycle: transaction.value };
+}
+
+async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin, channelUrl, version, runtimeIds, repair, hostPort, choice = null }) {
+  const previous = readLifecycleState(stateRoot);
+  if (choice && (previous?.operation_id !== choice.operation_id || previous?.selection?.snapshot_digest !== choice.snapshot_digest
+      || previous.target_version !== version || previous.selection.product !== product || previous.selection.environment !== environmentName
+      || JSON.stringify(previous.target_ids) !== JSON.stringify(runtimeIds)))
+    fail("runtime_switch_selection_stale", "The Runtime switch selection has changed");
+  if (choice?.action === "defer") {
+    if (previous.cutover_started) fail("runtime_switch_selection_stale", "A started cutover cannot be deferred");
+    writeLifecycleState(join(stateRoot, "lifecycle.json"), { ...previous, phase: "deferred", updated_at: new Date().toISOString() });
+    return switchResult({ value: { ...previous, phase: "deferred" } }, "deferred");
+  }
   const transaction = new LifecycleTransaction(stateRoot, version, runtimeIds);
-  let quiesced = false;
-  let oldRuntimeId = null;
+  let quiesced = false, oldRuntimeId = null;
   try {
     const prepared = await prepareBoundRuntime({ home, stateRoot, channelUrl, product, version, runtimeIds, repair });
     const productState = product === "live" ? liveStateRoot : researchStateRoot;
@@ -1106,71 +1261,106 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
     if (existsSync(stateMarker)) {
       const metadata = lstatSync(stateMarker);
       if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 4096) fail("product_state_invalid", "Product state format is invalid");
-      const value = JSON.parse(readFileSync(stateMarker, "utf8"));
-      if (canonical(value) !== canonical({ schema: "edgepilot-product-state-format-v1", product, version: 1 })) fail("product_state_incompatible", "Product state is newer or belongs to another product");
+      if (canonical(JSON.parse(readFileSync(stateMarker, "utf8"))) !== canonical({ schema: "edgepilot-product-state-format-v1", product, version: 1 }))
+        fail("product_state_incompatible", "Product state is newer or belongs to another product");
     }
     transaction.advance("inspect", { target_runtime_id: prepared.manifest.runtime_id });
     let jobs = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : { jobs: [], pinned_runtime_ids: [] };
-    if (jobs.pinned_runtime_ids.length > 0) {
-      transaction.advance("inspect", { blockers: jobs.jobs.filter(job => job.runtime_in_use) });
-      fail("runtime_pinned", "Active or unverifiable processes block replacement; inspect Runtime blockers");
+    if (jobs.truncated) fail("runtime_process_inventory_exceeded", "Too many active tasks to confirm in one switch");
+    const identity = await switchHostIdentity(pluginStateRoot, product);
+    if (identity?.runtime_id === prepared.manifest.runtime_id && previous?.cutover_started
+        && ["start", "commit"].includes(previous.interrupted_phase ?? previous.phase)
+        && prepared.runtimeRoot === join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id))) {
+      const started = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort,
+        selectedRuntime: { root: prepared.runtimeRoot, manifest: prepared.manifest } });
+      return commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins: jobs.pinned_runtime_ids });
     }
-    const productionHome = environmentName === "production" && basename(home) === `.edgepilot-runtime-${product}-production`;
-    if (product === "live" && (existsSync(join(liveStateRoot, "local-dashboard.json")) || existsSync(join(liveStateRoot, "background-dashboard", "enabled.json")))) {
-      const registrationHome = productionHome && resolve(liveStateRoot) === resolve(dirname(home), ".edgepilot") ? dirname(home) : undefined;
-      await inspectPreparedJobs(prepared, liveStateRoot, "retire-legacy", { registrationHome });
+    let previousId = identity?.runtime_id ?? null;
+    if (!previousId) { try { previousId = readPointer(join(stateRoot, "current.json")).current_runtime_id; } catch {} }
+    oldRuntimeId = previousId;
+    let oldPython = null;
+    if (previousId) {
+      const previousRoot = join(stateRoot, "releases", runtimeDirectory(previousId));
+      const manifestPath = existsSync(join(previousRoot, "RUNTIME.json")) ? join(previousRoot, "RUNTIME.json")
+        : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : null;
+      if (!manifestPath) fail("runtime_identity_invalid", "Previous Runtime manifest is missing");
+      const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
+      if (manifest.runtime_id !== previousId || manifestProduct(manifest) !== product) fail("runtime_identity_invalid", "Previous Runtime identity differs");
+      oldPython = safeDestination(previousRoot, manifest.payload.python.executable);
     }
-    if (productionHome && resolve(productState) === resolve(dirname(home), product === "live" ? ".edgepilot" : ".edgepilot-research")) {
-      const historicalHome = join(dirname(home), `.edgepilot-runtime-${product}`);
-      const historicalPlugins = join(historicalHome, "plugins");
-      const historicalConnection = join(historicalPlugins, "connections", `${product}.json`);
-      if (existsSync(historicalConnection)) {
-        if (lstatSync(historicalHome).isSymbolicLink() || lstatSync(historicalConnection).isSymbolicLink()) fail("legacy_runtime_unverified", "Legacy Runtime identity is invalid");
-        const value = JSON.parse(readFileSync(historicalConnection, "utf8"));
-        if (await probeConnection(historicalConnection, value.runtime_id) && !await stopHost(historicalPlugins, value.runtime_id, product)) fail("legacy_host_stop_failed", "Historical Host did not retire");
+    const inspect = async () => {
+      const live = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : { jobs: [], pinned_runtime_ids: [] };
+      const unverified = live.jobs.filter(job => job.runtime_in_use && (job.runtime_id !== previousId || job.process_evidence !== "running"));
+      if (live.truncated || unverified.length) {
+        transaction.advance("inspect", { blockers: unverified.map(job => ({ job_ref: job.job_ref, runtime_id: job.runtime_id, process_evidence: job.process_evidence })) });
+        fail("runtime_process_identity_unverified", "An old task process cannot be verified");
       }
-    }
-    transaction.advance("quiesce");
-    let oldConnection;
-    try { oldConnection = JSON.parse(readFileSync(join(pluginStateRoot, "connections", `${product}.json`), "utf8")); } catch { oldConnection = null; }
-    if (oldConnection && (repair || oldConnection.runtime_id !== prepared.manifest.runtime_id)) {
-      oldRuntimeId = oldConnection.runtime_id;
-      let admission;
-      try { admission = await controlHost(pluginStateRoot, oldRuntimeId, product, "quiesce"); }
-      catch (error) { if (!repair) throw error; admission = null; }
-      quiesced = admission !== null;
-      if (admission !== null && admission.blockers.length > 0) {
-        transaction.advance("quiesce", { blockers: admission.blockers });
-        fail("runtime_pinned", "In-flight jobs block Runtime replacement");
+      const processes = oldPython ? snapshotRuntimeProcesses({ python: oldPython, hostPid: identity?.pid ?? null,
+        birthOf: processBirth, authorized: transaction.value.authorized?.processes ?? [] }) : [];
+      for (const job of live.jobs.filter(job => job.runtime_in_use)) {
+        const birth = processBirth(job.pid);
+        if (!birth) fail("runtime_process_identity_unverified", "An execution process cannot be verified");
+        if (!processes.some(item => item.pid === job.pid)) processes.push({ pid: job.pid, birth, role: "execution" });
       }
-      const ordinaryJobs = join(productState, "runtime-jobs");
-      if (existsSync(ordinaryJobs)) {
-        for (const name of readdirSync(ordinaryJobs).filter(name => /^job_[A-Za-z0-9_-]+\.json$/.test(name))) {
-          const path = join(ordinaryJobs, name);
-          if (lstatSync(path).isSymbolicLink() || lstatSync(path).size > 1024 * 1024) fail("runtime_job_state_invalid", "Job state cannot be verified");
-          const record = JSON.parse(readFileSync(path, "utf8"));
-          if (["queued", "running", "cancelling"].includes(record.state)) fail("runtime_pinned", "A background job is still active");
+      const ordinary = [];
+      const directory = join(productState, "runtime-jobs");
+      if (existsSync(directory)) {
+        if (lstatSync(directory).isSymbolicLink()) fail("runtime_job_state_invalid", "Job store is invalid");
+        for (const name of readdirSync(directory).filter(name => /^job_[A-Za-z0-9_-]+\.json$/.test(name))) {
+          const path = join(directory, name);
+          if (lstatSync(path).isSymbolicLink() || lstatSync(path).size > 1024 * 1024) fail("runtime_job_state_invalid", "Job record is invalid");
+          const job = JSON.parse(readFileSync(path, "utf8"));
+          if (identity && ["queued", "running", "cancelling"].includes(job.state)) ordinary.push({ job_ref: job.job_ref ?? name.slice(0, -5), runtime_id: job.runtime_id ?? previousId, kind: job.kind ?? "background" });
         }
       }
-      jobs = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : jobs;
-      if (jobs.pinned_runtime_ids.length) fail("runtime_pinned", "A job was admitted while preparing the Runtime");
-      transaction.advance("retire", { cutover_started: true });
-      const reachable = await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), oldConnection.runtime_id);
-      const stopped = await stopHost(pluginStateRoot, oldConnection.runtime_id, product);
-      if (reachable && !stopped && !repair) fail("host_stop_failed", "Old Host did not stop");
+      return { processes, jobs: [...ordinary, ...live.jobs.filter(job => job.runtime_in_use).map(job => ({ job_ref: job.job_ref, account_ref: job.account_ref, runtime_id: job.runtime_id, kind: job.kind }))], live };
+    };
+    let snapshot = await inspect();
+    if (snapshot.jobs.length > 200) fail("runtime_process_inventory_exceeded", "Too many tasks to confirm in one switch");
+    const authorized = transaction.value.authorized ?? (choice?.action === "stop_and_continue" ? previous.selection : null);
+    if ((snapshot.processes.length || snapshot.jobs.length) && !selectionCovers(authorized, snapshot)) {
+      switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
+      return switchResult(transaction, "awaiting_confirmation");
+    }
+    if (authorized) transaction.advance("quiesce", { authorized });
+    if (identity && (snapshot.processes.length || snapshot.jobs.length)) {
+      const admission = await controlHost(pluginStateRoot, previousId, product, "quiesce");
+      quiesced = admission !== null;
+      if (admission === null && snapshot.jobs.length) fail("host_quiesce_failed", "The old Host cannot close task admission");
+      if (admission?.blockers.some(item => item.code !== "job_active")) fail("host_quiesce_failed", "Requests or invalid task state prevent switching");
+      snapshot = await inspect();
+      if (!selectionCovers(authorized, snapshot)) {
+        if (quiesced) await controlHost(pluginStateRoot, previousId, product, "resume");
+        quiesced = false;
+        switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
+        return switchResult(transaction, "awaiting_confirmation");
+      }
+    }
+    // Persist authorization before effects so an interrupted confirmed switch can resume.
+    if (snapshot.processes.length || snapshot.jobs.length) {
+      transaction.advance("retire", { cutover_started: true, authorized });
+      for (const job of snapshot.live.jobs.filter(job => job.runtime_in_use)) {
+        await inspectPreparedJobs(prepared, liveStateRoot, "stop", { jobRef: job.job_ref, accountRef: job.account_ref,
+          idempotencyKey: `runtime-switch-${transaction.value.operation_id}-${job.job_ref}` });
+      }
+      const beforeHostStop = await inspect();
+      const currentHost = await switchHostIdentity(pluginStateRoot, product);
+      if (!selectionCovers(authorized, beforeHostStop)
+          || (currentHost && !authorized.processes.some(item => item.pid === currentHost.pid && item.birth === processBirth(currentHost.pid)))) {
+        if (quiesced) await controlHost(pluginStateRoot, previousId, product, "resume");
+        quiesced = false;
+        switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...beforeHostStop });
+        return switchResult(transaction, "awaiting_confirmation");
+      }
+      // Host shutdown requests normal worker/Dashboard teardown; exact process identities
+      // still get checked before bounded escalation if the owner does not finish.
+      if (identity) await stopHost(pluginStateRoot, previousId, product);
+      await stopAuthorizedProcesses(snapshot.processes, { birthOf: processBirth });
+      const remaining = await inspect();
+      if (remaining.processes.length || remaining.live.pinned_runtime_ids.length)
+        fail("runtime_process_in_use", "A process survived the confirmed Runtime switch");
     }
     jobs = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : jobs;
-    if (jobs.pinned_runtime_ids.length) fail("runtime_pinned", "An old execution survived Host retirement");
-    let previousId = oldRuntimeId;
-    if (previousId === null) { try { previousId = readPointer(join(stateRoot, "current.json")).current_runtime_id; } catch {} }
-    if (previousId !== null && (previousId !== prepared.manifest.runtime_id || repair)) {
-      const previousRoot = join(stateRoot, "releases", runtimeDirectory(previousId));
-      const previousManifestPath = existsSync(join(previousRoot, "RUNTIME.json")) ? join(previousRoot, "RUNTIME.json")
-        : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : join(previousRoot, "RUNTIME.json");
-      const previousManifest = validateManifest(JSON.parse(readFileSync(previousManifestPath, "utf8")), null);
-      if (previousManifest.runtime_id !== previousId) fail("runtime_identity_invalid", "Previous Runtime identity differs");
-      await retireRuntimeProcesses({ python: safeDestination(previousRoot, previousManifest.payload.python.executable), birthOf: processBirth, allowForce: repair });
-    }
     const final = join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id));
     if (prepared.runtimeRoot !== final) {
       mkdirSync(dirname(final), { recursive: true, mode: 0o700 });
@@ -1186,18 +1376,7 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
     transaction.advance("start", { cutover_started: true });
     const started = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort,
       selectedRuntime: { root: final, manifest: prepared.manifest } });
-    transaction.advance("commit");
-    atomicJson(join(stateRoot, "current.json"), { schema: "edgepilot-runtime-pointer-v1", current_runtime_id: prepared.manifest.runtime_id, previous_runtime_id: null });
-    transaction.advance("ready", { blockers: [], last_error: null });
-    try {
-      await garbageCollect({ stateRoot, liveStateRoot: product === "live" ? liveStateRoot : null, pluginStateRoot,
-        pinnedRuntimeIds: jobs.pinned_runtime_ids, maximumReleases: 1 });
-    } catch { transaction.advance("ready", { cleanup_pending: true }); }
-    if (transaction.value.retired_directory) {
-      try { rmSync(join(stateRoot, "retired", transaction.value.retired_directory), { recursive: true, force: true }); }
-      catch { transaction.advance("ready", { cleanup_pending: true }); }
-    }
-    return { schema: "edgepilot-bootstrap-result-v1", runtime_id: prepared.manifest.runtime_id, reused: prepared.reused, offline: prepared.reused, host: started, lifecycle: transaction.value };
+    return await commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins: jobs.pinned_runtime_ids });
   } catch (error) {
     transaction.failure(error);
     if (quiesced && oldRuntimeId && !transaction.value.cutover_started) await controlHost(pluginStateRoot, oldRuntimeId, product, "resume");
@@ -1526,10 +1705,11 @@ export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, res
   });
   const connections = join(pluginStateRoot, "connections");
   if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) {
-    await startDashboard(pluginStateRoot, manifest.runtime_id, product);
-    return { alreadyRunning: true, runtimeId: manifest.runtime_id };
+    const dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product);
+    return { alreadyRunning: true, runtimeId: manifest.runtime_id, dashboard };
   }
-  await stopStaleHost(pluginStateRoot, manifest.runtime_id, product);
+  if (await switchHostIdentity(pluginStateRoot, product))
+    fail("runtime_switch_confirmation_required", "A different Host must be confirmed before replacement");
   mkdirSync(join(stateRoot, "logs"), { recursive: true, mode: 0o700 });
   const logPath = join(stateRoot, "logs", "host.log");
   rotateHostLog(logPath);
@@ -1553,7 +1733,8 @@ export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, res
   hostArguments.push("--research-dashboard-port", String(researchDashboardPort));
   if (trustedKeys === null) hostArguments.push("--functional-unsigned");
   for (const value of trustedKeyArguments) hostArguments.push("--trusted-key", value);
-  const child = spawn(python, hostArguments, { detached: true, stdio: ["ignore", log, log], windowsHide: true, env: cleanHostEnvironment() });
+  const child = spawn(python, hostArguments, { detached: true, stdio: ["ignore", log, log], windowsHide: true,
+    env: { ...cleanHostEnvironment(), EDGEPILOT_BOOTSTRAP_OWNS_CUTOVER: "1" } });
   closeSync(log);
   let spawnError = null;
   child.once("error", (error) => { spawnError = error; });
@@ -1561,13 +1742,14 @@ export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, res
   while (Date.now() < deadline) {
     if (spawnError !== null) fail("host_start_failed", "Runtime Host process could not start");
     if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) {
-      try { await startDashboard(pluginStateRoot, manifest.runtime_id, product); } catch (error) { await stopChild(child); throw error; }
+      let dashboard;
+      try { dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product); } catch (error) { await stopChild(child); throw error; }
       child.unref();
-      return { alreadyRunning: child.exitCode !== null, runtimeId: manifest.runtime_id, ...(child.exitCode === null ? { pid: child.pid } : {}) };
+      return { alreadyRunning: child.exitCode !== null, runtimeId: manifest.runtime_id, dashboard, ...(child.exitCode === null ? { pid: child.pid } : {}) };
     }
     if (child.exitCode !== null) {
       await new Promise((accept) => setTimeout(accept, 100));
-      if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) { await startDashboard(pluginStateRoot, manifest.runtime_id, product); return { alreadyRunning: true, runtimeId: manifest.runtime_id }; }
+      if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) { const dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product); return { alreadyRunning: true, runtimeId: manifest.runtime_id, dashboard }; }
       continue;
     }
     await new Promise((accept) => setTimeout(accept, 100));
@@ -1870,6 +2052,12 @@ async function cliUnlocked(arguments_) {
     const channelUrl = option(options, "channel-url", null);
     const expectedProductVersion = option(options, "expected-product-version", option(options, "plugin-version", "").split("+", 1)[0] || null);
     const expectedRuntimeIds = optionMany(options, "expected-runtime-id");
+    const switchAction = option(options, "switch-action", null);
+    const choice = switchAction === null ? null : { action: switchAction,
+      operation_id: option(options, "operation-id"), snapshot_digest: option(options, "snapshot-digest") };
+    if (choice && (!["defer", "stop_and_continue"].includes(choice.action) || !/^[0-9a-f-]{36}$/.test(choice.operation_id)
+        || !isDigest(choice.snapshot_digest))) fail("usage", "Invalid Runtime switch selection");
+
     if ((expectedProductVersion !== null && !isSemver(expectedProductVersion)) || expectedRuntimeIds.some((id) => !isDigest(id))) fail("usage", "plugin Runtime binding is invalid");
     if (channelUrl === null) fail("usage", `${command} requires --channel-url`);
     let active = null;
@@ -1887,15 +2075,24 @@ async function cliUnlocked(arguments_) {
       fail("plugin_session_stale", "An older plugin cannot replace a newer lifecycle transaction");
     }
     if (active !== null && expectedProductVersion !== null && compareSemver(active.manifest.payload.release_version, expectedProductVersion) > 0) fail("plugin_session_stale", "older plugin cannot alter the active Runtime");
-    if (command !== "repair" && active !== null && expectedRuntimeIds.includes(active.manifest.runtime_id)
-        && (pending === null || pending.phase === "ready")
-        && await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), active.manifest.runtime_id)) {
+    const resumeTarget = pending?.cutover_started && ["start", "commit"].includes(pending.interrupted_phase ?? pending.phase)
+      && pending.target_runtime_id === active?.manifest.runtime_id;
+    const ordinaryStart = command !== "repair" && !pending?.cutover_started;
+    const currentHost = active === null ? null : await switchHostIdentity(pluginStateRoot, product);
+    if (active !== null && choice?.action !== "defer" && active.manifest.payload.release_version === expectedProductVersion
+        && (currentHost === null || currentHost.runtime_id === active.manifest.runtime_id)
+        && expectedRuntimeIds.includes(active.manifest.runtime_id)
+        && (ordinaryStart || resumeTarget || (command !== "repair" && pending?.phase === "ready"))) {
       const host = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, selectedRuntime: active });
+      if (pending && pending.target_version === expectedProductVersion && pending.target_ids.includes(active.manifest.runtime_id)
+          && (!pending.target_runtime_id || pending.target_runtime_id === active.manifest.runtime_id) && pending.phase !== "ready") {
+        writeLifecycleState(join(stateRoot, "lifecycle.json"), { ...pending, phase: "ready", last_error: null, updated_at: new Date().toISOString() });
+      }
       return { schema: "edgepilot-bootstrap-result-v1", runtime_id: active.manifest.runtime_id, reused: true, offline: true, host };
     }
     if (expectedProductVersion !== null && expectedRuntimeIds.length > 0) {
       return forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin,
-        channelUrl, version: expectedProductVersion, runtimeIds: expectedRuntimeIds, repair: command === "repair", hostPort: Number(option(options, "host-port", String(DEFAULT_HOST_PORT))) });
+        channelUrl, version: expectedProductVersion, runtimeIds: expectedRuntimeIds, repair: command === "repair", hostPort: Number(option(options, "host-port", String(DEFAULT_HOST_PORT))), choice });
     }
     fail("runtime_binding_missing", "Use the plugin's bundled lifecycle entry with its exact version and Runtime ID");
   }

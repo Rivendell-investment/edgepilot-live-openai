@@ -4,7 +4,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_RESOURCE_BYTES = 768 * 1024;
@@ -94,11 +94,13 @@ async function handleRequest(request) {
     return forwardHost(request);
   }
   if (request.method === "resources/list") {
+    if ((await runtimeStatus()).state !== "ready") return resultResponse(id, { resources: [] });
     const connection = await healthyConnection();
     if (connection === null) return resultResponse(id, { resources: [] });
     return forward(connection, request);
   }
   if (request.method === "resources/read") {
+    if ((await runtimeStatus()).state !== "ready") return errorResponse(id, -32001, "runtime_not_ready");
     const connection = await healthyConnection();
     if (connection === null) return errorResponse(id, -32001, "runtime_not_ready");
     return forward(connection, request);
@@ -130,16 +132,13 @@ const LIFECYCLE_HANDLERS = {
     return await runtimeStatus();
   },
   edgepilot_runtime_start: async (argumentsValue) => {
-    requireEmpty(argumentsValue);
-    return runLifecycle("ensure-start");
+    return runLifecycle("ensure-start", switchArguments(argumentsValue));
   },
   edgepilot_runtime_update: async (argumentsValue) => {
-    requireEmpty(argumentsValue);
-    return runLifecycle("update");
+    return runLifecycle("update", switchArguments(argumentsValue));
   },
   edgepilot_runtime_repair: async (argumentsValue) => {
-    requireEmpty(argumentsValue);
-    return runLifecycle("repair");
+    return runLifecycle("repair", switchArguments(argumentsValue));
   },
 };
 
@@ -172,10 +171,14 @@ function coldOnboardingRuntimeId() {
 
 function lifecycleTools(runtimeId = null) {
   const emptyInput = { type: "object", properties: {}, required: [], additionalProperties: false };
+  const switchInput = { type: "object", oneOf: [emptyInput, { type: "object", additionalProperties: false,
+    properties: { action: { enum: ["defer", "stop_and_continue"] }, operation_id: { type: "string", pattern: "^[0-9a-f-]{36}$" }, snapshot_digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" } },
+    required: ["action", "operation_id", "snapshot_digest"] }] };
   const output = {
     type: "object",
     properties: {
-      state: { enum: ["ready", "stopped", "not_installed", "update_required", "stale_session", "error"] },
+      state: { enum: ["ready", "stopped", "not_installed", "update_required", "awaiting_confirmation", "deferred", "stale_session", "error"] },
+      switch: { type: ["object", "null"] },
       profile: { enum: ["live", "research"] },
       plugin_version: { type: "string" },
       version: { type: "string" },
@@ -200,8 +203,8 @@ function lifecycleTools(runtimeId = null) {
     ["edgepilot_runtime_repair", "Runtime Repair", "Reinstall the channel Runtime and restart the local Host.", false],
   ];
   const tools = definitions.map(([name, title, description, readOnly]) => ({
-    name, title, description, inputSchema: emptyInput, outputSchema: output,
-    annotations: { readOnlyHint: readOnly, destructiveHint: false, idempotentHint: true, openWorldHint: !readOnly },
+    name, title, description: readOnly ? description : `${description} If a prepared replacement needs old processes stopped, returns awaiting_confirmation with their exact snapshot. Only submit stop_and_continue after the user chooses to stop those listed processes; defer leaves the old installation running.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
+    annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: !readOnly },
   }));
   if (profile === "live") {
     tools.push({ name: "edgepilot_runtime_blockers", title: "Inspect Runtime Blockers", description: "Inspect old Live jobs even when plugin and Runtime versions differ. May prepare the fixed Runtime maintenance executable; never starts trading.", inputSchema: emptyInput,
@@ -277,6 +280,7 @@ async function runLifecycle(command, managementArguments = {}) {
   const management = ["runtime-blockers", "stop-job", "review-job"].includes(command);
   const before = await runtimeStatus();
   if (!management && before.state === "stale_session") return before;
+  if (!management && before.message === "runtime_operation_pending") return before;
   if (new Set(["update", "repair"]).has(command) && !before.repair_allowed) return staleSession(before);
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = validateBootstrapFile(configuredBootstrapPath());
@@ -303,6 +307,12 @@ async function runLifecycle(command, managementArguments = {}) {
   if (management) {
     try { return JSON.parse(completed.stdout); } catch { throw new BridgeError("maintenance_response_invalid"); }
   }
+  let outcome;
+  try { outcome = JSON.parse(completed.stdout); } catch { /* Older lifecycle fixtures return no structured output. */ }
+  if (["awaiting_confirmation", "deferred"].includes(outcome?.state)) {
+    return { ...(await runtimeStatus()), state: outcome.state, switch: outcome.switch, lifecycle: outcome.lifecycle,
+      connection_ready: false, required_action: outcome.required_action, message: outcome.state === "awaiting_confirmation" ? "runtime_switch_confirmation_required" : "runtime_switch_deferred" };
+  }
   const connection = await healthyConnection();
   if (connection === null) return { ...(await runtimeStatus()), state: "error", message: "host_not_ready" };
   admittedRuntimeId = connection.runtime_id;
@@ -318,6 +328,8 @@ async function runLifecycle(command, managementArguments = {}) {
 async function ensureForUse() {
   const status = await runtimeStatus();
   if (status.state === "stale_session") return status;
+  if (status.message === "runtime_operation_pending" || status.message === "runtime_operation_identity_unverified") return status;
+  if (["awaiting_confirmation", "deferred"].includes(status.state)) return status;
   if (status.state === "ready") { admittedRuntimeId = status.runtime_id; return null; }
   const result = await runLifecycle("ensure-start");
   return result.state === "ready" ? null : result;
@@ -330,8 +342,36 @@ function lifecycleSnapshot() {
     const metadata = lstatSync(path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 65536) return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
     const value = JSON.parse(readFileSync(path, "utf8"));
-    return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending"].map(key => [key, value[key] ?? null]));
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+        || !["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(value.phase)) {
+      return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
+    }
+    return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
   } catch { return { phase: "repair_required", last_error: "lifecycle_state_invalid" }; }
+}
+
+function lifecycleExecution() {
+  const lock = join(runtimeHome, "runtime", "lifecycle.lock"), path = join(lock, "owner.json");
+  if (!existsSync(lock)) return null;
+  try {
+    if (!lstatSync(lock).isDirectory() || lstatSync(lock).isSymbolicLink()
+        || !lstatSync(path).isFile() || lstatSync(path).isSymbolicLink() || lstatSync(path).size > 4096) return "unverified";
+    const owner = JSON.parse(readFileSync(path, "utf8"));
+    if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return "unverified";
+    try { process.kill(owner.pid, 0); } catch (error) { return error.code === "ESRCH" ? null : "unverified"; }
+    let birth = null;
+    if (process.platform === "linux") {
+      birth = `linux:${readFileSync(`/proc/${owner.pid}/stat`, "utf8").split(") ")[1].split(" ")[19]}`;
+    } else if (process.platform === "darwin") {
+      const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(owner.pid)], { encoding: "utf8", timeout: 1000 });
+      if (result.status === 0 && result.stdout.trim()) birth = `macos:${result.stdout.trim()}`;
+    } else if (process.platform === "win32") {
+      const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+      const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${owner.pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`], { encoding: "utf8", timeout: 3000, windowsHide: true });
+      if (result.status === 0 && /^\d+$/.test(result.stdout.trim())) birth = `windows:${result.stdout.trim()}`;
+    }
+    return birth === null || typeof owner.birth !== "string" ? "unverified" : birth === owner.birth ? "running" : null;
+  } catch { return existsSync(lock) ? "unverified" : null; }
 }
 
 async function runtimeStatus() {
@@ -340,7 +380,8 @@ async function runtimeStatus() {
   const runtime = readInstalledRuntime(runtimeId);
   const incompatible = runtime !== null && !supportsRuntimeContract(runtime.contractVersion);
   const newerThanPlugin = runtime !== null && compareProductVersions(runtime.releaseVersion, productVersion) > 0;
-  const connection = incompatible ? null : await healthyConnection(runtimeId, runtime);
+  const executing = lifecycleExecution();
+  const connection = incompatible || executing !== null ? null : await healthyConnection(runtimeId, runtime);
   const base = {
     profile,
     lifecycle: lifecycleSnapshot(),
@@ -356,6 +397,16 @@ async function runtimeStatus() {
   if (bindingFailure !== null) return { ...base, state: "stale_session", connection_ready: false,
     repair_allowed: false, required_action: "update_plugin_and_reload", message: bindingFailure };
   if (incompatible || newerThanPlugin || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
+  if (executing !== null) return { ...base, state: executing === "running" ? "stopped" : "error", connection_ready: false,
+    repair_allowed: false, required_action: executing === "running" ? "wait_for_runtime_status" : "inspect_runtime_status",
+    message: executing === "running" ? "runtime_operation_pending" : "runtime_operation_identity_unverified" };
+  if (base.lifecycle?.selection && base.lifecycle.target_version === productVersion
+      && delivery.expected_runtime_ids.includes(base.lifecycle.selection.target_runtime_id)
+      && ["awaiting_confirmation", "deferred"].includes(base.lifecycle.phase)) {
+    return { ...base, state: base.lifecycle.phase, switch: base.lifecycle.selection, connection_ready: false,
+      repair_allowed: true, required_action: base.lifecycle.phase === "awaiting_confirmation" ? "choose_runtime_switch" : null,
+      message: base.lifecycle.phase === "awaiting_confirmation" ? "runtime_switch_confirmation_required" : "runtime_switch_deferred" };
+  }
   if (runtime !== null && !matchesRelease(runtimeId, runtime)) {
     return { ...base, state: "update_required", connection_ready: false, repair_allowed: true, required_action: "start", message: "runtime_update_required" };
   }
@@ -484,7 +535,8 @@ async function healthyConnection(
       signal: AbortSignal.timeout(500),
     });
     const body = response.ok ? await response.json() : null;
-    return body?.result?.serverInfo?.runtimeId === runtimeId && body.result.serverInfo.runtimeReady !== false && readInstalledRuntimeId() === runtimeId ? connection : null;
+    return body?.result?.serverInfo?.runtimeId === runtimeId && body.result.serverInfo.runtimeReady !== false
+      && readInstalledRuntimeId() === runtimeId ? connection : null;
   } catch { return null; }
 }
 
@@ -494,8 +546,19 @@ function matchesRelease(runtimeId, runtime) {
 
 function toolResult(value, isError = false) {
   isError ||= value?.state === "error" || value?.state === "stale_session";
+  const pending = value?.message === "runtime_operation_pending";
+  const text = value?.state === "awaiting_confirmation"
+    ? "The target Runtime is prepared. Show the listed old processes/tasks and ask once: defer the switch, or stop the listed old version and continue. Stopping programs does not guarantee cancelling orders or closing positions. Only after that explicit choice call the same lifecycle tool with action, operation_id and snapshot_digest. Do not open the old Dashboard or onboarding as target success."
+    : value?.state === "deferred" ? "Runtime switch deferred. The old environment is preserved; this target startup request has ended."
+    : pending
+    ? "EdgePilot Runtime installation or startup is still pending. Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation."
+    : isError || (typeof value?.state === "string" && value.state !== "ready")
+      ? "EdgePilot Runtime is not ready. Follow required_action before opening Dashboard or onboarding."
+      : value?.state === "ready"
+        ? "EdgePilot Runtime is ready. Installation and startup have completed; Dashboard and onboarding may now be opened."
+        : "EdgePilot Runtime operation completed.";
   return {
-    content: [{ type: "text", text: isError ? "EdgePilot Runtime is not ready." : "EdgePilot Runtime lifecycle completed." }],
+    content: [{ type: "text", text }],
     structuredContent: value,
     ...(isError ? { isError: true } : {}),
   };
@@ -507,6 +570,14 @@ function writeResponse(value) { process.stdout.write(`${JSON.stringify(value)}\n
 
 function requireEmpty(value) {
   if (Object.keys(value).length !== 0) throw new BridgeError("invalid_arguments");
+}
+
+function switchArguments(value) {
+  if (Object.keys(value).length === 0) return {};
+  if (Object.keys(value).sort().join(",") !== "action,operation_id,snapshot_digest"
+      || !["defer", "stop_and_continue"].includes(value.action) || !/^[0-9a-f-]{36}$/.test(value.operation_id)
+      || !/^sha256:[0-9a-f]{64}$/.test(value.snapshot_digest)) throw new BridgeError("invalid_arguments");
+  return { "switch-action": value.action, "operation-id": value.operation_id, "snapshot-digest": value.snapshot_digest };
 }
 
 function fatal(code) {

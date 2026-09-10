@@ -69,14 +69,26 @@ asks for onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` o
 Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
 must go directly to that outcome and must not force the questionnaire.
 
-1. Call `edgepilot_runtime_status`. If it is `not_installed`, `stopped` or `update_required`, tell the user
-   once that the product Runtime will be downloaded or started, then call
-   `edgepilot_runtime_start` exactly once. Never repeat start merely because it takes time.
-   On an error, report the stable error. For `runtime_pinned`, follow Upgrade recovery; for other errors, offer the indicated recovery without looping.
-   If status is `stale_session` or the message is `plugin_session_stale`, do not start,
-   update or repair; tell the user to reload the app or start a new task so Codex loads the
-   compatible plugin.
-2. Only after `state=ready` and `connection_ready=true`, call
+1. Call `edgepilot_runtime_status`, then `edgepilot_runtime_start` when the bound target
+   needs starting, installation or recovery. Let the script decide whether to reuse,
+   start, prepare or resume; do not infer process liveness from stored job states or
+   historical lifecycle phases and do not assemble alternative shell recovery commands.
+   Wait for the original call's final result; yielded/running is not completed. If the
+   script reports `runtime_operation_pending`, wait on that call or query status with
+   bounded backoff, without parallel open calls or duplicate installations.
+   When `state=awaiting_confirmation`, show `switch.processes` and `switch.jobs` and ask
+   once: “暂不切换” (`defer`) or “停止旧版本并继续” (`stop_and_continue`), translated into
+   the user's language. Explain that stopping trading programs does not guarantee order
+   cancellation or position closure. Submit the chosen action to the same lifecycle tool
+   with the returned `operation_id` and `snapshot_digest`; never invent or reuse a changed
+   snapshot. This choice authorizes only the listed process stop, not an orders/positions
+   review. A refreshed snapshot requires a fresh choice. On `deferred`, end this target
+   startup request and leave the old environment alone; do not open old onboarding as
+   target success. Report other failures and their script-provided recovery action.
+   For `stale_session`, reload the plugin session rather than attempting a downgrade.
+2. For this Dashboard-and-onboarding request, all successful paths (already running,
+   stopped target started, first installation, upgrade or repair) continue identically.
+   Only after `state=ready` and `connection_ready=true`, call
    `edgepilot_dashboard_open` once and return its loopback URL. Then call
    `edgepilot_onboarding_open` once with the current locale. On success, hand control to
    that interactive card and end the turn. A brief instruction to continue in the card is
