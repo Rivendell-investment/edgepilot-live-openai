@@ -24,7 +24,7 @@ import {
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, platform as hostPlatform, arch as hostArch, release as hostRelease } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { Transform, Readable } from "node:stream";
@@ -245,7 +245,7 @@ function processInventory() {
   if (process.platform === "win32") {
     const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
     const script = "$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {$o=Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop; if (($o.Domain+'\\'+$o.User) -eq $me) {$_ | Select-Object ProcessId,ParentProcessId,CommandLine}}) | ConvertTo-Json -Compress";
-    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 10000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
+    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 120000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
     if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
     try { const value = JSON.parse(result.stdout || "[]"); return (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, parent: item.ParentProcessId, command: item.CommandLine ?? "" })); }
     catch { throw processFailure("runtime_process_inspection_failed"); }
@@ -325,8 +325,10 @@ const MAX_CHANNEL_BYTES = 512 * 1024;
 const MAX_FILES = 200_000;
 const METADATA_DOWNLOAD_TIMEOUT_MS = 120_000;
 const RUNTIME_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
+export const HOST_START_TIMEOUT_MS = 60_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.2.18";
+const BOOTSTRAP_PRODUCT_VERSION = "1.2.19";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -637,7 +639,11 @@ export function validateFunctionalChannel(value, channelUrl, { enforcePlatform =
       selected = target;
     }
   }
-  if (selected === null) fail("platform_unsupported", "Runtime channel has no matching target");
+  if (selected === null) {
+    const available = channel.targets.map((target) => `${target.os}-${target.arch}`).join(", ");
+    const hostLabel = host === null ? "unknown" : `${host.os}-${host.arch}`;
+    fail("platform_unsupported", `Runtime channel has no matching target for ${hostLabel}; available targets: ${available}`);
+  }
   if (expectedProductVersion !== null && selected.release_version !== expectedProductVersion) fail("runtime_version_incompatible", "plugin requires another Runtime product version");
   return { channel, target: selected };
 }
@@ -1132,7 +1138,9 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
       if (canonical(installed) !== canonical(manifest)) fail("runtime_identity_invalid", "installed Runtime manifest differs");
       await probe(final, manifest, stateRoot);
     } else {
-      const candidate = join(releases, `.candidate-${randomUUID()}`);
+      // Keep the temporary Windows import path below DLL loader limits; the
+      // activated content-addressed release path remains unchanged.
+      const candidate = join(releases, `.c-${randomUUID().slice(0, 12)}`);
       try {
         await extractZip(archivePath, candidate, manifest);
         await verifyTree(candidate, manifest);
@@ -1182,7 +1190,14 @@ export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product
         if (repair && cacheRoot === stateRoot) continue;
         try {
           const cached = await runtimeById(cacheRoot, id, null);
-          if (manifestProduct(cached.manifest) === product && cached.manifest.payload.release_version === version) return { runtimeRoot: cached.root, manifest: cached.manifest, reused: true };
+          if (manifestProduct(cached.manifest) === product && cached.manifest.payload.release_version === version) {
+            try {
+              await verifyTree(cached.root, cached.manifest);
+              return { runtimeRoot: cached.root, manifest: cached.manifest, reused: true };
+            } catch (error) {
+              if (error?.code !== "runtime_file_missing" && error?.code !== "runtime_file_digest_mismatch") throw error;
+            }
+          }
         } catch (error) {
           if (error?.code === "EACCES" || error?.code === "EPERM") throw error;
         }
@@ -1317,7 +1332,15 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
     };
     let snapshot = await inspect();
     if (snapshot.jobs.length > 200) fail("runtime_process_inventory_exceeded", "Too many tasks to confirm in one switch");
-    const authorized = transaction.value.authorized ?? (choice?.action === "stop_and_continue" ? previous.selection : null);
+    let authorized = transaction.value.authorized ?? (choice?.action === "stop_and_continue" ? previous.selection : null);
+    // Local development Hosts are detached from the launcher so an interrupted
+    // terminal/IDE session can orphan them under launchd. If there are no
+    // active jobs, the process snapshot is safe to reclaim automatically; do
+    // not turn an idle local restart into a user confirmation gate.
+    if (!authorized && environmentName === "local" && snapshot.jobs.length === 0 && snapshot.processes.length > 0) {
+      switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
+      authorized = transaction.value.selection;
+    }
     if ((snapshot.processes.length || snapshot.jobs.length) && !selectionCovers(authorized, snapshot)) {
       switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
       return switchResult(transaction, "awaiting_confirmation");
@@ -1438,12 +1461,14 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
     "after_import=runtime_inventory()",
     "(_ for _ in ()).throw(RuntimeError(f'Runtime import mutated tree dont_write={sys.dont_write_bytecode} extra={sorted(after_import-expected)[:10]}')) if after_import!=expected else None",
     "manifest=RuntimeManifestEnvelope.from_dict(raw)",
+    "print('runtime_probe_stage=verify_tree',flush=True)",
     "RuntimeArtifactVerifier(RuntimePlatform.current()).verify_tree(root,manifest,allow_installed_manifest=True)",
+    "print('runtime_probe_stage=worker_probe',flush=True)",
     "RuntimeWorkerProbe(pathlib.Path(sys.argv[2]),timeout=10.0)(root,manifest)",
   ].join("\n");
   try {
     await new Promise((accept, reject) => {
-      let tail = "";
+      let tail = "runtime_probe_stage=starting\n";
       let settled = false;
       const child = spawn(python, ["-I", "-B", "-c", script, runtimeRoot, probeRoot], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1457,9 +1482,9 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
         if (settled) return;
         settled = true;
         child.kill("SIGKILL");
-        atomicJson(join(stateRoot, "probe-failure.json"), { schema: "edgepilot-runtime-probe-failure-v1", code: "runtime_probe_timeout", diagnostic: tail || null });
+        atomicJson(join(stateRoot, "probe-failure.json"), { schema: "edgepilot-runtime-probe-failure-v1", code: "runtime_probe_timeout", diagnostic: tail });
         reject(new BootstrapError("runtime_probe_timeout", "Runtime worker probe timed out"));
-      }, 120_000);
+      }, RUNTIME_PROBE_TIMEOUT_MS);
       child.once("error", (error) => {
         if (settled) return;
         settled = true;
@@ -1738,7 +1763,7 @@ export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, res
   closeSync(log);
   let spawnError = null;
   child.once("error", (error) => { spawnError = error; });
-  const deadline = Date.now() + 15_000;
+  const deadline = Date.now() + HOST_START_TIMEOUT_MS;
   while (Date.now() < deadline) {
     if (spawnError !== null) fail("host_start_failed", "Runtime Host process could not start");
     if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) {
@@ -1769,7 +1794,9 @@ export async function startDashboard(pluginStateRoot, runtimeId, product) {
   let response;
   try { response = await fetch(endpoint, {
     // Includes listener inspection (5s), readiness (10s), and bounded child cleanup.
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(30_000),
+    // Host Dashboard readiness is bounded at 60 seconds on cold Windows starts;
+    // leave request headroom so Bootstrap does not abort the peer call first.
+    method: "POST", redirect: "error", signal: AbortSignal.timeout(90_000),
     headers: { Authorization: ["Bearer", authority[`${product}_app`]].join(" "), "Content-Type": "application/json" },
     body: JSON.stringify({ method: "dashboard.start" }),
   }); } catch (error) {
