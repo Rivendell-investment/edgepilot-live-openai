@@ -167,6 +167,18 @@ const { resolve, join } = __edgepilot_processes_dependency_1;
 
 function processFailure(code) { return Object.assign(new Error(code), { code }); }
 
+function logProcessInspectionFailure(stage, result) {
+  console.error(JSON.stringify({
+    diagnostic: "runtime_process_inspection",
+    stage,
+    status: result.status,
+    signal: result.signal,
+    error: result.error?.message ?? null,
+    stderr: String(result.stderr ?? "").slice(0, 2000),
+    stdout: String(result.stdout ?? "").slice(0, 2000),
+  }));
+}
+
 function classifyRuntimeCommand(executable, command) {
   const prefixes = [executable + " ", '"' + executable + '" '];
   const prefix = prefixes.find(value => command.startsWith(value));
@@ -186,14 +198,14 @@ function runtimeProcesses(python) {
     const quoted = executable.replaceAll("'", "''");
     const script = `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {$_.ExecutablePath -eq '${quoted}'} | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress`;
     const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true });
-    if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
+    if (result.status !== 0) { logProcessInspectionFailure("process_inventory", result); throw processFailure("runtime_process_inspection_failed"); }
     try {
       const value = result.stdout.trim() ? JSON.parse(result.stdout) : [];
       entries = (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, command: item.CommandLine }));
     } catch { throw processFailure("runtime_process_inspection_failed"); }
   } else {
     const result = spawnSync("/bin/ps", ["-u", String(process.getuid()), "-o", "pid=,command="], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
-    if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
+    if (result.status !== 0) { logProcessInspectionFailure("runtime_processes", result); throw processFailure("runtime_process_inspection_failed"); }
     entries = result.stdout.split("\n").flatMap(line => {
       const match = /^\s*(\d+)\s+(.+)$/u.exec(line);
       if (!match) return [];
@@ -241,13 +253,42 @@ async function retireRuntimeProcesses({ python, birthOf, allowForce = false, all
   return { retired: selected.length };
 }
 
-function processInventory() {
+function processInventory({ executables = [], roots = [], descendants = false } = {}) {
   if (process.platform === "win32") {
     const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const script = "$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name; @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object {$o=Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop; if (($o.Domain+'\\'+$o.User) -eq $me) {$_ | Select-Object ProcessId,ParentProcessId,CommandLine}}) | ConvertTo-Json -Compress";
+    const scope = JSON.stringify({ executables, roots, descendants }).replaceAll("'", "''");
+    const script = `$ErrorActionPreference='Stop';
+$scope=ConvertFrom-Json '${scope}';
+$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;
+$rows=@(Get-CimInstance Win32_Process -ErrorAction Stop);
+$selected=@{}; $children=@{}; $queue=[System.Collections.Generic.Queue[uint32]]::new();
+foreach ($row in $rows) {
+  $parent=[string]$row.ParentProcessId;
+  if (!$children.ContainsKey($parent)) {$children[$parent]=[System.Collections.Generic.List[object]]::new()};
+  $children[$parent].Add($row);
+  $exact=$false;
+  foreach ($exe in $scope.executables) {
+    if ($row.CommandLine -and ($row.CommandLine.StartsWith($exe+' ', [StringComparison]::Ordinal) -or $row.CommandLine.StartsWith('"'+$exe+'" ', [StringComparison]::Ordinal))) {$exact=$true; break}
+  };
+  if ($exact -or $scope.roots -contains $row.ProcessId) {$selected[[string]$row.ProcessId]=$row; $queue.Enqueue($row.ProcessId)}
+};
+if ($scope.descendants) {
+  while ($queue.Count) {
+    $parent=[string]$queue.Dequeue();
+    foreach ($row in $children[$parent]) {
+      $key=[string]$row.ProcessId;
+      if (!$selected.ContainsKey($key)) {$selected[$key]=$row; $queue.Enqueue($row.ProcessId)}
+    }
+  }
+};
+@($selected.Values | ForEach-Object {
+  $o=Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop;
+  if ($o.ReturnValue -ne 0) {throw 'process_owner_unverified'};
+  if (($o.Domain+'\\'+$o.User) -eq $me) {$_ | Select-Object ProcessId,ParentProcessId,CommandLine}
+}) | ConvertTo-Json -Compress`;
     const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 120000, maxBuffer: 4 * 1024 * 1024, windowsHide: true });
     if (result.status !== 0) throw processFailure("runtime_process_inspection_failed");
-    try { const value = JSON.parse(result.stdout || "[]"); return (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, parent: item.ParentProcessId, command: item.CommandLine ?? "" })); }
+    try { const value = JSON.parse(result.stdout.trim() || "[]"); return (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, parent: item.ParentProcessId, command: item.CommandLine ?? "" })); }
     catch { throw processFailure("runtime_process_inspection_failed"); }
   }
   const result = spawnSync("/bin/ps", ["-u", String(process.getuid()), "-o", "pid=,ppid=,command="], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
@@ -259,13 +300,15 @@ function processInventory() {
 }
 
 function runtimeExecutablesInUse(executables) {
-  const entries = processInventory();
+  const entries = processInventory({ executables });
   return new Set(executables.filter(executable => entries.some(entry =>
     entry.command.startsWith(executable + " ") || entry.command.startsWith('"' + executable + '" '))));
 }
 
 function snapshotRuntimeProcesses({ python, hostPid = null, birthOf, authorized = [], inventory = processInventory }) {
-  const executable = resolve(python), entries = inventory();
+  const executable = resolve(python), entries = inventory({
+    executables: [executable], roots: [hostPid, ...authorized.map(item => item.pid)].filter(Number.isSafeInteger), descendants: true,
+  });
   const children = new Map();
   for (const entry of entries) { const rows = children.get(entry.parent) ?? []; rows.push(entry); children.set(entry.parent, rows); }
   const selected = new Map(), queue = [];
@@ -326,9 +369,11 @@ const MAX_FILES = 200_000;
 const METADATA_DOWNLOAD_TIMEOUT_MS = 120_000;
 const RUNTIME_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
 export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
-export const HOST_START_TIMEOUT_MS = 60_000;
+// Windows cold starts re-hash the full installed Runtime tree before the Host
+// writes its connection; 60s was below measured verify_tree cost (~66s).
+export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.2.19";
+const BOOTSTRAP_PRODUCT_VERSION = "1.2.20";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -378,6 +423,21 @@ export function validateEnvironmentIsolation({ product, environmentName, marketp
     })) {
       fail("environment_state_mismatch", "local Runtime requires isolated Runtime and product state roots");
     }
+  }
+}
+
+// MAX_PATH is 260 WCHARs including the terminator. LoadLibrary still applies it
+// to extension modules with embedded manifests even when long paths are enabled,
+// so the budget is measured against the real file inventory, not a guess.
+const WINDOWS_MAX_PATH_CHARS = 259;
+
+export function validateWindowsReleasePathBudget(releaseRoot, manifest, platform = process.platform) {
+  if (platform !== "win32") return;
+  let deepest = 0;
+  for (const entry of manifest.payload.files) if (entry.path.length > deepest) deepest = entry.path.length;
+  const longest = releaseRoot.length + 1 + deepest;
+  if (longest > WINDOWS_MAX_PATH_CHARS) {
+    fail("runtime_path_too_long", `Windows Runtime path would reach ${longest} characters; choose a --runtime-home at least ${longest - WINDOWS_MAX_PATH_CHARS} characters shorter`);
   }
 }
 
@@ -1109,6 +1169,7 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
     mkdirSync(releases, { recursive: true, mode: 0o700 });
     await recoverRepairBackups(releases, trustedKeys, enforcePlatform);
     const final = join(releases, runtimeDirectory(manifest.runtime_id));
+    validateWindowsReleasePathBudget(final, manifest);
     const pointerPath = join(stateRoot, "current.json");
     let previous = null;
     if (existsSync(pointerPath)) {
@@ -1829,8 +1890,13 @@ function waitChild(child, milliseconds) {
   });
 }
 
-function cleanHostEnvironment() {
-  const allowed = new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL"]);
+export function cleanHostEnvironment() {
+  // Keep the account home available to Python's platform/path libraries while
+  // continuing to drop inherited Python paths, credentials and unrelated
+  // process state. Windows Python resolves Path.home() from USERPROFILE (or
+  // HOMEDRIVE/HOMEPATH); Unix builds use HOME.
+  const allowed = new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL",
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
   return {
     ...Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toUpperCase()))),
     PYTHONDONTWRITEBYTECODE: "1",

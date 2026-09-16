@@ -10,6 +10,10 @@ const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_RESOURCE_BYTES = 768 * 1024;
 const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
+// Keep the bridge budget above the 180s catalog-search owner budget so a
+// normal upstream timeout is reported by the owner instead of being masked by
+// the local transport. Other operations retain the same bounded bridge path.
+const MCP_FORWARD_TIMEOUT_MS = 210_000;
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const HOST_TOOL_NAMES = new Set([
@@ -468,7 +472,7 @@ async function forwardHost(request) {
 
 async function forward(connection, request) {
   const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), 120_000);
+  const deadline = setTimeout(() => controller.abort(), MCP_FORWARD_TIMEOUT_MS);
   try {
     const response = await fetch(connection.endpoint, {
       method: "POST",
@@ -623,7 +627,7 @@ async function runLifecycleProcess(args) {
   try {
     child = spawn(process.execPath, args, {
       detached: true, stdio: ["ignore", out, err], windowsHide: true,
-      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]).has(key.toUpperCase()))),
+      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]).has(key.toUpperCase()))),
     });
   } finally { closeSync(out); closeSync(err); }
   return new Promise((resolve, reject) => {
