@@ -35,7 +35,11 @@ Route one user outcome at a time:
 For chat recommendation, call the read-only `edgepilot_strategy_recommend` convenience
 tool with the user's structured questionnaire; it delegates to
 `catalog.strategy.recommend` in the Host. Do not replace recommendation with generic
-catalog search. For “open”, “start” or “launch EdgePilot”, ensure Runtime is ready, then
+catalog search. Use `edgepilot_strategy_search` directly for identity/keyword lookup and
+explicit hard filters, always preserving locale and every supported hard constraint. Use
+Recommendation V3 for subjective fit, filters plus preferences, or an incomplete quick-fit
+request; use V2 only for the confirmed seven-question onboarding. Disclose unsupported
+constraints and never merge repeated searches into a new owner ranking. For “open”, “start” or “launch EdgePilot”, ensure Runtime is ready, then
 call `edgepilot_dashboard_open`; return its loopback URL and never spawn a legacy Dashboard
 directly.
 

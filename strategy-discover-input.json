@@ -1,0 +1,188 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "cursor": {
+      "maxLength": 512,
+      "minLength": 1,
+      "type": "string"
+    },
+    "diversity": {
+      "default": "none",
+      "enum": [
+        "none",
+        "strategy_family"
+      ],
+      "type": "string"
+    },
+    "filters": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "data_type": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "directionality": {
+          "items": {
+            "enum": [
+              "long_only",
+              "long_short",
+              "market_neutral"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "max_drawdown_pct_lte": {
+          "maximum": 99.999,
+          "minimum": 0,
+          "type": "number"
+        },
+        "maximum_required_leverage_lte": {
+          "maximum": 125,
+          "minimum": 1,
+          "type": "number"
+        },
+        "min_capacity_usd": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "type": "number"
+        },
+        "profit_style": {
+          "items": {
+            "enum": [
+              "trend",
+              "reversal",
+              "relative_value"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "quote_asset": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "recommendable_only": {
+          "type": "boolean"
+        },
+        "risk_profile": {
+          "items": {
+            "enum": [
+              "conservative",
+              "balanced",
+              "aggressive"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "type": "array"
+        },
+        "shorting_required": {
+          "type": "boolean"
+        },
+        "strategy_family": {
+          "items": {
+            "enum": [
+              "breakout",
+              "pullback",
+              "momentum",
+              "mean_reversion",
+              "rotation",
+              "spread",
+              "market_neutral",
+              "dca",
+              "regime"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "timeframe": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "venue": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "limit": {
+      "default": 10,
+      "maximum": 25,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "locale": {
+      "enum": [
+        "en",
+        "ko",
+        "zh-CN",
+        "zh-TW"
+      ],
+      "type": "string"
+    },
+    "objective": {
+      "enum": [
+        "relevance",
+        "published",
+        "annualized_return",
+        "max_drawdown",
+        "sharpe"
+      ],
+      "type": "string"
+    },
+    "query": {
+      "maxLength": 256,
+      "type": "string"
+    }
+  },
+  "required": [
+    "locale",
+    "diversity",
+    "limit"
+  ],
+  "type": "object"
+}

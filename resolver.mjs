@@ -10,10 +10,8 @@ const MAX_MESSAGE_BYTES = 256 * 1024;
 const MAX_RESOURCE_BYTES = 768 * 1024;
 const MAX_BOOTSTRAP_BYTES = 2 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION = "2025-06-18";
-// Keep the bridge budget above the 180s catalog-search owner budget so a
-// normal upstream timeout is reported by the owner instead of being masked by
-// the local transport. Other operations retain the same bounded bridge path.
 const MCP_FORWARD_TIMEOUT_MS = 210_000;
+const SEARCH_FORWARD_TIMEOUT_MS = 4_000;
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const HOST_TOOL_NAMES = new Set([
@@ -27,6 +25,7 @@ const profile = process.argv[2];
 if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
 
 const root = dirname(fileURLToPath(import.meta.url));
+const DISCOVER_INPUT_SCHEMA = readDiscoverSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
 const delivery = readDelivery();
@@ -71,10 +70,11 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
-    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open"].includes(name))) {
+    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open"].includes(name))) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
+    if (name === "edgepilot_strategy_search") return resultResponse(id, await executeHostOperation("catalog.strategy.discover", searchArguments(argumentsValue), SEARCH_FORWARD_TIMEOUT_MS));
     if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", argumentsValue));
     if (name === "edgepilot_onboarding_open") {
       const locale = argumentsValue.locale;
@@ -223,6 +223,12 @@ function lifecycleTools(runtimeId = null) {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } });
   }
   tools.push({
+    name: "edgepilot_strategy_search", title: "Search Strategies",
+    description: "Discover profile-scoped strategies with multilingual relevance, strict filters, facets, and match explanations. Use recommendations for subjective fit questions.",
+    inputSchema: searchSchema(),
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  });
+  tools.push({
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
     description: "Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.",
     inputSchema: { type: "object", properties: { locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] } }, required: ["locale"], additionalProperties: false },
@@ -251,9 +257,23 @@ function lifecycleTools(runtimeId = null) {
 }
 
 function recommendationSchema() {
+  const locale = { enum: ["en", "ko", "zh-CN", "zh-TW"] };
+  const preferences = { type: "object", additionalProperties: false, minProperties: 1, properties: {
+    profit_style: { enum: ["trend", "reversal", "relative_value"] },
+    holding_period: { enum: ["intraday", "multi_day", "multi_week"] },
+    pain_point: { enum: ["loss_streak", "inactivity", "tail_loss"] },
+    max_drawdown_pct: { enum: [5, 15, 20] },
+    trading_mode: { enum: ["long_only_no_leverage", "long_short_low_leverage", "long_short_high_leverage"] },
+    universe: { enum: ["majors", "altcoins", "any"] },
+  } };
+  const filters = { type: "object", additionalProperties: false, minProperties: 1, properties: {
+    query: { type: "string", minLength: 1, maxLength: 200 }, asset: { type: "string", minLength: 1, maxLength: 64 },
+    venue: { type: "string", minLength: 1, maxLength: 64 }, category: { type: "string", minLength: 1, maxLength: 128 },
+    data_type: { type: "string", minLength: 1, maxLength: 64 }, risk_profile: { enum: ["conservative", "balanced", "aggressive"] },
+    min_capacity_usd: { type: "number", minimum: 0, maximum: 1_000_000_000_000 },
+  } };
   return {
-    type: "object",
-    properties: {
+    oneOf: [{ type: "object", additionalProperties: false, properties: {
       questionnaire_version: { const: "2.0" },
       profit_style: { enum: ["trend", "reversal", "relative_value"] },
       holding_period: { enum: ["intraday", "multi_day", "multi_week"] },
@@ -262,20 +282,40 @@ function recommendationSchema() {
       trading_mode: { enum: ["long_only_no_leverage", "long_short_low_leverage", "long_short_high_leverage"] },
       allocation_band: { enum: ["under_25k", "25k_100k", "over_100k"] },
       universe: { enum: ["majors", "altcoins", "any"] },
-      locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] },
-    },
-    required: ["questionnaire_version", "profit_style", "holding_period", "pain_point", "max_drawdown_pct", "trading_mode", "allocation_band", "universe", "locale"],
-    additionalProperties: false,
+      locale,
+    }, required: ["questionnaire_version", "profit_style", "holding_period", "pain_point", "max_drawdown_pct", "trading_mode", "allocation_band", "universe", "locale"] },
+    { type: "object", additionalProperties: false, properties: { questionnaire_version: { const: "3.0" }, locale, filters, preferences }, required: ["questionnaire_version", "locale"], anyOf: [{ required: ["filters"] }, { required: ["preferences"] }] }],
   };
 }
 
-async function executeHostOperation(operationId, argumentsValue) {
+function searchSchema() {
+  return DISCOVER_INPUT_SCHEMA;
+}
+
+function searchArguments(value) {
+  const allowed = new Set(Object.keys(searchSchema().properties));
+  if (Object.keys(value).some(key => !allowed.has(key))) throw new BridgeError("invalid_tool_call");
+  return { ...value, diversity: value.diversity ?? "none", limit: value.limit ?? 10 };
+}
+
+function readDiscoverSchema() {
+  let value;
+  try { value = JSON.parse(readFileSync(join(root, "strategy-discover-input.json"), "utf8")); }
+  catch { fatal("discover_contract_missing"); }
+  if (value?.type !== "object" || value.additionalProperties !== false || !Array.isArray(value.required)
+      || !value.required.includes("locale") || !value.required.includes("limit") || !value.required.includes("diversity")) {
+    fatal("discover_contract_invalid");
+  }
+  return Object.freeze(value);
+}
+
+async function executeHostOperation(operationId, argumentsValue, timeoutMs = MCP_FORWARD_TIMEOUT_MS) {
   const connection = await healthyConnection();
   if (connection === null) return toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true);
-  const get = await forward(connection, { jsonrpc: "2.0", id: "bridge-operation-get", method: "tools/call", params: { name: "edgepilot_tool_get", arguments: { operation_ids: [operationId], include_output_schema: false } } });
+  const get = await forward(connection, { jsonrpc: "2.0", id: "bridge-operation-get", method: "tools/call", params: { name: "edgepilot_tool_get", arguments: { operation_ids: [operationId], include_output_schema: false } } }, timeoutMs);
   const operation = get?.result?.structuredContent?.operations?.[0];
   if (operation?.id !== operationId || typeof operation.schema_revision !== "string") throw new BridgeError("operation_unavailable");
-  const execute = await forward(connection, { jsonrpc: "2.0", id: "bridge-operation-execute", method: "tools/call", params: { name: "edgepilot_tool_execute", arguments: { calls: [{ call_id: `bridge-${operationId.replaceAll(".", "-")}`, operation_id: operationId, schema_revision: operation.schema_revision, authority: "direct", arguments: argumentsValue }], presentation: "never" } } });
+  const execute = await forward(connection, { jsonrpc: "2.0", id: "bridge-operation-execute", method: "tools/call", params: { name: "edgepilot_tool_execute", arguments: { calls: [{ call_id: `bridge-${operationId.replaceAll(".", "-")}`, operation_id: operationId, schema_revision: operation.schema_revision, authority: "direct", arguments: argumentsValue }], presentation: "never" } } }, timeoutMs);
   if (execute?.error) throw new BridgeError(String(execute.error.message ?? "operation_failed"));
   return execute.result;
 }
@@ -470,9 +510,9 @@ async function forwardHost(request) {
   return forward(connection, request);
 }
 
-async function forward(connection, request) {
+async function forward(connection, request, timeoutMs = MCP_FORWARD_TIMEOUT_MS) {
   const controller = new AbortController();
-  const deadline = setTimeout(() => controller.abort(), MCP_FORWARD_TIMEOUT_MS);
+  const deadline = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(connection.endpoint, {
       method: "POST",
