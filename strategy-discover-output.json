@@ -1,0 +1,857 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "applied_filters": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "data_type": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "directionality": {
+          "items": {
+            "enum": [
+              "long_only",
+              "long_short",
+              "market_neutral"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "max_drawdown_pct_lte": {
+          "maximum": 99.999,
+          "minimum": 0,
+          "type": "number"
+        },
+        "maximum_required_leverage_lte": {
+          "maximum": 125,
+          "minimum": 1,
+          "type": "number"
+        },
+        "min_capacity_usd": {
+          "maximum": 1000000000000,
+          "minimum": 0,
+          "type": "number"
+        },
+        "profit_style": {
+          "items": {
+            "enum": [
+              "trend",
+              "reversal",
+              "relative_value"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "quote_asset": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "recommendable_only": {
+          "type": "boolean"
+        },
+        "risk_profile": {
+          "items": {
+            "enum": [
+              "conservative",
+              "balanced",
+              "aggressive"
+            ],
+            "type": "string"
+          },
+          "maxItems": 3,
+          "minItems": 1,
+          "type": "array"
+        },
+        "shorting_required": {
+          "type": "boolean"
+        },
+        "strategy_family": {
+          "items": {
+            "enum": [
+              "breakout",
+              "pullback",
+              "momentum",
+              "mean_reversion",
+              "rotation",
+              "spread",
+              "market_neutral",
+              "dca",
+              "regime"
+            ],
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "timeframe": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        },
+        "venue": {
+          "items": {
+            "maxLength": 64,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "candidate_count": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "catalog_generation": {
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer"
+    },
+    "contract_version": {
+      "const": "2.0",
+      "type": "string"
+    },
+    "degraded": {
+      "type": "boolean"
+    },
+    "facets": {
+      "additionalProperties": false,
+      "properties": {
+        "assets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "data_types": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "directionalities": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "profit_styles": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 16,
+          "type": "array"
+        },
+        "quote_assets": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        },
+        "risk_profiles": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 8,
+          "type": "array"
+        },
+        "strategy_families": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "timeframes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "venues": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "count": {
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "value": {
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "value",
+              "count"
+            ],
+            "type": "object"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "required": [
+        "assets",
+        "quote_assets",
+        "venues",
+        "data_types",
+        "timeframes",
+        "strategy_families",
+        "profit_styles",
+        "directionalities",
+        "risk_profiles"
+      ],
+      "type": "object"
+    },
+    "fallbacks": {
+      "items": {
+        "maxLength": 64,
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "has_more": {
+      "type": "boolean"
+    },
+    "needs_clarification": {
+      "items": {
+        "maxLength": 128,
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "next_cursor": {
+      "anyOf": [
+        {
+          "maxLength": 512,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "no_good_match": {
+      "type": "boolean"
+    },
+    "query_interpretation": {
+      "additionalProperties": false,
+      "properties": {
+        "concept_codes": {
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 32,
+          "type": "array"
+        },
+        "normalized_locale": {
+          "enum": [
+            "en",
+            "ko",
+            "zh-CN",
+            "zh-TW"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "normalized_locale",
+        "concept_codes"
+      ],
+      "type": "object"
+    },
+    "relaxed_filters": {
+      "items": {
+        "maxLength": 128,
+        "type": "string"
+      },
+      "maxItems": 16,
+      "type": "array"
+    },
+    "search_snapshot_id": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "snapshot_at": {
+      "type": "string"
+    },
+    "strategies": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "compatibility": {
+            "additionalProperties": false,
+            "properties": {
+              "assets": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "data_types": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "directionality": {
+                "anyOf": [
+                  {
+                    "maxLength": 64,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "profit_styles": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              "quote_assets": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              "required_leverage": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "risk_profile": {
+                "anyOf": [
+                  {
+                    "enum": [
+                      "conservative",
+                      "balanced",
+                      "aggressive"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "shorting_required": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "strategy_family": {
+                "anyOf": [
+                  {
+                    "maxLength": 64,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "timeframes": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 32,
+                "type": "array"
+              },
+              "venues": {
+                "items": {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              }
+            },
+            "required": [
+              "assets",
+              "quote_assets",
+              "venues",
+              "data_types",
+              "timeframes",
+              "strategy_family",
+              "profit_styles",
+              "directionality",
+              "risk_profile",
+              "required_leverage",
+              "shorting_required"
+            ],
+            "type": "object"
+          },
+          "content_locale": {
+            "enum": [
+              "en",
+              "ko",
+              "zh-CN",
+              "zh-TW"
+            ],
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "match_reasons": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "matched_fields": {
+            "items": {
+              "maxLength": 64,
+              "type": "string"
+            },
+            "maxItems": 16,
+            "type": "array"
+          },
+          "metrics": {
+            "additionalProperties": false,
+            "properties": {
+              "annualized_return_pct": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "capacity_usd": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "cumulative_return_pct": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "max_drawdown_pct": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "sharpe": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "cumulative_return_pct",
+              "annualized_return_pct",
+              "max_drawdown_pct",
+              "sharpe",
+              "capacity_usd"
+            ],
+            "type": "object"
+          },
+          "name": {
+            "maxLength": 255,
+            "type": "string"
+          },
+          "retrieval": {
+            "additionalProperties": false,
+            "properties": {
+              "dense_rank": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "exact_rank": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "fusion_rank": {
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "type": "integer"
+              },
+              "lexical_rank": {
+                "anyOf": [
+                  {
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "exact_rank",
+              "lexical_rank",
+              "dense_rank",
+              "fusion_rank"
+            ],
+            "type": "object"
+          },
+          "scores": {
+            "additionalProperties": false,
+            "properties": {
+              "dense": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "evidence_quality": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "lexical": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "operational_readiness": {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "relevance": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "relevance",
+              "lexical",
+              "dense",
+              "evidence_quality",
+              "operational_readiness"
+            ],
+            "type": "object"
+          },
+          "slug": {
+            "maxLength": 80,
+            "type": "string"
+          },
+          "summary": {
+            "maxLength": 1000,
+            "type": "string"
+          },
+          "version": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "warnings": {
+            "items": {
+              "maxLength": 128,
+              "type": "string"
+            },
+            "maxItems": 32,
+            "type": "array"
+          }
+        },
+        "required": [
+          "slug",
+          "version",
+          "content_sha256",
+          "name",
+          "summary",
+          "content_locale",
+          "matched_fields",
+          "match_reasons",
+          "retrieval",
+          "scores",
+          "metrics",
+          "compatibility",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "maxItems": 25,
+      "type": "array"
+    },
+    "unsupported_constraints": {
+      "items": {
+        "maxLength": 128,
+        "type": "string"
+      },
+      "maxItems": 32,
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract_version",
+    "catalog_generation",
+    "search_snapshot_id",
+    "snapshot_at",
+    "candidate_count",
+    "has_more",
+    "next_cursor",
+    "facets",
+    "query_interpretation",
+    "applied_filters",
+    "unsupported_constraints",
+    "needs_clarification",
+    "relaxed_filters",
+    "fallbacks",
+    "degraded",
+    "no_good_match",
+    "strategies"
+  ],
+  "type": "object"
+}

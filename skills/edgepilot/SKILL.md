@@ -32,14 +32,20 @@ Route one user outcome at a time:
 - use `presentation: "if_required"` normally and present only an execute-minted
   `result_ref`.
 
-For chat recommendation, call the read-only `edgepilot_strategy_recommend` convenience
-tool with the user's structured questionnaire; it delegates to
-`catalog.strategy.recommend` in the Host. Do not replace recommendation with generic
-catalog search. Use `edgepilot_strategy_search` directly for identity/keyword lookup and
-explicit hard filters, always preserving locale and every supported hard constraint. Use
-Recommendation V3 for subjective fit, filters plus preferences, or an incomplete quick-fit
-request; use V2 only for the confirmed seven-question onboarding. Disclose unsupported
-constraints and never merge repeated searches into a new owner ranking. For “open”, “start” or “launch EdgePilot”, ensure Runtime is ready, then
+Route every ordinary chat request for finding or recommending strategies through
+`edgepilot_strategy_search`, including identity/keyword lookup, explicit hard filters,
+subjective fit, mixed preferences, “recommend a low-risk strategy” and “find something for
+small capital”. Preserve the user's locale and every supported hard constraint; keep
+unsupported wishes in the natural-language query and disclose constraints the owner cannot
+apply. Never call `edgepilot_strategy_recommend` or discover/execute
+`catalog.strategy.recommend` for an ordinary chat request, and never create a V3
+questionnaire payload. Only an explicit request to open/start the questionnaire or strategy
+onboarding may enter the onboarding flow below. The onboarding App, or its explicitly
+requested textual fallback, submits the complete confirmed V2 questionnaire. Preserve the
+owner order and never merge repeated searches into a new owner ranking. If the user asks for an exact number of recommendations, send that number as
+`limit` (for example, `limit=1`, `limit=2` or `limit=3`); do not let the search tool default
+to ten results for a counted request. Use a larger explicit limit only when the user asks for
+options or multiple candidates. For “open”, “start” or “launch EdgePilot”, ensure Runtime is ready, then
 call `edgepilot_dashboard_open`; return its loopback URL and never spawn a legacy Dashboard
 directly.
 
@@ -68,8 +74,9 @@ requires all normal prepare/start confirmations and execution checks.
 
 ## First-use onboarding
 
-Run this flow only when the user selects a setup/recommendation starter prompt or explicitly
-asks for onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` or `zh-TW`).
+Run this flow only when the user selects an interactive-onboarding starter prompt or
+explicitly asks to open/start the questionnaire or onboarding. A plain request to find or
+recommend a strategy is not onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` or `zh-TW`).
 Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
 must go directly to that outcome and must not force the questionnaire.
 
@@ -120,7 +127,8 @@ must go directly to that outcome and must not force the questionnaire.
 5. After the last answer, use a separate assistant turn to summarize the selected values
    and ask only for explicit confirmation. Do not combine that confirmation request with
    another question and do not call recommendation before confirmation.
-6. In the textual fallback, call `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
+6. Only in this explicitly requested textual onboarding fallback, call the hidden App/fallback
+   handler `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
    confirmed values and the matching locale. Present exactly the three owner-ranked choices:
    best fit, relatively steadier and more aggressive, preserving versions, evidence,
    trade-offs and warnings.

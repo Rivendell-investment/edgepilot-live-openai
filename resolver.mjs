@@ -1,5 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { closeSync, openSync, existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -14,6 +14,7 @@ const MCP_FORWARD_TIMEOUT_MS = 210_000;
 const SEARCH_FORWARD_TIMEOUT_MS = 4_000;
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
+const searchResultsResourceUri = (runtimeId) => `ui://edgepilot/strategy-search-results-v1/${runtimeId.slice("sha256:".length)}.html`;
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
   "edgepilot_tool_search",
@@ -26,6 +27,7 @@ if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DISCOVER_INPUT_SCHEMA = readDiscoverSchema();
+const DISCOVER_OUTPUT_SCHEMA = readDiscoverOutputSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
 const delivery = readDelivery();
@@ -74,8 +76,8 @@ async function handleRequest(request) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
-    if (name === "edgepilot_strategy_search") return resultResponse(id, await executeHostOperation("catalog.strategy.discover", searchArguments(argumentsValue), SEARCH_FORWARD_TIMEOUT_MS));
-    if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", argumentsValue));
+    if (name === "edgepilot_strategy_search") return resultResponse(id, await executeStrategySearch(argumentsValue));
+    if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", recommendationArguments(argumentsValue)));
     if (name === "edgepilot_onboarding_open") {
       const locale = argumentsValue.locale;
       if (!new Set(["en", "ko", "zh-CN", "zh-TW"]).has(locale)) throw new BridgeError("invalid_locale");
@@ -86,8 +88,7 @@ async function handleRequest(request) {
       });
     }
     if (name === "edgepilot_dashboard_open") {
-      requireEmpty(argumentsValue);
-      return resultResponse(id, await executeHostOperation("dashboard.open", {}));
+      return resultResponse(id, await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue)));
     }
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
@@ -104,6 +105,8 @@ async function handleRequest(request) {
     return forward(connection, request);
   }
   if (request.method === "resources/read") {
+    const local = readSearchResultsResource(request.params?.uri);
+    if (local !== null) return resultResponse(id, { contents: [local] });
     if ((await runtimeStatus()).state !== "ready") return errorResponse(id, -32001, "runtime_not_ready");
     const connection = await healthyConnection();
     if (connection === null) return errorResponse(id, -32001, "runtime_not_ready");
@@ -224,9 +227,16 @@ function lifecycleTools(runtimeId = null) {
   }
   tools.push({
     name: "edgepilot_strategy_search", title: "Search Strategies",
-    description: "Discover profile-scoped strategies with multilingual relevance, strict filters, facets, and match explanations. Use recommendations for subjective fit questions.",
+    description: "Search profile-scoped strategies for ordinary chat requests with multilingual relevance, strict filters, facets, and match explanations. When the user asks for an exact number of recommendations, pass that number as limit (for example 1, 2, or 3) so the conversation and App show the same count. Use a larger limit only when the user asks for options or multiple candidates. Open onboarding only when the user explicitly asks for the questionnaire.",
     inputSchema: searchSchema(),
+    outputSchema: searchOutputSchema(),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    ...(runtimeId === null ? {} : {
+      _meta: {
+        ui: { resourceUri: searchResultsResourceUri(runtimeId) },
+        "openai/outputTemplate": searchResultsResourceUri(runtimeId),
+      },
+    }),
   });
   tools.push({
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
@@ -242,15 +252,9 @@ function lifecycleTools(runtimeId = null) {
     }),
   });
   tools.push({
-    name: "edgepilot_strategy_recommend", title: "Recommend Strategies",
-    description: "Return profile-scoped strategy recommendations from the Runtime owner.",
-    inputSchema: recommendationSchema(),
-    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-  });
-  tools.push({
     name: "edgepilot_dashboard_open", title: "Open Dashboard",
-    description: "Start or reuse the Host-owned profile Dashboard and return its loopback URL.",
-    inputSchema: emptyInput,
+    description: "Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.",
+    inputSchema: dashboardSchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   });
   return tools;
@@ -258,38 +262,82 @@ function lifecycleTools(runtimeId = null) {
 
 function recommendationSchema() {
   const locale = { enum: ["en", "ko", "zh-CN", "zh-TW"] };
-  const preferences = { type: "object", additionalProperties: false, minProperties: 1, properties: {
+  return { type: "object", additionalProperties: false, properties: {
+    questionnaire_version: { const: "2.0" },
     profit_style: { enum: ["trend", "reversal", "relative_value"] },
     holding_period: { enum: ["intraday", "multi_day", "multi_week"] },
     pain_point: { enum: ["loss_streak", "inactivity", "tail_loss"] },
     max_drawdown_pct: { enum: [5, 15, 20] },
     trading_mode: { enum: ["long_only_no_leverage", "long_short_low_leverage", "long_short_high_leverage"] },
+    allocation_band: { enum: ["under_25k", "25k_100k", "over_100k"] },
     universe: { enum: ["majors", "altcoins", "any"] },
-  } };
-  const filters = { type: "object", additionalProperties: false, minProperties: 1, properties: {
-    query: { type: "string", minLength: 1, maxLength: 200 }, asset: { type: "string", minLength: 1, maxLength: 64 },
-    venue: { type: "string", minLength: 1, maxLength: 64 }, category: { type: "string", minLength: 1, maxLength: 128 },
-    data_type: { type: "string", minLength: 1, maxLength: 64 }, risk_profile: { enum: ["conservative", "balanced", "aggressive"] },
-    min_capacity_usd: { type: "number", minimum: 0, maximum: 1_000_000_000_000 },
-  } };
+    locale,
+  }, required: ["questionnaire_version", "profit_style", "holding_period", "pain_point", "max_drawdown_pct", "trading_mode", "allocation_band", "universe", "locale"] };
+}
+
+function dashboardTargetSchema() {
   return {
-    oneOf: [{ type: "object", additionalProperties: false, properties: {
-      questionnaire_version: { const: "2.0" },
-      profit_style: { enum: ["trend", "reversal", "relative_value"] },
-      holding_period: { enum: ["intraday", "multi_day", "multi_week"] },
-      pain_point: { enum: ["loss_streak", "inactivity", "tail_loss"] },
-      max_drawdown_pct: { enum: [5, 15, 20] },
-      trading_mode: { enum: ["long_only_no_leverage", "long_short_low_leverage", "long_short_high_leverage"] },
-      allocation_band: { enum: ["under_25k", "25k_100k", "over_100k"] },
-      universe: { enum: ["majors", "altcoins", "any"] },
-      locale,
-    }, required: ["questionnaire_version", "profit_style", "holding_period", "pain_point", "max_drawdown_pct", "trading_mode", "allocation_band", "universe", "locale"] },
-    { type: "object", additionalProperties: false, properties: { questionnaire_version: { const: "3.0" }, locale, filters, preferences }, required: ["questionnaire_version", "locale"], anyOf: [{ required: ["filters"] }, { required: ["preferences"] }] }],
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      kind: { const: "strategy" },
+      slug: { type: "string", pattern: "^[a-z0-9]+(?:-[a-z0-9]+)*$", maxLength: 80 },
+      version: { type: "string", pattern: "^(0|[1-9]\\d*)\\.(0|[1-9]\\d*)\\.(0|[1-9]\\d*)(?:-((?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9]\\d*|\\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\\+([0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*))?$", maxLength: 64 },
+      content_sha256: { type: "string", pattern: "^[0-9a-f]{64}$" },
+    },
+    required: ["kind", "slug", "version", "content_sha256"],
   };
+}
+
+function dashboardSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: { target: dashboardTargetSchema() },
+    required: [],
+  };
+}
+
+function dashboardArguments(value) {
+  if (Object.keys(value).length === 0) return {};
+  if (Object.keys(value).sort().join(",") !== "target" || value.target === null
+      || typeof value.target !== "object" || Array.isArray(value.target)) throw new BridgeError("invalid_tool_call");
+  const target = value.target;
+  if (Object.keys(target).sort().join(",") !== "content_sha256,kind,slug,version"
+      || target.kind !== "strategy" || typeof target.slug !== "string"
+      || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(target.slug) || target.slug.length > 80
+      || typeof target.version !== "string" || target.version.length > 64
+      || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.test(target.version)
+      || typeof target.content_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(target.content_sha256)) throw new BridgeError("invalid_tool_call");
+  return { target: { ...target } };
+}
+
+function recommendationArguments(value) {
+  const schema = recommendationSchema();
+  if (Object.keys(value).sort().join(",") !== [...schema.required].sort().join(",")) throw new BridgeError("invalid_tool_call");
+  for (const [key, property] of Object.entries(schema.properties)) {
+    if (Object.hasOwn(property, "const") && value[key] !== property.const) throw new BridgeError("invalid_tool_call");
+    if (Array.isArray(property.enum) && !property.enum.includes(value[key])) throw new BridgeError("invalid_tool_call");
+  }
+  return { ...value };
 }
 
 function searchSchema() {
   return DISCOVER_INPUT_SCHEMA;
+}
+
+function searchOutputSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      schema: { const: "edgepilot-strategy-search-results-v1" },
+      profile: { enum: ["live", "research"] },
+      request: DISCOVER_INPUT_SCHEMA,
+      result: DISCOVER_OUTPUT_SCHEMA,
+    },
+    required: ["schema", "profile", "request", "result"],
+  };
 }
 
 function searchArguments(value) {
@@ -307,6 +355,168 @@ function readDiscoverSchema() {
     fatal("discover_contract_invalid");
   }
   return Object.freeze(value);
+}
+
+function readDiscoverOutputSchema() {
+  let value;
+  try { value = JSON.parse(readFileSync(join(root, "strategy-discover-output.json"), "utf8")); }
+  catch { fatal("discover_contract_missing"); }
+  if (value?.type !== "object" || value.additionalProperties !== false || !Array.isArray(value.required)
+      || !value.required.includes("strategies") || value.properties?.contract_version?.const !== "2.0") {
+    fatal("discover_contract_invalid");
+  }
+  return Object.freeze(value);
+}
+
+async function executeStrategySearch(value) {
+  const request = searchArguments(value);
+  const result = await executeHostOperation("catalog.strategy.discover", request, SEARCH_FORWARD_TIMEOUT_MS);
+  if (result?.isError === true) return result;
+  const outcomes = result?.structuredContent?.outcomes;
+  const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
+  const output = outcome?.output;
+  if (outcome?.operation_id !== "catalog.strategy.discover" || outcome?.status !== "completed"
+      || output === null || typeof output !== "object" || Array.isArray(output)
+      || output.contract_version !== "2.0" || !Array.isArray(output.strategies)) {
+    return toolResult({ schema: "edgepilot-strategy-search-failure-v1", profile, code: "search_result_invalid" }, true);
+  }
+  const payload = { schema: "edgepilot-strategy-search-results-v1", profile, request, result: output };
+  return {
+    content: [{ type: "text", text: searchFallback(payload) }],
+    structuredContent: payload,
+  };
+}
+
+function searchFallback(payload) {
+  const strategies = Number.isInteger(payload.request.limit)
+    ? payload.result.strategies.slice(0, payload.request.limit)
+    : payload.result.strategies;
+  const count = strategies.length;
+  const prefix = payload.request.locale === "zh-CN" ? `已准备 ${count} 个搜索结果`
+    : payload.request.locale === "zh-TW" ? `已準備 ${count} 個搜尋結果`
+      : payload.request.locale === "ko" ? `${count}개의 검색 결과가 준비되었습니다`
+        : `${count} search results are ready`;
+  const identities = strategies
+    .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})`)
+    .join(", ");
+  const concepts = payload.result.query_interpretation?.concept_codes ?? [];
+  const filters = Object.entries(payload.result.applied_filters ?? {})
+    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(",") : String(value)}`)
+    .join(", ");
+  const notes = [...(payload.result.needs_clarification ?? []), ...(payload.result.unsupported_constraints ?? []), ...(payload.result.relaxed_filters ?? [])];
+  const interpretation = [
+    concepts.length > 0 ? `interpreted as ${concepts.join(", ")}` : "",
+    filters ? `filters ${filters}` : "",
+    notes.length > 0 ? `notes ${notes.join("; ")}` : "",
+  ].filter(Boolean).join("; ");
+  return `${prefix}${identities ? `: ${identities}` : ""}${interpretation ? `. ${interpretation}` : ""}. Use the interactive strategy result cards to open a strategy in Dashboard.`;
+}
+
+// 只读搜索卡必须绑定请求中的精确 Runtime release，但不应被 Host 会话准入状态阻断。
+function readSearchResultsResource(uri) {
+  if (typeof uri !== "string") return null;
+  const match = /^ui:\/\/edgepilot\/strategy-search-results-v1\/([0-9a-f]{64})\.html$/.exec(uri);
+  if (match === null) return null;
+  const runtimeId = `sha256:${match[1]}`;
+  const runtimeRoot = join(runtimeHome, "runtime");
+  const releasesRoot = join(runtimeRoot, "releases");
+  const release = join(runtimeHome, "runtime", "releases", match[1]);
+  const appsRoot = join(release, "apps");
+  const appRoot = join(release, "apps", "mcp-app");
+  const path = join(appRoot, "search-results.html");
+  try {
+    const runtimeMetadata = lstatSync(runtimeRoot);
+    const releasesMetadata = lstatSync(releasesRoot);
+    const releaseMetadata = lstatSync(release);
+    const appsMetadata = lstatSync(appsRoot);
+    const appMetadata = lstatSync(appRoot);
+    const manifestPath = join(release, "RUNTIME.json");
+    const manifestMetadata = lstatSync(manifestPath);
+    const metadata = lstatSync(path);
+    if (!runtimeMetadata.isDirectory() || runtimeMetadata.isSymbolicLink()
+        || !releasesMetadata.isDirectory() || releasesMetadata.isSymbolicLink()
+        || !releaseMetadata.isDirectory() || releaseMetadata.isSymbolicLink()
+        || !appsMetadata.isDirectory() || appsMetadata.isSymbolicLink()
+        || !appMetadata.isDirectory() || appMetadata.isSymbolicLink()
+        || !manifestMetadata.isFile() || manifestMetadata.isSymbolicLink() || manifestMetadata.size > 256 * 1024
+        || !metadata.isFile() || metadata.isSymbolicLink() || metadata.size > MAX_RESOURCE_BYTES) return null;
+    const manifestBytes = readBoundedRegularFile(manifestPath, 256 * 1024);
+    if (manifestBytes === null) return null;
+    const manifest = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifestBytes));
+    const runtime = {
+      releaseVersion: manifest?.payload?.release_version,
+      contractVersion: manifest?.payload?.contract_version,
+    };
+    if (manifest?.runtime_id !== runtimeId || !Array.isArray(manifest?.payload?.profiles)
+        || !manifest.payload.profiles.includes(profile) || runtimePayloadDigest(manifest.payload) !== runtimeId
+        || typeof runtime.releaseVersion !== "string"
+        || !Number.isInteger(runtime.contractVersion?.major) || !Number.isInteger(runtime.contractVersion?.minor)
+        || !supportsRuntimeContract(runtime.contractVersion) || !matchesRelease(runtimeId, runtime)) return null;
+    const entries = manifest.payload.files;
+    const expected = Array.isArray(entries)
+      ? entries.filter(entry => entry?.path === "apps/mcp-app/search-results.html")
+      : [];
+    if (expected.length !== 1 || expected[0].kind !== "file" || expected[0].executable !== false
+        || expected[0].size !== metadata.size || !/^sha256:[0-9a-f]{64}$/.test(expected[0].sha256)) return null;
+    const bytes = readBoundedRegularFile(path, MAX_RESOURCE_BYTES);
+    if (bytes === null || bytes.length !== metadata.size) return null;
+    if (`sha256:${createHash("sha256").update(bytes).digest("hex")}` !== expected[0].sha256) return null;
+    const port = process.env[profile === "live" ? "EDGEPILOT_LIVE_DASHBOARD_PORT" : "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]
+      ?? (profile === "live" ? "8787" : "8686");
+    if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) return null;
+    const origin = `http://127.0.0.1:${port}`;
+    return {
+      uri,
+      mimeType: "text/html;profile=mcp-app",
+      text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      _meta: {
+        ui: {
+          prefersBorder: true,
+          csp: { connectDomains: [], resourceDomains: [] },
+        },
+        "openai/widgetPrefersBorder": true,
+        "openai/widgetCSP": {
+          connect_domains: [],
+          resource_domains: [],
+          redirect_domains: [origin],
+        },
+      },
+    };
+  } catch { return null; }
+}
+
+function readBoundedRegularFile(path, maximumBytes) {
+  let descriptor;
+  try {
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const metadata = fstatSync(descriptor);
+    if (!metadata.isFile() || metadata.size > maximumBytes) return null;
+    const bytes = Buffer.alloc(metadata.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(descriptor, bytes, offset, bytes.length - offset, offset);
+      if (count === 0) return null;
+      offset += count;
+    }
+    return bytes;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
+  }
+}
+
+function runtimePayloadDigest(payload) {
+  const canonical = value => {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+    if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+    if (value !== null && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+      return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`;
+    }
+    throw new TypeError("runtime manifest payload is not canonical JSON");
+  };
+  return `sha256:${createHash("sha256").update(canonical(payload)).digest("hex")}`;
 }
 
 async function executeHostOperation(operationId, argumentsValue, timeoutMs = MCP_FORWARD_TIMEOUT_MS) {
