@@ -227,7 +227,7 @@ function lifecycleTools(runtimeId = null) {
   }
   tools.push({
     name: "edgepilot_strategy_search", title: "Search Strategies",
-    description: "Search profile-scoped strategies for ordinary chat requests with multilingual relevance, strict filters, facets, and match explanations. When the user asks for an exact number of recommendations, pass that number as limit (for example 1, 2, or 3) so the conversation and App show the same count. Use a larger limit only when the user asks for options or multiple candidates. Open onboarding only when the user explicitly asks for the questionnaire.",
+    description: `Search profile-scoped strategies for ordinary chat requests with multilingual relevance, strict filters, facets, and match explanations. When the user asks for an exact number of recommendations, pass that number as limit (for example 1, 2, or 3) so the conversation and App show the same count. Use a larger limit only when the user asks for options or multiple candidates. ${profile === "live" ? "For a Live plugin mention with no other message content, open Dashboard and onboarding; do not search." : "Open onboarding only when the user explicitly asks for the questionnaire."}`,
     inputSchema: searchSchema(),
     outputSchema: searchOutputSchema(),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -240,7 +240,7 @@ function lifecycleTools(runtimeId = null) {
   });
   tools.push({
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
-    description: "Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.",
+    description: `Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.${profile === "live" ? " A Live plugin mention with no other message content requests this onboarding after Dashboard opens." : ""}`,
     inputSchema: { type: "object", properties: { locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] } }, required: ["locale"], additionalProperties: false },
     outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" } }, required: ["schema", "profile", "locale", "questionnaire_version"], additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

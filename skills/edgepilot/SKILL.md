@@ -74,9 +74,14 @@ requires all normal prepare/start confirmations and execution checks.
 
 ## First-use onboarding
 
-Run this flow only when the user selects an interactive-onboarding starter prompt or
-explicitly asks to open/start the questionnaire or onboarding. A plain request to find or
-recommend a strategy is not onboarding. Reply in the user's current language (`en`, `ko`, `zh-CN` or `zh-TW`).
+Run this flow when the user's entire message is only an EdgePilot Live plugin mention
+(apart from whitespace), when the user selects an interactive-onboarding starter prompt,
+or when the user explicitly asks to open/start the questionnaire or onboarding. Treat a
+mention-only message as a request to launch the Dashboard and interactive onboarding;
+do not reply with a generic menu or ask what the user wants to do. A plain request to find
+or recommend a strategy is not onboarding. Reply in the user's current language (`en`,
+`ko`, `zh-CN` or `zh-TW`); if the mention-only message gives no language signal, use the
+conversation's language, then the host locale, and otherwise English.
 Ordinary requests such as opening the Dashboard, checking a run or searching the catalog
 must go directly to that outcome and must not force the questionnaire.
 
