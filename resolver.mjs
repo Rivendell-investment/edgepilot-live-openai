@@ -362,7 +362,7 @@ function readDiscoverOutputSchema() {
   try { value = JSON.parse(readFileSync(join(root, "strategy-discover-output.json"), "utf8")); }
   catch { fatal("discover_contract_missing"); }
   if (value?.type !== "object" || value.additionalProperties !== false || !Array.isArray(value.required)
-      || !value.required.includes("strategies") || value.properties?.contract_version?.const !== "2.0") {
+      || !value.required.includes("strategies") || value.properties?.contract_version?.const !== "2.1") {
     fatal("discover_contract_invalid");
   }
   return Object.freeze(value);
@@ -377,7 +377,7 @@ async function executeStrategySearch(value) {
   const output = outcome?.output;
   if (outcome?.operation_id !== "catalog.strategy.discover" || outcome?.status !== "completed"
       || output === null || typeof output !== "object" || Array.isArray(output)
-      || output.contract_version !== "2.0" || !Array.isArray(output.strategies)) {
+      || output.contract_version !== "2.1" || !Array.isArray(output.strategies)) {
     return toolResult({ schema: "edgepilot-strategy-search-failure-v1", profile, code: "search_result_invalid" }, true);
   }
   const payload = { schema: "edgepilot-strategy-search-results-v1", profile, request, result: output };
@@ -399,17 +399,8 @@ function searchFallback(payload) {
   const identities = strategies
     .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})`)
     .join(", ");
-  const concepts = payload.result.query_interpretation?.concept_codes ?? [];
-  const filters = Object.entries(payload.result.applied_filters ?? {})
-    .map(([key, value]) => `${key}=${Array.isArray(value) ? value.join(",") : String(value)}`)
-    .join(", ");
   const notes = [...(payload.result.needs_clarification ?? []), ...(payload.result.unsupported_constraints ?? []), ...(payload.result.relaxed_filters ?? [])];
-  const interpretation = [
-    concepts.length > 0 ? `interpreted as ${concepts.join(", ")}` : "",
-    filters ? `filters ${filters}` : "",
-    notes.length > 0 ? `notes ${notes.join("; ")}` : "",
-  ].filter(Boolean).join("; ");
-  return `${prefix}${identities ? `: ${identities}` : ""}${interpretation ? `. ${interpretation}` : ""}. Use the interactive strategy result cards to open a strategy in Dashboard.`;
+  return `${prefix}${identities ? `: ${identities}` : ""}${notes.length ? `. Notes: ${notes.join("; ")}` : ""}. Use the interactive strategy result cards to open a strategy in Dashboard.`;
 }
 
 // 只读搜索卡必须绑定请求中的精确 Runtime release，但不应被 Host 会话准入状态阻断。
@@ -867,6 +858,20 @@ function configuredBootstrapPath() {
   return join(root, "bootstrap.mjs");
 }
 
+function lifecycleProcessEnvironment() {
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "EDGEPILOT_PROXY_URL", "EDGEPILOT_PROXY_MODE"]).has(key.toUpperCase())));
+  const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
+  if (names.length === 0) environment.NO_PROXY = "127.0.0.1";
+  else for (const name of names) {
+    const raw = String(environment[name] ?? "");
+    const tokens = raw.split(",").map((item) => item.trim()).filter(Boolean);
+    if (!tokens.some((item) => item.toLowerCase() === "127.0.0.1")) {
+      environment[name] = ["127.0.0.1", ...tokens].join(",");
+    }
+  }
+  return environment;
+}
+
 async function runLifecycleProcess(args) {
   const logs = join(runtimeHome, "runtime", "logs");
   mkdirSync(logs, { recursive: true, mode: 0o700 });
@@ -877,7 +882,7 @@ async function runLifecycleProcess(args) {
   try {
     child = spawn(process.execPath, args, {
       detached: true, stdio: ["ignore", out, err], windowsHide: true,
-      env: Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]).has(key.toUpperCase()))),
+      env: lifecycleProcessEnvironment(),
     });
   } finally { closeSync(out); closeSync(err); }
   return new Promise((resolve, reject) => {

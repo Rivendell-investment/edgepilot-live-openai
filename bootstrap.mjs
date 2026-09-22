@@ -373,7 +373,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.0";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.3";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -1890,15 +1890,38 @@ function waitChild(child, milliseconds) {
   });
 }
 
+function ensureLoopbackNoProxy(environment) {
+  const result = { ...environment };
+  const names = Object.keys(result).filter((key) => key.toUpperCase() === "NO_PROXY");
+  if (names.length === 0) {
+    result.NO_PROXY = "127.0.0.1";
+    return result;
+  }
+  for (const name of names) {
+    const raw = String(result[name] ?? "");
+    const tokens = raw.split(",").map((item) => item.trim()).filter(Boolean);
+    if (!tokens.some((item) => item.toLowerCase() === "127.0.0.1")) {
+      result[name] = ["127.0.0.1", ...tokens].join(",");
+    }
+  }
+  return result;
+}
+
 export function cleanHostEnvironment() {
   // Keep the account home available to Python's platform/path libraries while
   // continuing to drop inherited Python paths, credentials and unrelated
   // process state. Windows Python resolves Path.home() from USERPROFILE (or
-  // HOMEDRIVE/HOMEPATH); Unix builds use HOME.
+  // HOMEDRIVE/HOMEPATH); Unix builds use HOME. USERPROFILE is not the user
+  // environment: spawn({env}) replaces inheritance, so proxy variables must
+  // be allowlisted or backtests cannot reach venue HTTP endpoints. Forwarded
+  // HTTP(S)_PROXY would otherwise send Host/Dashboard loopback traffic through
+  // the proxy, so NO_PROXY always contains 127.0.0.1.
   const allowed = new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL",
-    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH"]);
+    "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "EDGEPILOT_PROXY_URL", "EDGEPILOT_PROXY_MODE"]);
   return {
-    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toUpperCase()))),
+    ...ensureLoopbackNoProxy(Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key.toUpperCase())))),
     PYTHONDONTWRITEBYTECODE: "1",
     PYTHONNOUSERSITE: "1",
     PYTHONUTF8: "1",
