@@ -373,7 +373,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.5";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.6";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
