@@ -128,9 +128,9 @@ function selectionCovers(selection, { processes, jobs }) {
     && jobs.every(item => selection.jobs.some(old => old.job_ref === item.job_ref && old.runtime_id === item.runtime_id));
 }
 
-async function runLiveMaintenance({ python, liveStateRoot, runtimeId, operation = "inspect", jobRef, accountRef, idempotencyKey, registrationHome, evidenceDigest, acknowledgement, env }) {
+async function runLiveMaintenance({ python, liveStateRoot, runtimeId, operation = "inspect", jobRef, accountRef, idempotencyKey, env }) {
   const args = ["-I", "-B", "-m", "edgepilot.runtime_maintenance", operation, "--state-root", liveStateRoot, "--runtime-id", runtimeId];
-  for (const [name, value] of [["job-ref", jobRef], ["account-ref", accountRef], ["idempotency-key", idempotencyKey], ["registration-home", registrationHome], ["evidence-digest", evidenceDigest], ["acknowledgement", acknowledgement]]) {
+  for (const [name, value] of [["job-ref", jobRef], ["account-ref", accountRef], ["idempotency-key", idempotencyKey]]) {
     if (value !== undefined) args.push(`--${name}`, value);
   }
   return new Promise((resolve, reject) => {
@@ -161,23 +161,11 @@ return { LifecycleTransaction, readLifecycleState, writeLifecycleState, runLiveM
 import * as __edgepilot_processes_dependency_0 from "node:child_process";
 import * as __edgepilot_processes_dependency_1 from "node:path";
 const { snapshotRuntimeProcesses, stopAuthorizedProcesses, runtimeExecutablesInUse } = (() => {
-// Retire only service processes executing the verified old Runtime interpreter.
+// Inventory and stop processes running a verified Runtime interpreter.
 const { spawnSync } = __edgepilot_processes_dependency_0;
 const { resolve, join } = __edgepilot_processes_dependency_1;
 
 function processFailure(code) { return Object.assign(new Error(code), { code }); }
-
-function logProcessInspectionFailure(stage, result) {
-  console.error(JSON.stringify({
-    diagnostic: "runtime_process_inspection",
-    stage,
-    status: result.status,
-    signal: result.signal,
-    error: result.error?.message ?? null,
-    stderr: String(result.stderr ?? "").slice(0, 2000),
-    stdout: String(result.stdout ?? "").slice(0, 2000),
-  }));
-}
 
 function classifyRuntimeCommand(executable, command) {
   const prefixes = [executable + " ", '"' + executable + '" '];
@@ -186,71 +174,10 @@ function classifyRuntimeCommand(executable, command) {
   const args = command.slice(prefix.length);
   if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot_runtime_host\.host_main(?:\s|$)/u.test(args)) return "host";
   if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot_worker\.worker_main(?:\s|$)/u.test(args)) return "worker";
-  if (/^(?:-(?:I|B|u)\s+)*-c\s+["']?from (?:edgepilot\.dashboard\.http import _serve_unmanaged_for_test|edgepilot_research\.ui import serve)(?:\s|;|$)/u.test(args)) return "dashboard";
+  // Runtimes installed before the Live entry was renamed still run `_serve_unmanaged_for_test`;
+  // upgrades must recognize their Dashboards to stop them.
+  if (/^(?:-(?:I|B|u)\s+)*-c\s+["']?from (?:edgepilot\.dashboard\.http import (?:serve|_serve_unmanaged_for_test)|edgepilot_research\.ui import serve)(?:\s|;|$)/u.test(args)) return "dashboard";
   return null;
-}
-
-function runtimeProcesses(python) {
-  const executable = resolve(python);
-  let entries;
-  if (process.platform === "win32") {
-    const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const quoted = executable.replaceAll("'", "''");
-    const script = `@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {$_.ExecutablePath -eq '${quoted}'} | Select-Object ProcessId,CommandLine) | ConvertTo-Json -Compress`;
-    const result = spawnSync(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], { encoding: "utf8", timeout: 5000, maxBuffer: 1024 * 1024, windowsHide: true });
-    if (result.status !== 0) { logProcessInspectionFailure("process_inventory", result); throw processFailure("runtime_process_inspection_failed"); }
-    try {
-      const value = result.stdout.trim() ? JSON.parse(result.stdout) : [];
-      entries = (Array.isArray(value) ? value : [value]).map(item => ({ pid: item.ProcessId, command: item.CommandLine }));
-    } catch { throw processFailure("runtime_process_inspection_failed"); }
-  } else {
-    const result = spawnSync("/bin/ps", ["-u", String(process.getuid()), "-o", "pid=,command="], { encoding: "utf8", timeout: 3000, maxBuffer: 4 * 1024 * 1024 });
-    if (result.status !== 0) { logProcessInspectionFailure("runtime_processes", result); throw processFailure("runtime_process_inspection_failed"); }
-    entries = result.stdout.split("\n").flatMap(line => {
-      const match = /^\s*(\d+)\s+(.+)$/u.exec(line);
-      if (!match) return [];
-      const command = match[2];
-      return command.startsWith(executable + " ") || command.startsWith('"' + executable + '" ') ? [{ pid: Number(match[1]), command }] : [];
-    });
-  }
-  return entries.map(item => {
-    if (!Number.isSafeInteger(item.pid) || item.pid <= 0 || typeof item.command !== "string") throw processFailure("runtime_process_identity_unverified");
-    const role = classifyRuntimeCommand(executable, item.command);
-    return { pid: item.pid, service: role !== null, role };
-  });
-}
-
-async function retireRuntimeProcesses({ python, birthOf, allowForce = false, allowInUse = false, role = null }) {
-  const snapshot = runtimeProcesses(python);
-  if (!allowInUse && snapshot.some(item => !item.service)) throw processFailure("runtime_process_in_use");
-  const selected = snapshot.filter(item => item.service && (role === null || item.role === role));
-  for (const item of selected) {
-    if (item.pid === process.pid) throw processFailure("runtime_process_identity_unverified");
-    const exists = () => {
-      try { process.kill(item.pid, 0); return true; }
-      catch (error) { if (error.code === "ESRCH") return false; throw processFailure("runtime_process_identity_unverified"); }
-    };
-    if (!exists()) continue; // Parent retirement can already have reaped its children.
-    const birth = birthOf(item.pid);
-    if (birth === null) { if (!exists()) continue; throw processFailure("runtime_process_identity_unverified"); }
-    const remains = () => {
-      if (!exists()) return false;
-      const current = birthOf(item.pid);
-      if (current === null) { if (!exists()) return false; throw processFailure("runtime_process_identity_unverified"); }
-      return current === birth;
-    };
-    if (!remains()) continue;
-    try { process.kill(item.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw processFailure("host_stop_failed"); }
-    const deadline = Date.now() + 5000;
-    while (remains() && Date.now() < deadline) await new Promise(accept => setTimeout(accept, 50));
-    if (remains() && allowForce) process.kill(item.pid, "SIGKILL");
-    const forcedDeadline = Date.now() + 2000;
-    while (remains() && Date.now() < forcedDeadline) await new Promise(accept => setTimeout(accept, 50));
-    if (remains()) throw processFailure("host_stop_failed");
-  }
-  const remaining = runtimeProcesses(python);
-  if (remaining.some(item => (item.service && (role === null || item.role === role)) || (!allowInUse && !item.service))) throw processFailure("runtime_process_in_use");
-  return { retired: selected.length };
 }
 
 function processInventory({ executables = [], roots = [], descendants = false } = {}) {
@@ -373,7 +300,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.6";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.7";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -1278,7 +1205,7 @@ export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product
 }
 
 async function inspectPreparedJobs(prepared, liveStateRoot, operation = "reconcile", options = {}) {
-  if (operation !== "retire-legacy" && !existsSync(join(liveStateRoot, "runtime-live-process-jobs"))) return { schema: "edgepilot-live-maintenance-v1", jobs: [], pinned_runtime_ids: [] };
+  if (!existsSync(join(liveStateRoot, "runtime-live-process-jobs"))) return { schema: "edgepilot-live-maintenance-v1", jobs: [], pinned_runtime_ids: [] };
   return runLiveMaintenance({ python: safeDestination(prepared.runtimeRoot, prepared.manifest.payload.python.executable), liveStateRoot,
     runtimeId: prepared.manifest.runtime_id, operation, env: cleanHostEnvironment(), ...options });
 }
@@ -1686,10 +1613,6 @@ async function runtimeById(stateRoot, runtimeId, trustedKeys) {
   return { root, manifest };
 }
 
-export async function activatePreviousRuntime() {
-  fail("runtime_rollback_retired", "Runtime upgrades are forward-only; repair the selected release");
-}
-
 export async function probeConnection(path, expectedRuntimeId) {
   let connection;
   try { connection = JSON.parse(await readFile(path, "utf8")); } catch { return false; }
@@ -1718,20 +1641,6 @@ function validControlConnection(value, product = null) {
   } catch { return false; }
 }
 
-export async function stopStaleHost(pluginStateRoot, expectedRuntimeId, product) {
-  const connectionPath = join(pluginStateRoot, "connections", `${product}.json`);
-  let connection;
-  try {
-    connection = JSON.parse(await readFile(connectionPath, "utf8"));
-  } catch {
-    return false;
-  }
-  if (connection.runtime_id === expectedRuntimeId && await probeConnection(connectionPath, expectedRuntimeId)) return false;
-  const reachable = await probeConnection(connectionPath, connection.runtime_id);
-  const stopped = await stopHost(pluginStateRoot, connection.runtime_id, product);
-  if (reachable && !stopped) fail("host_stop_failed", "old Runtime Host did not stop");
-  return stopped;
-}
 
 export async function stopHost(pluginStateRoot, runtimeId, product) {
   let connection;
@@ -2090,10 +1999,12 @@ function absoluteOption(options, name, fallback) {
   return resolve(value);
 }
 
+const LIFECYCLE_COMMANDS = ["ensure-start", "start", "update", "repair", "status", "stop", "restart", "runtime-blockers", "stop-job", "uninstall", "gc", "doctor"];
+
 export async function cli(arguments_) {
   const command = arguments_[0];
-  if (command === "rollback") fail("runtime_rollback_retired", "Runtime upgrades are forward-only; repair the selected release");
-  if (["install", "install-start"].includes(command)) fail("runtime_entry_retired", "Use the fixed-release plugin lifecycle entry");
+  // Reject unknown commands before any lock or state directory is created.
+  if (!LIFECYCLE_COMMANDS.includes(command)) fail("usage", "Unknown Runtime lifecycle command");
   const options = parseOptions(arguments_.slice(1));
   const product = option(options, "product", null);
   if (!["live", "research"].includes(product)) fail("usage", "bootstrap requires --product live|research");
@@ -2106,8 +2017,7 @@ export async function cli(arguments_) {
 
 async function cliUnlocked(arguments_) {
   const command = arguments_[0];
-  if (command === "rollback") fail("runtime_rollback_retired", "Runtime upgrades are forward-only; repair the selected release");
-  if (!["ensure-start", "start", "update", "repair", "status", "stop", "restart", "runtime-blockers", "stop-job", "review-job", "uninstall", "gc", "doctor"].includes(command)) fail("usage", "Unknown Runtime lifecycle operation");
+  if (!LIFECYCLE_COMMANDS.includes(command)) fail("usage", "Unknown Runtime lifecycle command");
   const options = parseOptions(arguments_.slice(1));
   const product = option(options, "product", null);
   if (!["live", "research"].includes(product)) fail("usage", "bootstrap requires --product live|research");
@@ -2120,13 +2030,12 @@ async function cliUnlocked(arguments_) {
   const liveStateRoot = absoluteOption(options, "live-state-root", join(homedir(), ".edgepilot"));
   const researchStateRoot = absoluteOption(options, "research-state-root", join(homedir(), ".edgepilot-research"));
   const trusted = optionMany(options, "trusted-key").length === 0 ? { keys: null, values: [] } : trustedKeyOptions(options);
-  if (["runtime-blockers", "stop-job", "review-job"].includes(command)) {
+  if (["runtime-blockers", "stop-job"].includes(command)) {
     if (product !== "live") fail("maintenance_operation_invalid", "Live management is unavailable for Research");
     const prepared = await prepareBoundRuntime({ home, stateRoot, channelUrl: option(options, "channel-url"), product,
       version: option(options, "expected-product-version"), runtimeIds: optionMany(options, "expected-runtime-id") });
-    return inspectPreparedJobs(prepared, liveStateRoot, command === "stop-job" ? "stop" : command === "review-job" ? "review" : "inspect", command !== "runtime-blockers" ? {
+    return inspectPreparedJobs(prepared, liveStateRoot, command === "stop-job" ? "stop" : "inspect", command !== "runtime-blockers" ? {
       jobRef: option(options, "job-ref"), accountRef: option(options, "account-ref"), idempotencyKey: option(options, "idempotency-key"),
-      evidenceDigest: option(options, "evidence-digest"), acknowledgement: option(options, "acknowledgement"),
     } : {});
   }
   if (command === "doctor") {
@@ -2151,16 +2060,13 @@ async function cliUnlocked(arguments_) {
   if (["restart", "start"].includes(command)) {
     const pending = readLifecycleState(stateRoot);
     const incomplete = pending?.cutover_started && pending.phase !== "ready";
-    if (incomplete && ["start", "restart"].includes(command)) fail("runtime_repair_required", "Continue the bound upgrade before starting a Runtime");
+    if (incomplete) fail("runtime_repair_required", "Continue the bound upgrade before starting a Runtime");
     const active = incomplete && pending.target_runtime_id ? await runtimeById(stateRoot, pending.target_runtime_id, trusted.keys) : await activeRuntime(stateRoot, trusted.keys);
     if (manifestProduct(active.manifest) !== product) fail("runtime_product_incompatible", "installed Runtime belongs to another product");
     const running = await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), active.manifest.runtime_id);
-    const shouldStop = ["stop", "restart"].includes(command) && running;
+    const shouldStop = command === "restart" && running;
     const stopped = shouldStop ? await stopHost(pluginStateRoot, active.manifest.runtime_id, product) : false;
     if (shouldStop && !stopped) fail("host_stop_failed", "the verified Runtime Host did not stop");
-    if (command === "status" || command === "stop") {
-      return { schema: "edgepilot-bootstrap-result-v1", runtime_id: active.manifest.runtime_id, running, stopped, plugin_state_root: pluginStateRoot };
-    }
     const started = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: trusted.keys, trustedKeyArguments: trusted.values, marketplaceOrigin, environmentName, hostPort: Number(option(options, "host-port", String(DEFAULT_HOST_PORT))) });
     return { schema: "edgepilot-bootstrap-result-v1", runtime_id: started.runtimeId, running: true, stopped, host: started, plugin_state_root: pluginStateRoot };
   }

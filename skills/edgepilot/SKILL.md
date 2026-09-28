@@ -1,6 +1,6 @@
 ---
 name: edgepilot
-description: Route strategy discovery, configuration, backtesting, paper, exchange-demo, and attended live execution through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
+description: Route strategy discovery, configuration, backtesting, exchange-demo, attended live execution and failure diagnosis (why an install, backtest, demo/live run or request failed) through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
 ---
 
 # EdgePilot Live router
@@ -64,13 +64,38 @@ restart trading. Once blockers clear, resume the bound Runtime start/update. A p
 operation survives chat disconnect; inspect status instead of starting a duplicate. This
 management stop does not promise order cancellation or position closure.
 
-When `live_reconciliation_required` is returned, inspect Runtime blockers. For a confirmed exited job with an unknown outcome, the user may explicitly confirm that
-they have reviewed outstanding orders and positions. Only then call
-`edgepilot_runtime_review_job` with the exact job/account/evidence digest from blocker
-inspection and `acknowledgement=orders_and_positions_reviewed`. This records the user's
-review; it does not assert exchange verification or convert history to success. Never infer
-this confirmation from an upgrade, delete, repair or generic yes request. New trading still
-requires all normal prepare/start confirmations and execution checks.
+Exited unknown jobs remain historical diagnostics and do not require operator review.
+New trading still requires the normal prepare/start confirmations, verified process
+availability and current exchange synchronization. Existing orders or positions on the
+selected markets must be resolved before a new strategy is activated; do not automatically
+cancel, close, adopt or replay them.
+
+## Failure diagnosis
+
+Use this when the user asks why something failed, pastes an error, a `job_`, `req_` or
+`diag_` reference or a run ID, or reports that a strategy stopped or places no orders.
+Diagnosis is read-only: never start, stop, retry, repair, cancel orders or close positions
+as part of it.
+
+1. Install, update or startup problems, or Host tools unavailable: call
+   `edgepilot_runtime_diagnose` (works without a running Runtime).
+2. Everything else: search the `diagnostics` toolkit and execute
+   `diagnostics.failure.explain` with the reference. Without one, execute
+   `diagnostics.failure.list` first and let the user pick if several failures match.
+3. Report, in the user's language:
+   - **Where it failed**: kind, phase and time from `subject`.
+   - **Cause**: `matches` with `owner_classified` confidence are established by the owner;
+     `pattern_match` is a likely cause from log text. Quote at most two evidence lines.
+     With no match, state `unclassified` and summarize the strongest evidence lines
+     yourself, labelled as your inference.
+   - **Trading effect**: repeat `effect_guidance`. For `unknown`, tell the user to check
+     orders, fills and positions on the exchange before any new action.
+   - **What to do** and **how to verify**: the match `actions` and `verify`.
+   - **Missing evidence**: translate `gaps` (for example `diagnostic_id_not_written_to_log`
+     means the error ID has no log entry yet; `unclassified` means no known signature).
+4. Never present a guess as the cause, never ask for API keys or tokens, and never tell the
+   user to edit or delete EdgePilot state files. If the user wants support, give them the
+   reference IDs and the evidence lines, which are already redacted.
 
 ## First-use onboarding
 
@@ -138,7 +163,7 @@ must go directly to that outcome and must not force the questionnaire.
    best fit, relatively steadier and more aggressive, preserving versions, evidence,
    trade-offs and warnings.
 
-Onboarding never installs a recommended strategy without selection and never starts paper,
+Onboarding never installs a recommended strategy without selection and never starts
 demo or live execution. Authentication remains Dashboard-only and every existing live
 confirmation gate remains unchanged.
 
@@ -148,8 +173,8 @@ durable job status and result get. Keep the selected slug/version and all return
 unchanged. Login is Dashboard-only: ask the user to open the Live Dashboard. Never start
 Device Authorization or put credentials, access tokens or refresh tokens in chat.
 
-Paper is locally simulated execution. Demo can place orders in an exchange test account.
-Both use their explicit `paper.run.*` or `demo.run.*` operations and never imply Live.
+Demo can place orders in an exchange test account. It uses the explicit `demo.run.*`
+operations and never implies Live.
 
 Live execution is always two-stage. `live.run.prepare` freezes account, strategy,
 configuration, Runtime and risk identity. `live.run.start` requires the attended

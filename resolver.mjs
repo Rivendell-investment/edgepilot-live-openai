@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -21,6 +21,8 @@ const HOST_TOOL_NAMES = new Set([
   "edgepilot_tool_get",
   "edgepilot_tool_execute",
   "edgepilot_result_present",
+  // App-only: the confirmation card submits through the host, never listed to the model.
+  "edgepilot_result_state",
 ]);
 const profile = process.argv[2];
 if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
@@ -76,6 +78,13 @@ async function handleRequest(request) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
+    if (name === "edgepilot_runtime_diagnose") {
+      requireEmpty(argumentsValue);
+      return resultResponse(id, {
+        content: [{ type: "text", text: "Read-only Runtime install/startup diagnostics collected. Explain the failing step from lifecycle, host_log and last_operation evidence; separate confirmed causes from guesses. Do not start, update, repair or stop anything unless the user asks." }],
+        structuredContent: await runtimeDiagnosis(),
+      });
+    }
     if (name === "edgepilot_strategy_search") return resultResponse(id, await executeStrategySearch(argumentsValue));
     if (name === "edgepilot_strategy_recommend") return resultResponse(id, await executeHostOperation("catalog.strategy.recommend", recommendationArguments(argumentsValue)));
     if (name === "edgepilot_onboarding_open") {
@@ -121,13 +130,7 @@ const LIFECYCLE_HANDLERS = {
     if (profile !== "live") throw new BridgeError("tool_not_found");
     return runLifecycle("runtime-blockers");
   },
-  edgepilot_runtime_review_job: async (value) => {
-    if (profile !== "live" || Object.keys(value).sort().join(",") !== "account_ref,acknowledgement,evidence_digest,job_ref"
-        || !/^[0-9a-f]{64}$/.test(value.account_ref) || !/^job_[A-Za-z0-9_-]{20,128}$/.test(value.job_ref)
-        || !/^sha256:[0-9a-f]{64}$/.test(value.evidence_digest) || value.acknowledgement !== "orders_and_positions_reviewed") throw new BridgeError("invalid_tool_call");
-    return runLifecycle("review-job", { "job-ref": value.job_ref, "account-ref": value.account_ref,
-      "evidence-digest": value.evidence_digest, acknowledgement: value.acknowledgement });
-  },
+
   edgepilot_runtime_stop_job: async (value) => {
     if (profile !== "live" || Object.keys(value).sort().join(",") !== "account_ref,idempotency_key,job_ref"
         || !/^[0-9a-f]{64}$/.test(value.account_ref) || !/^job_[A-Za-z0-9_-]{20,128}$/.test(value.job_ref)
@@ -213,13 +216,11 @@ function lifecycleTools(runtimeId = null) {
     name, title, description: readOnly ? description : `${description} If a prepared replacement needs old processes stopped, returns awaiting_confirmation with their exact snapshot. Only submit stop_and_continue after the user chooses to stop those listed processes; defer leaves the old installation running.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: !readOnly },
   }));
+  tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures (lifecycle state, Host log and the last lifecycle operation output). Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
   if (profile === "live") {
     tools.push({ name: "edgepilot_runtime_blockers", title: "Inspect Runtime Blockers", description: "Inspect old Live jobs even when plugin and Runtime versions differ. May prepare the fixed Runtime maintenance executable; never starts trading.", inputSchema: emptyInput,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } });
-    tools.push({ name: "edgepilot_runtime_review_job", title: "Record Operator Review", description: "Only after the user explicitly confirms reviewing the identified stopped job's outstanding orders and positions, record that review against its current evidence digest. Keeps the unknown outcome; never starts trading or changes exchange state.",
-      inputSchema: { type: "object", additionalProperties: false, required: ["job_ref", "account_ref", "evidence_digest", "acknowledgement"], properties: {
-        job_ref: { type: "string", pattern: "^job_[A-Za-z0-9_-]{20,128}$" }, account_ref: { type: "string", pattern: "^[0-9a-f]{64}$" }, evidence_digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }, acknowledgement: { const: "orders_and_positions_reviewed" } } },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } });
     tools.push({ name: "edgepilot_runtime_stop_job", title: "Stop Runtime Job", description: "Stop one explicitly selected Live job using its exact account and job identity. Requires the user's request to stop that job; does not imply order cancellation or position closure.",
       inputSchema: { type: "object", additionalProperties: false, required: ["job_ref", "account_ref", "idempotency_key"], properties: {
         job_ref: { type: "string", pattern: "^job_[A-Za-z0-9_-]{20,128}$" }, account_ref: { type: "string", pattern: "^[0-9a-f]{64}$" }, idempotency_key: { type: "string", minLength: 16, maxLength: 128 } } },
@@ -522,7 +523,7 @@ async function executeHostOperation(operationId, argumentsValue, timeoutMs = MCP
 }
 
 async function runLifecycle(command, managementArguments = {}) {
-  const management = ["runtime-blockers", "stop-job", "review-job"].includes(command);
+  const management = ["runtime-blockers", "stop-job"].includes(command);
   const before = await runtimeStatus();
   if (!management && before.state === "stale_session") return before;
   if (!management && before.message === "runtime_operation_pending") return before;
@@ -593,6 +594,90 @@ function lifecycleSnapshot() {
     }
     return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
   } catch { return { phase: "repair_required", last_error: "lifecycle_state_invalid" }; }
+}
+
+const DIAGNOSE_TAIL_BYTES = 256 * 1024;
+const DIAGNOSE_PROBLEM = /error|exception|traceback|failed|failure|denied|refused|timed? ?out|killed|invalid|mismatch|unavailable|EdgePilot bootstrap:/iu;
+
+// Read-only install/startup evidence; the Host MCP may be unavailable here.
+async function runtimeDiagnosis() {
+  const logs = join(runtimeHome, "runtime", "logs");
+  const hostLog = diagnosticLines(tailText(join(logs, "host.log")), 40, 10);
+  let operations = [];
+  try {
+    operations = readdirSync(logs).filter(name => /^operation-[0-9a-f-]{36}\.(?:err|out)$/u.test(name))
+      .map(name => ({ name, modified: lstatSync(join(logs, name)).mtimeMs }))
+      .sort((left, right) => right.modified - left.modified);
+  } catch { /* No lifecycle operation has run yet. */ }
+  const latest = operations[0]?.name.replace(/\.(?:err|out)$/u, "") ?? null;
+  const lastOperation = latest === null ? null : {
+    at: new Date(operations[0].modified).toISOString(),
+    stderr: diagnosticLines(tailText(join(logs, `${latest}.err`)), 30, 10),
+    stdout: diagnosticLines(tailText(join(logs, `${latest}.out`)), 10, 5),
+  };
+  let lastFailure = null;
+  try {
+    const path = join(logs, "last-failed-operation.json");
+    if (lstatSync(path).isFile() && lstatSync(path).size <= 65536) lastFailure = JSON.parse(readFileSync(path, "utf8"));
+  } catch { /* No failed lifecycle operation recorded. */ }
+  const status = await runtimeStatus();
+  const gaps = [];
+  if (!existsSync(logs)) gaps.push("runtime_logs_missing");
+  if (hostLog.length === 0) gaps.push("host_log_empty_or_missing");
+  if (lastOperation === null && lastFailure === null) gaps.push("no_lifecycle_operation_output");
+  return { schema: "edgepilot-runtime-diagnostics-v1", profile, plugin_version: pluginVersion, status, lifecycle: lifecycleSnapshot(), host_log: hostLog,
+    last_operation: lastOperation, last_failed_operation: lastFailure, gaps };
+}
+
+// Operation output is deleted after each call; keep one redacted record of the
+// most recent failure so install/update/start problems remain diagnosable.
+function recordFailedOperation(logs, command, completed) {
+  try {
+    const record = {
+      schema: "edgepilot-failed-lifecycle-operation-v1", at: new Date().toISOString(), command: String(command ?? ""),
+      exit_status: completed.status, stderr: diagnosticLines(completed.stderr, 30, 10), stdout: diagnosticLines(completed.stdout, 10, 5),
+    };
+    const target = join(logs, "last-failed-operation.json"), temporary = `${target}.${process.pid}.tmp`;
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+    renameSync(temporary, target);
+  } catch { /* Diagnostics must never change the lifecycle result. */ }
+}
+
+function tailText(path) {
+  let descriptor = null;
+  try {
+    const metadata = lstatSync(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return "";
+    descriptor = openSync(path, "r");
+    const length = Math.min(metadata.size, DIAGNOSE_TAIL_BYTES);
+    const buffer = Buffer.alloc(length);
+    readSync(descriptor, buffer, 0, length, metadata.size - length);
+    return buffer.toString("utf8");
+  } catch { return ""; } finally { if (descriptor !== null) closeSync(descriptor); }
+}
+
+function diagnosticLines(text, limit, keepTail) {
+  const lines = text.replace(/\x1b\[[0-9;]*[A-Za-z]/gu, "").split(/\r?\n/u).map(line => line.trimEnd()).filter(Boolean);
+  const tailStart = Math.max(0, lines.length - keepTail);
+  const chosen = lines.map((line, index) => index >= tailStart || DIAGNOSE_PROBLEM.test(line) ? index : -1).filter(index => index >= 0);
+  const selected = [];
+  for (const index of chosen.slice(-limit)) {
+    const cleaned = scrubDiagnosticLine(lines[index]);
+    if (selected.at(-1) !== cleaned) selected.push(cleaned);
+  }
+  return selected;
+}
+
+function scrubDiagnosticLine(line) {
+  let value = line.replace(/(bearer\s+)[^\s"',;]+/giu, "$1[REDACTED]")
+    .replace(/([?&](?:sign|signature|token|key|apikey|api_key|passphrase|secret)=)[^&\s"']+/giu, "$1[REDACTED]")
+    .replace(/((?:password|passwd|pwd|api[_-]?(?:key|secret)|secret|passphrase|token|authorization)\s*[=:]\s*)([^\s,;]+)/giu, "$1[REDACTED]");
+  const home = homedir();
+  if (home.length > 1) value = value.split(home).join("~");
+  value = value.replace(/(?:\/Users\/|\/home\/|[A-Za-z]:\\Users\\)[^/\\\s"']+/gu, "~")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/gu, "[EMAIL]")
+    .replace(/(?<![A-Za-z0-9_:/.-])[A-Za-z0-9+/_=-]{40,}/gu, "[TOKEN]");
+  return value.length > 400 ? `${value.slice(0, 400)}…` : value;
 }
 
 function lifecycleExecution() {
@@ -891,7 +976,9 @@ async function runLifecycleProcess(args) {
     child.once("close", status => {
       clearTimeout(timer);
       const bounded = path => lstatSync(path).size <= 1024 * 1024 ? readFileSync(path, "utf8") : "";
-      resolve({ status, stdout: bounded(output), stderr: bounded(errors) });
+      const completed = { status, stdout: bounded(output), stderr: bounded(errors) };
+      if (status !== 0) recordFailedOperation(logs, args[1], completed);
+      resolve(completed);
       rmSync(output, { force: true }); rmSync(errors, { force: true });
     });
   });
