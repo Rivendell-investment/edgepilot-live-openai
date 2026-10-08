@@ -97,7 +97,7 @@ async function handleRequest(request) {
       });
     }
     if (name === "edgepilot_dashboard_open") {
-      return resultResponse(id, await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue)));
+      return resultResponse(id, dashboardOpenResult(await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue))));
     }
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
@@ -291,6 +291,25 @@ function dashboardArguments(value) {
       || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.test(target.version)
       || typeof target.content_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(target.content_sha256)) throw new BridgeError("invalid_tool_call");
   return { target: { ...target } };
+}
+
+// Clients that only show content text never see structuredContent. Put the exact
+// loopback URL there; keep the structured result for clients that prefer it.
+function dashboardOpenResult(result) {
+  const outcomes = result?.structuredContent?.outcomes;
+  const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
+  const url = outcome?.output?.url;
+  if (outcome?.operation_id !== "dashboard.open" || outcome?.status !== "completed" || !dashboardLoopbackUrl(url)) return result;
+  return { ...result, content: [{ type: "text", text: url }] };
+}
+
+function dashboardLoopbackUrl(value) {
+  if (typeof value !== "string" || value.length > 2048) return false;
+  let parsed;
+  try { parsed = new URL(value); } catch { return false; }
+  return parsed.protocol === "http:" && parsed.hostname === "127.0.0.1" && parsed.port !== ""
+    && parsed.username === "" && parsed.password === "" && parsed.search === ""
+    && (parsed.pathname === "" || parsed.pathname === "/");
 }
 
 function recommendationArguments(value) {
