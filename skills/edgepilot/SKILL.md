@@ -1,6 +1,6 @@
 ---
 name: edgepilot
-description: Route strategy discovery, configuration, backtesting, exchange-demo, attended live execution and failure diagnosis (why an install, backtest, demo/live run or request failed) through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
+description: Route strategy discovery, configuration, backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
 ---
 
 # EdgePilot Live router
@@ -46,29 +46,28 @@ owner order and never merge repeated searches into a new owner ranking. If the u
 `limit` (for example, `limit=1`, `limit=2` or `limit=3`); do not let the search tool default
 to ten results for a counted request. Use a larger explicit limit only when the user asks for
 options or multiple candidates. For “open”, “start” or “launch EdgePilot”, ensure Runtime is ready, then
-call `edgepilot_dashboard_open`; return its loopback URL and never spawn a legacy Dashboard
-directly.
+call `edgepilot_dashboard_open`; present its URL as a link (Dashboard links below) and never
+spawn a legacy Dashboard directly.
+
+## Dashboard links
+
+Show a Dashboard URL as one Markdown link with a short label in the user's language, never as
+the raw address: for example `[打开 EdgePilot 控制台](<url>)`, or, when a strategy target was
+opened, `[在 EdgePilot 中查看 <strategy name> <version>](<url>)`.
+
+- A message "Dashboard 已准备好，请点击打开：<url>" is posted by the EdgePilot card's view
+  button and already carries a fresh link to that strategy: reply only with that exact URL as
+  the link. Do not call `edgepilot_dashboard_open` for it; a new link without the card's target
+  would open the Dashboard without the strategy.
+- A link signs the browser in once within 10 minutes. When the user asks to open it again
+  later, call `edgepilot_dashboard_open` again with the same `target` as before.
 
 ## Upgrade recovery
 
-Runtime upgrades are forward-only. When `runtime_pinned` occurs, call
-`edgepilot_runtime_blockers` to inspect the exact old jobs; this does not require a ready
-Dashboard or matching business Runtime. A stored `running` value alone is not proof that a
-process is alive. Report owner-computed evidence. Never edit/delete task files or an old
-Runtime to clear a pin, and never recommend repeated repair for the same active-job blocker.
-
-Only when the user explicitly asks to stop the identified job, call
-`edgepilot_runtime_stop_job` with its exact `job_ref`, `account_ref` and one stable idempotency
-key. Continue from returned state; `unknown` is not successful cancellation or permission to
-restart trading. Once blockers clear, resume the bound Runtime start/update. A pending
-operation survives chat disconnect; inspect status instead of starting a duplicate. This
-management stop does not promise order cancellation or position closure.
-
-Exited unknown jobs remain historical diagnostics and do not require operator review.
-New trading still requires the normal prepare/start confirmations, verified process
-availability and current exchange synchronization. Existing orders or positions on the
-selected markets must be resolved before a new strategy is activated; do not automatically
-cancel, close, adopt or replay them.
+Runtime upgrades are forward-only. Trading runs in the separate local trading service, which
+the upgrade drains (instances keep their desired state and resume after the upgrade). Never
+edit or delete trading service files, and never recommend repeated repair to clear a
+failure; inspect `trading.service.status` and the diagnostics operations instead.
 
 ## Failure diagnosis
 
@@ -93,7 +92,12 @@ as part of it.
    - **What to do** and **how to verify**: the match `actions` and `verify`.
    - **Missing evidence**: translate `gaps` (for example `diagnostic_id_not_written_to_log`
      means the error ID has no log entry yet; `unclassified` means no known signature).
-4. Never present a guess as the cause, never ask for API keys or tokens, and never tell the
+4. When the cause may be the exchange API key (a trading state offers `test_credentials`,
+   or the failure is a connection, authentication or starting-capital error), execute
+   `credentials.test` with that account's `venue` and `mode`. It only reads the account and
+   logs in to the private stream; report its `result`, the failed step's `venue_code` and
+   what to change. Never ask the user to paste keys to test them.
+5. Never present a guess as the cause, never ask for API keys or tokens, and never tell the
    user to edit or delete EdgePilot state files. If the user wants support, give them the
    reference IDs and the evidence lines, which are already redacted.
 
@@ -117,20 +121,24 @@ must go directly to that outcome and must not force the questionnaire.
    Wait for the original call's final result; yielded/running is not completed. If the
    script reports `runtime_operation_pending`, wait on that call or query status with
    bounded backoff, without parallel open calls or duplicate installations.
-   When `state=awaiting_confirmation`, show `switch.processes` and `switch.jobs` and ask
-   once: “暂不切换” (`defer`) or “停止旧版本并继续” (`stop_and_continue`), translated into
-   the user's language. Explain that stopping trading programs does not guarantee order
-   cancellation or position closure. Submit the chosen action to the same lifecycle tool
-   with the returned `operation_id` and `snapshot_digest`; never invent or reuse a changed
-   snapshot. This choice authorizes only the listed process stop, not an orders/positions
-   review. A refreshed snapshot requires a fresh choice. On `deferred`, end this target
+   When `state=awaiting_confirmation`, show `switch.jobs` and ask once: “暂不切换”
+   (`defer`) or “暂停并继续升级” (`stop_and_continue`), translated into the user's
+   language. A `kind: "trading"` entry means running strategies pause during the switch
+   (positions and orders stay as they are) and resume automatically once the new version
+   is ready. Other entries are trading tasks of the previous version; they are stopped
+   keeping their positions, which does not cancel orders or close positions, and the new
+   version lists what it finds on the exchange for the user to take over or close.
+   Submit the chosen action to the same lifecycle tool with the returned `operation_id`
+   and `snapshot_digest`; never invent or reuse a changed snapshot. This choice
+   authorizes only the listed pause or stop, not an orders/positions review. A refreshed
+   snapshot requires a fresh choice. On `deferred`, end this target
    startup request and leave the old environment alone; do not open old onboarding as
    target success. Report other failures and their script-provided recovery action.
    For `stale_session`, reload the plugin session rather than attempting a downgrade.
 2. For this Dashboard-and-onboarding request, all successful paths (already running,
    stopped target started, first installation, upgrade or repair) continue identically.
    Only after `state=ready` and `connection_ready=true`, call
-   `edgepilot_dashboard_open` once and return its loopback URL. Then call
+   `edgepilot_dashboard_open` once and present its URL as a link (Dashboard links). Then call
    `edgepilot_onboarding_open` once with the current locale. On success, hand control to
    that interactive card and end the turn. A brief instruction to continue in the card is
    enough; do not repeat questionnaire choices in chat or call another question/selection
@@ -173,14 +181,23 @@ durable job status and result get. Keep the selected slug/version and all return
 unchanged. Login is Dashboard-only: ask the user to open the Live Dashboard. Never start
 Device Authorization or put credentials, access tokens or refresh tokens in chat.
 
-Demo can place orders in an exchange test account. It uses the explicit `demo.run.*`
-operations and never implies Live.
+Trading runs as strategy instances in the local trading service. Demo and live are separate
+trading accounts selected by `mode` and `venue`; demo can place orders in an exchange test
+account and never implies live.
 
-Live execution is always two-stage. `live.run.prepare` freezes account, strategy,
-configuration, Runtime and risk identity. `live.run.start` requires the attended
-confirmation bound to that prepared intent. Never turn a generic “yes” into authorization,
-never retry an unknown external effect automatically, and never place credentials in model
-arguments or prose.
+Deploying is always two-stage. `trading.instance.prepare` validates and freezes the strategy,
+configuration and venue for ten minutes. `trading.instance.start` requires the attended
+confirmation bound to that exact `prepared_ref`. Never turn a generic “yes” into
+authorization and never place credentials in model arguments or prose.
+
+Trading commands (`start`, `stop`, `resume`, `halt`, `exposure.flatten`, `exposure.adopt`)
+return when the trading service recorded them; what happened at the exchange is read from
+`trading.state.get` (engine, instances, exposure ownership, risk) or `trading.events.list`.
+Every state object lists its `actions`; offer only those. Stopping keeps the position by
+default (`stop_policy: keep`); flattening closes it and needs the user's explicit choice.
+When the outcome of a command is unknown, read the state or repeat with the same
+idempotency key; never repeat it with a new key. Orders or positions the platform cannot
+attribute block the instance until the user adopts or flattens them from the actions.
 
 After an attended result is presented, stop and wait for the App. App submit invokes the
 stored exact Owner call once; do not replay the original Execute as confirmation. Continue

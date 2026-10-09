@@ -97,7 +97,7 @@ async function handleRequest(request) {
       });
     }
     if (name === "edgepilot_dashboard_open") {
-      return resultResponse(id, await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue)));
+      return resultResponse(id, dashboardOpenResult(await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue))));
     }
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
@@ -125,18 +125,6 @@ async function handleRequest(request) {
 }
 
 const LIFECYCLE_HANDLERS = {
-  edgepilot_runtime_blockers: async (argumentsValue) => {
-    requireEmpty(argumentsValue);
-    if (profile !== "live") throw new BridgeError("tool_not_found");
-    return runLifecycle("runtime-blockers");
-  },
-
-  edgepilot_runtime_stop_job: async (value) => {
-    if (profile !== "live" || Object.keys(value).sort().join(",") !== "account_ref,idempotency_key,job_ref"
-        || !/^[0-9a-f]{64}$/.test(value.account_ref) || !/^job_[A-Za-z0-9_-]{20,128}$/.test(value.job_ref)
-        || typeof value.idempotency_key !== "string" || !/^[\x20-\x7e]{16,128}$/.test(value.idempotency_key)) throw new BridgeError("invalid_tool_call");
-    return runLifecycle("stop-job", { "job-ref": value.job_ref, "account-ref": value.account_ref, "idempotency-key": value.idempotency_key });
-  },
   edgepilot_runtime_status: async (argumentsValue) => {
     requireEmpty(argumentsValue);
     return await runtimeStatus();
@@ -213,19 +201,11 @@ function lifecycleTools(runtimeId = null) {
     ["edgepilot_runtime_repair", "Runtime Repair", "Reinstall the channel Runtime and restart the local Host.", false],
   ];
   const tools = definitions.map(([name, title, description, readOnly]) => ({
-    name, title, description: readOnly ? description : `${description} If a prepared replacement needs old processes stopped, returns awaiting_confirmation with their exact snapshot. Only submit stop_and_continue after the user chooses to stop those listed processes; defer leaves the old installation running.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
+    name, title, description: readOnly ? description : `${description} If the switch would pause work, returns awaiting_confirmation with the exact snapshot: a "trading" entry means running strategies pause during the switch and resume automatically after it; other entries are old trading tasks of the previous version that will be stopped keeping their positions. Only submit stop_and_continue after the user agrees; defer leaves the old installation running. Background tasks such as backtests keep running either way.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: !readOnly },
   }));
   tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures (lifecycle state, Host log and the last lifecycle operation output). Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
-  if (profile === "live") {
-    tools.push({ name: "edgepilot_runtime_blockers", title: "Inspect Runtime Blockers", description: "Inspect old Live jobs even when plugin and Runtime versions differ. May prepare the fixed Runtime maintenance executable; never starts trading.", inputSchema: emptyInput,
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true } });
-    tools.push({ name: "edgepilot_runtime_stop_job", title: "Stop Runtime Job", description: "Stop one explicitly selected Live job using its exact account and job identity. Requires the user's request to stop that job; does not imply order cancellation or position closure.",
-      inputSchema: { type: "object", additionalProperties: false, required: ["job_ref", "account_ref", "idempotency_key"], properties: {
-        job_ref: { type: "string", pattern: "^job_[A-Za-z0-9_-]{20,128}$" }, account_ref: { type: "string", pattern: "^[0-9a-f]{64}$" }, idempotency_key: { type: "string", minLength: 16, maxLength: 128 } } },
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } });
-  }
   tools.push({
     name: "edgepilot_strategy_search", title: "Search Strategies",
     description: `Search profile-scoped strategies for ordinary chat requests with multilingual relevance, strict filters, facets, and match explanations. When the user asks for an exact number of recommendations, pass that number as limit (for example 1, 2, or 3) so the conversation and App show the same count. Use a larger limit only when the user asks for options or multiple candidates. ${profile === "live" ? "For a Live plugin mention with no other message content, open Dashboard and onboarding; do not search." : "Open onboarding only when the user explicitly asks for the questionnaire."}`,
@@ -311,6 +291,25 @@ function dashboardArguments(value) {
       || !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/.test(target.version)
       || typeof target.content_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(target.content_sha256)) throw new BridgeError("invalid_tool_call");
   return { target: { ...target } };
+}
+
+// Clients that only show content text never see structuredContent. Put the exact
+// loopback URL there; keep the structured result for clients that prefer it.
+function dashboardOpenResult(result) {
+  const outcomes = result?.structuredContent?.outcomes;
+  const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
+  const url = outcome?.output?.url;
+  if (outcome?.operation_id !== "dashboard.open" || outcome?.status !== "completed" || !dashboardLoopbackUrl(url)) return result;
+  return { ...result, content: [{ type: "text", text: url }] };
+}
+
+function dashboardLoopbackUrl(value) {
+  if (typeof value !== "string" || value.length > 2048) return false;
+  let parsed;
+  try { parsed = new URL(value); } catch { return false; }
+  return parsed.protocol === "http:" && parsed.hostname === "127.0.0.1" && parsed.port !== ""
+    && parsed.username === "" && parsed.password === "" && parsed.search === ""
+    && (parsed.pathname === "" || parsed.pathname === "/");
 }
 
 function recommendationArguments(value) {
@@ -523,10 +522,9 @@ async function executeHostOperation(operationId, argumentsValue, timeoutMs = MCP
 }
 
 async function runLifecycle(command, managementArguments = {}) {
-  const management = ["runtime-blockers", "stop-job"].includes(command);
   const before = await runtimeStatus();
-  if (!management && before.state === "stale_session") return before;
-  if (!management && before.message === "runtime_operation_pending") return before;
+  if (before.state === "stale_session") return before;
+  if (before.message === "runtime_operation_pending") return before;
   if (new Set(["update", "repair"]).has(command) && !before.repair_allowed) return staleSession(before);
   const channelUrl = process.env.EDGEPILOT_CHANNEL_URL ?? delivery.channel_url;
   const bootstrap = validateBootstrapFile(configuredBootstrapPath());
@@ -548,10 +546,7 @@ async function runLifecycle(command, managementArguments = {}) {
     }
     if (new Set(["plugin_incompatible", "contract_incompatible"]).has(code)) return staleSession(await runtimeStatus());
     return { ...(await runtimeStatus()), state: "error", connection_ready: false, message: code,
-      required_action: code === "runtime_pinned" ? "inspect_runtime_blockers" : code.startsWith("dashboard_") ? "inspect_startup_diagnostics" : "inspect_runtime_status" };
-  }
-  if (management) {
-    try { return JSON.parse(completed.stdout); } catch { throw new BridgeError("maintenance_response_invalid"); }
+      required_action: "inspect_runtime_status" };
   }
   let outcome;
   try { outcome = JSON.parse(completed.stdout); } catch { /* Older lifecycle fixtures return no structured output. */ }
@@ -944,7 +939,7 @@ function configuredBootstrapPath() {
 }
 
 function lifecycleProcessEnvironment() {
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "EDGEPILOT_PROXY_URL", "EDGEPILOT_PROXY_MODE"]).has(key.toUpperCase())));
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => new Set(["SYSTEMROOT", "WINDIR", "COMSPEC", "TEMP", "TMP", "LANG", "LC_ALL", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "EDGEPILOT_ENV", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "EDGEPILOT_PROXY_URL", "EDGEPILOT_PROXY_MODE", "XDG_RUNTIME_DIR", "TMPDIR", "USERNAME", "USERDOMAIN", "EDGEPILOT_SERVICE_MODE"]).has(key.toUpperCase())));
   const names = Object.keys(environment).filter((key) => key.toUpperCase() === "NO_PROXY");
   if (names.length === 0) environment.NO_PROXY = "127.0.0.1";
   else for (const name of names) {

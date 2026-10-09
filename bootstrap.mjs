@@ -160,7 +160,7 @@ return { LifecycleTransaction, readLifecycleState, writeLifecycleState, runLiveM
 })();
 import * as __edgepilot_processes_dependency_0 from "node:child_process";
 import * as __edgepilot_processes_dependency_1 from "node:path";
-const { snapshotRuntimeProcesses, stopAuthorizedProcesses, runtimeExecutablesInUse } = (() => {
+const { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse } = (() => {
 // Inventory and stop processes running a verified Runtime interpreter.
 const { spawnSync } = __edgepilot_processes_dependency_0;
 const { resolve, join } = __edgepilot_processes_dependency_1;
@@ -174,41 +174,28 @@ function classifyRuntimeCommand(executable, command) {
   const args = command.slice(prefix.length);
   if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot_runtime_host\.host_main(?:\s|$)/u.test(args)) return "host";
   if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot_worker\.worker_main(?:\s|$)/u.test(args)) return "worker";
+  if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot\.tradingd(?:\s|$)/u.test(args)) return "tradingd";
+  if (/^(?:-(?:I|B|u)\s+)*-m\s+edgepilot\.trading_engine(?:\s|$)/u.test(args)) return "engine";
   // Runtimes installed before the Live entry was renamed still run `_serve_unmanaged_for_test`;
   // upgrades must recognize their Dashboards to stop them.
   if (/^(?:-(?:I|B|u)\s+)*-c\s+["']?from (?:edgepilot\.dashboard\.http import (?:serve|_serve_unmanaged_for_test)|edgepilot_research\.ui import serve)(?:\s|;|$)/u.test(args)) return "dashboard";
   return null;
 }
 
-function processInventory({ executables = [], roots = [], descendants = false } = {}) {
+function processInventory({ executables = [] } = {}) {
   if (process.platform === "win32") {
     const powershell = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    const scope = JSON.stringify({ executables, roots, descendants }).replaceAll("'", "''");
+    const scope = JSON.stringify({ executables }).replaceAll("'", "''");
     const script = `$ErrorActionPreference='Stop';
 $scope=ConvertFrom-Json '${scope}';
 $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().Name;
-$rows=@(Get-CimInstance Win32_Process -ErrorAction Stop);
-$selected=@{}; $children=@{}; $queue=[System.Collections.Generic.Queue[uint32]]::new();
-foreach ($row in $rows) {
-  $parent=[string]$row.ParentProcessId;
-  if (!$children.ContainsKey($parent)) {$children[$parent]=[System.Collections.Generic.List[object]]::new()};
-  $children[$parent].Add($row);
-  $exact=$false;
+@(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+  $line=$_.CommandLine; $exact=$false;
   foreach ($exe in $scope.executables) {
-    if ($row.CommandLine -and ($row.CommandLine.StartsWith($exe+' ', [StringComparison]::Ordinal) -or $row.CommandLine.StartsWith('"'+$exe+'" ', [StringComparison]::Ordinal))) {$exact=$true; break}
+    if ($line -and ($line.StartsWith($exe+' ', [StringComparison]::Ordinal) -or $line.StartsWith('"'+$exe+'" ', [StringComparison]::Ordinal))) {$exact=$true; break}
   };
-  if ($exact -or $scope.roots -contains $row.ProcessId) {$selected[[string]$row.ProcessId]=$row; $queue.Enqueue($row.ProcessId)}
-};
-if ($scope.descendants) {
-  while ($queue.Count) {
-    $parent=[string]$queue.Dequeue();
-    foreach ($row in $children[$parent]) {
-      $key=[string]$row.ProcessId;
-      if (!$selected.ContainsKey($key)) {$selected[$key]=$row; $queue.Enqueue($row.ProcessId)}
-    }
-  }
-};
-@($selected.Values | ForEach-Object {
+  $exact
+} | ForEach-Object {
   $o=Invoke-CimMethod -InputObject $_ -MethodName GetOwner -ErrorAction Stop;
   if ($o.ReturnValue -ne 0) {throw 'process_owner_unverified'};
   if (($o.Domain+'\\'+$o.User) -eq $me) {$_ | Select-Object ProcessId,ParentProcessId,CommandLine}
@@ -232,30 +219,18 @@ function runtimeExecutablesInUse(executables) {
     entry.command.startsWith(executable + " ") || entry.command.startsWith('"' + executable + '" '))));
 }
 
-function snapshotRuntimeProcesses({ python, hostPid = null, birthOf, authorized = [], inventory = processInventory }) {
-  const executable = resolve(python), entries = inventory({
-    executables: [executable], roots: [hostPid, ...authorized.map(item => item.pid)].filter(Number.isSafeInteger), descendants: true,
-  });
-  const children = new Map();
-  for (const entry of entries) { const rows = children.get(entry.parent) ?? []; rows.push(entry); children.set(entry.parent, rows); }
-  const selected = new Map(), queue = [];
-  for (const entry of entries) {
-    const exact = entry.command.startsWith(executable + " ") || entry.command.startsWith('"' + executable + '" ');
-    const approved = authorized.some(old => old.pid === entry.pid && old.birth === birthOf(entry.pid));
-    if (entry.pid === hostPid || exact || approved) { selected.set(entry.pid, entry); queue.push(entry.pid); }
-  }
-  for (let index = 0; index < queue.length; index += 1) {
-    for (const entry of children.get(queue[index]) ?? []) {
-      if (!selected.has(entry.pid)) { selected.set(entry.pid, entry); queue.push(entry.pid); }
-    }
-  }
-  if (selected.size > 200) throw processFailure("runtime_process_inventory_exceeded");
-  return [...selected.values()].map(entry => {
-    if (!Number.isSafeInteger(entry.pid) || entry.pid <= 0 || entry.pid === process.pid) throw processFailure("runtime_process_identity_unverified");
+/**
+ * Processes of one Runtime interpreter with the given roles, identified by their command
+ * line at this moment -- never by a saved process id (v2/11 section 1.3).
+ */
+function runtimeProcessesByRole({ python, roles, birthOf, inventory = processInventory }) {
+  const executable = resolve(python);
+  return inventory({ executables: [executable] }).flatMap((entry) => {
+    const role = classifyRuntimeCommand(executable, entry.command);
+    if (!roles.includes(role) || !Number.isSafeInteger(entry.pid) || entry.pid <= 0 || entry.pid === process.pid) return [];
     const birth = birthOf(entry.pid);
-    if (!birth) throw processFailure("runtime_process_identity_unverified");
-    return { pid: entry.pid, birth, role: entry.pid === hostPid ? "host" : classifyRuntimeCommand(executable, entry.command) ?? "execution" };
-  }).sort((a, b) => a.pid - b.pid);
+    return birth ? [{ pid: entry.pid, birth, role }] : [];
+  });
 }
 
 async function stopAuthorizedProcesses(processes, { birthOf, signal = (pid, kind) => process.kill(pid, kind),
@@ -284,7 +259,358 @@ async function stopAuthorizedProcesses(processes, { birthOf, signal = (pid, kind
   while (selected.some(remains) && Date.now() < deadline) await wait(50);
   if (selected.some(remains)) throw processFailure("runtime_process_stop_failed");
 }
-return { snapshotRuntimeProcesses, stopAuthorizedProcesses, runtimeExecutablesInUse };
+return { runtimeProcessesByRole, stopAuthorizedProcesses, runtimeExecutablesInUse };
+})();
+import * as __edgepilot_services_dependency_0 from "node:child_process";
+import * as __edgepilot_services_dependency_1 from "node:crypto";
+import * as __edgepilot_services_dependency_2 from "node:fs";
+import * as __edgepilot_services_dependency_3 from "node:os";
+import * as __edgepilot_services_dependency_4 from "node:path";
+const { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, writeLauncher, writeServicesRecord } = (() => {
+// User-level services: launcher, service definitions and the service manager
+// (docs/architecture/v2/11 section 1; decisions D40, D41).
+//
+// The service definitions point at a fixed launcher under the Runtime home. The
+// launcher carries the current Runtime's Python, arguments and environment and is
+// rewritten atomically whenever they change, so an upgrade never rewrites a service
+// definition. The launcher is also the only place that defines the environment of the
+// Host, the trading service and bootstrap's own trading service commands: the trading
+// socket lives under XDG_RUNTIME_DIR/TMPDIR, so all of them must agree.
+const { spawn, spawnSync } = __edgepilot_services_dependency_0;
+const { randomUUID } = __edgepilot_services_dependency_1;
+const { chmodSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } = __edgepilot_services_dependency_2;
+const { homedir } = __edgepilot_services_dependency_3;
+const { dirname, join } = __edgepilot_services_dependency_4;
+
+const SERVICES_SCHEMA = "edgepilot-services-v1";
+const MANAGED_MODES = { darwin: "launchd", linux: "systemd", win32: "schtasks" };
+// Environment the services keep from the installing session; everything else is dropped.
+// The Host passes these on when it runs bootstrap, which rewrites the launcher from them.
+const CAPTURED = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "EDGEPILOT_PROXY_URL", "EDGEPILOT_PROXY_MODE",
+  "XDG_RUNTIME_DIR", "TMPDIR", "LANG", "LC_ALL", "EDGEPILOT_LIVE_DASHBOARD_PORT", "EDGEPILOT_RESEARCH_DASHBOARD_PORT",
+  "EDGEPILOT_SERVICE_MODE"];
+const LAUNCHD_PREFIX = "ai.edgepilot.";
+
+function failure(code) { return Object.assign(new Error(code), { code }); }
+
+function serviceNames(product, environment) {
+  const prefix = environment === "local" ? "edgepilot-local-" : "edgepilot-";
+  return { host: `${prefix}host-${product}`, tradingd: product === "live" ? `${prefix}tradingd` : null };
+}
+
+function launcherPath(home, platform = process.platform) {
+  return join(home, "bin", platform === "win32" ? "edgepilot-launch.vbs" : "edgepilot-launch");
+}
+
+/** The session environment a launcher pins (proxy, locale and the socket directory roots). */
+function capturedEnvironment(source = process.env) {
+  const result = {};
+  for (const [key, value] of Object.entries(source)) {
+    const name = key.toUpperCase();
+    if (CAPTURED.includes(name) && typeof value === "string" && value && !/[\0\r\n]/u.test(value)) result[name] = value;
+  }
+  const noProxy = (result.NO_PROXY ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+  if (!noProxy.some((item) => item.toLowerCase() === "127.0.0.1")) result.NO_PROXY = ["127.0.0.1", ...noProxy].join(",");
+  return result;
+}
+
+const shellQuote = (value) => `'${String(value).replaceAll("'", "'\\''")}'`;
+const vbsString = (value) => `"${String(value).replaceAll('"', '""')}"`;
+const windowsArgument = (value) => /[\s"]/u.test(value) ? `"${String(value).replaceAll('"', '\\"')}"` : String(value);
+
+/**
+ * spec: { runtimeId, python, host: [arguments after python], tradingd: { stateRoot, environment } | null,
+ *         environment: captured variables }
+ */
+function renderLauncher(spec, platform = process.platform) {
+  const base = { PYTHONDONTWRITEBYTECODE: "1", PYTHONNOUSERSITE: "1", PYTHONUTF8: "1", ...spec.environment };
+  const tradingd = spec.tradingd === null ? null : ["-I", "-B", "-m", "edgepilot.tradingd", "--environment", spec.tradingd.environment];
+  const tradingdEnvironment = spec.tradingd === null ? {} : { EDGEPILOT_HOME: spec.tradingd.stateRoot, EDGEPILOT_RUNTIME_ID: spec.runtimeId };
+  if (platform === "win32") {
+    // The interpreter is always quoted: CreateProcess splits an unquoted path at spaces.
+    const command = (args) => vbsString([`"${spec.python}"`, ...args.map(windowsArgument)].join(" "));
+    const set = (values) => Object.entries(values).map(([key, value]) => `env(${vbsString(key)}) = ${vbsString(value)}`);
+    return [
+      `' Generated by EdgePilot bootstrap for Runtime ${spec.runtimeId}; rewritten when the Runtime changes.`,
+      "' Runs the Host or the trading service hidden; reruns it after a non-zero exit (D40).",
+      "Option Explicit",
+      "Dim shell, env, command, code",
+      "Set shell = CreateObject(\"WScript.Shell\")",
+      "Set env = shell.Environment(\"Process\")",
+      ...set(base),
+      "If WScript.Arguments.Count < 1 Then WScript.Quit 2",
+      "Select Case WScript.Arguments(0)",
+      `  Case "host": command = ${command(["-I", "-B", "-m", "edgepilot_runtime_host.host_main", ...spec.host])}`,
+      ...(tradingd === null ? [] : [`  Case "tradingd"`, ...set(tradingdEnvironment).map((line) => `    ${line}`), `    command = ${command(tradingd)}`]),
+      "  Case Else: WScript.Quit 2",
+      "End Select",
+      "Do",
+      "  code = shell.Run(command, 0, True)",
+      "  If code = 0 Then Exit Do",
+      "  WScript.Sleep 60000",
+      "Loop",
+      "WScript.Quit code",
+      "",
+    ].join("\r\n");
+  }
+  const exports = (values) => Object.entries(values).map(([key, value]) => `export ${key}=${shellQuote(value)}`);
+  const unset = CAPTURED.filter((name) => !(name in base));
+  return [
+    "#!/bin/sh",
+    `# Generated by EdgePilot bootstrap for Runtime ${spec.runtimeId}; rewritten when the Runtime changes.`,
+    ...(unset.length ? [`unset ${unset.join(" ")}`] : []),
+    ...exports(base),
+    "command=\"$1\"",
+    "[ $# -gt 0 ] && shift",
+    "case \"$command\" in",
+    `  host) exec ${[spec.python, "-I", "-B", "-m", "edgepilot_runtime_host.host_main", ...spec.host].map(shellQuote).join(" ")} "$@" ;;`,
+    ...(tradingd === null ? [] : [
+      `  tradingd) ${exports(tradingdEnvironment).join("; ")}; exec ${[spec.python, ...tradingd].map(shellQuote).join(" ")} "$@" ;;`]),
+    "  *) echo 'usage: edgepilot-launch host|tradingd' >&2; exit 2 ;;",
+    "esac",
+    "",
+  ].join("\n");
+}
+
+function atomicWrite(path, content, mode) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw failure("service_state_invalid");
+  const temporary = join(dirname(path), `.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, content, { flag: "wx", mode });
+    if (process.platform !== "win32") chmodSync(temporary, mode);
+    renameSync(temporary, path);
+  } finally { rmSync(temporary, { force: true }); }
+}
+
+function currentContent(path, encoding) {
+  try { return lstatSync(path).isFile() ? readFileSync(path, encoding) : null; } catch { return null; }
+}
+
+/** Write the launcher when its content changed; returns whether it did. */
+function writeLauncher(home, spec, platform = process.platform) {
+  const path = launcherPath(home, platform);
+  const content = renderLauncher(spec, platform);
+  // wscript reads UTF-16LE with a byte order mark, so user paths may be non-ASCII.
+  const bytes = platform === "win32" ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(content, "utf16le")]) : Buffer.from(content, "utf8");
+  const current = currentContent(path, null);
+  if (current !== null && Buffer.compare(current, bytes) === 0) return false;
+  atomicWrite(path, bytes, 0o700);
+  return true;
+}
+
+const xml = (value) => String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+const systemdQuote = (value) => `"${String(value).replaceAll("\\", "\\\\").replaceAll('"', '\\"').replaceAll("%", "%%").replaceAll("$", "$$$$")}"`;
+
+/** The service definition file for one service: { path, content (string), encoding }. */
+function renderDefinition({ platform, home, name, kind, product, environment, launcher, user = null, configHome = homedir() }) {
+  const description = `EdgePilot ${kind === "host" ? `${product} Host` : "trading service"} (${environment})`;
+  const log = join(home, "runtime", "logs", `${kind}.log`);
+  if (platform === "darwin") {
+    const argumentsXml = ["/bin/sh", launcher, kind].map((item) => `    <string>${xml(item)}</string>`).join("\n");
+    return { path: join(configHome, "Library", "LaunchAgents", `${LAUNCHD_PREFIX}${name}.plist`), encoding: "utf8", content: [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0">', "<dict>",
+      `  <key>Label</key><string>${xml(LAUNCHD_PREFIX + name)}</string>`,
+      "  <key>ProgramArguments</key>", "  <array>", argumentsXml, "  </array>",
+      "  <key>RunAtLoad</key><true/>",
+      "  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>",
+      "  <key>ProcessType</key><string>Interactive</string>",
+      // Engines must survive a supervisor exit or crash (07 section 2).
+      ...(kind === "tradingd" ? ["  <key>AbandonProcessGroup</key><true/>"] : []),
+      `  <key>StandardOutPath</key><string>${xml(log)}</string>`,
+      `  <key>StandardErrorPath</key><string>${xml(log)}</string>`,
+      "</dict>", "</plist>", "",
+    ].join("\n") };
+  }
+  if (platform === "linux") {
+    return { path: join(configHome, ".config", "systemd", "user", `${name}.service`), encoding: "utf8", content: [
+      "[Unit]", `Description=${description}`, "",
+      "[Service]", "Type=simple",
+      `ExecStart=/bin/sh ${systemdQuote(launcher)} ${kind}`,
+      `StandardOutput=append:${log}`, "StandardError=inherit",
+      "Restart=on-failure", "RestartSec=2",
+      // KillMode=process keeps the engines; an explicit stop drains them first (11 section 1.1).
+      ...(kind === "tradingd" ? ["KillMode=process", `ExecStop=/bin/sh ${systemdQuote(launcher)} tradingd --drain`, "TimeoutStopSec=180"] : []),
+      "", "[Install]", "WantedBy=default.target", "",
+    ].join("\n") };
+  }
+  if (platform === "win32") {
+    const wscript = join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "wscript.exe");
+    return { path: join(home, "runtime", "services", `${name}.xml`), encoding: "utf16le", content: [
+      '<?xml version="1.0" encoding="UTF-16"?>',
+      '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
+      `  <RegistrationInfo><Description>${xml(description)}</Description></RegistrationInfo>`,
+      `  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>${xml(user)}</UserId></LogonTrigger></Triggers>`,
+      `  <Principals><Principal id="Author"><UserId>${xml(user)}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>`,
+      "  <Settings>",
+      "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>",
+      "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>",
+      "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>",
+      "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+      "    <Hidden>true</Hidden>",
+      "    <StartWhenAvailable>true</StartWhenAvailable>",
+      "    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>",
+      "  </Settings>",
+      `  <Actions Context="Author"><Exec><Command>${xml(wscript)}</Command><Arguments>${xml(`//B //Nologo "${launcher}" ${kind}`)}</Arguments></Exec></Actions>`,
+      "</Task>", "",
+    ].join("\r\n") };
+  }
+  throw failure("platform_unsupported");
+}
+
+// Absolute paths: bootstrap runs with a minimal environment that may have no PATH.
+function systemCommand(command) {
+  if (command === "launchctl") return "/bin/launchctl";
+  if (command === "systemctl") return ["/usr/bin/systemctl", "/bin/systemctl"].find((path) => existsSync(path)) ?? "/usr/bin/systemctl";
+  if (command === "schtasks") return join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "schtasks.exe");
+  throw failure("service_command_invalid");
+}
+
+function defaultRun(command, args) {
+  const result = spawnSync(systemCommand(command), args, { encoding: "utf8", timeout: 60_000, windowsHide: true });
+  return { status: result.error ? null : result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/**
+ * One product's services under one service manager. ``run(command, args)`` is injected in
+ * tests; the default runs the real manager and is never used by tests (D41).
+ */
+class ServiceManager {
+  constructor({ home, product, environment, platform = process.platform, run = defaultRun, configHome = homedir(),
+    uid = typeof process.getuid === "function" ? process.getuid() : null,
+    user = process.env.USERDOMAIN && process.env.USERNAME ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}` : process.env.USERNAME ?? null,
+    spawnDetached = defaultSpawnDetached, managed = process.env.EDGEPILOT_SERVICE_MODE !== "detached" }) {
+    // EDGEPILOT_SERVICE_MODE=detached: never touch the service manager (tests, managed desktops).
+    Object.assign(this, { home, product, environment, platform, run, configHome, uid, user, spawnDetached, managed });
+    this.names = serviceNames(product, environment);
+    this.launcher = launcherPath(home, platform);
+    this.mode = null;
+  }
+
+  kinds() { return this.names.tradingd === null ? ["host"] : ["host", "tradingd"]; }
+
+  #definition(kind) {
+    return renderDefinition({ platform: this.platform, home: this.home, name: this.names[kind], kind, product: this.product,
+      environment: this.environment, launcher: this.launcher, user: this.user, configHome: this.configHome });
+  }
+
+  #label(kind) { return `gui/${this.uid}/${LAUNCHD_PREFIX}${this.names[kind]}`; }
+  #task(kind) { return `EdgePilot\\${this.names[kind]}`; }
+  #ok(command, args) { return this.run(command, args).status === 0; }
+
+  /** Whether the manager has the service loaded (it may or may not run right now). */
+  registered(kind) {
+    if (!this.managed) return false;
+    if (this.platform === "darwin") return this.#ok("launchctl", ["print", this.#label(kind)]);
+    if (this.platform === "linux") return this.#ok("systemctl", ["--user", "is-enabled", "--quiet", `${this.names[kind]}.service`]);
+    return this.#ok("schtasks", ["/Query", "/TN", this.#task(kind)]);
+  }
+
+  /** Whether the service's process currently runs according to the manager. */
+  active(kind) {
+    if (!this.managed) return false;
+    if (this.platform === "darwin") return /\bstate = running\b/u.test(this.run("launchctl", ["print", this.#label(kind)]).stdout);
+    if (this.platform === "linux") return this.#ok("systemctl", ["--user", "is-active", "--quiet", `${this.names[kind]}.service`]);
+    return /"Running"/u.test(this.run("schtasks", ["/Query", "/TN", this.#task(kind), "/FO", "CSV", "/NH"]).stdout);
+  }
+
+  /**
+   * Write the definition and load it when it is new or changed. A loaded trading
+   * service is never reloaded here: unloading it would drain every engine. Returns
+   * false when the manager is unavailable (the caller falls back to detached starts).
+   */
+  register(kind, { reloadLoaded = kind !== "tradingd" } = {}) {
+    const definition = this.#definition(kind);
+    const bytes = definition.encoding === "utf16le"
+      ? Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(definition.content, "utf16le")]) : Buffer.from(definition.content, "utf8");
+    const current = currentContent(definition.path, null);
+    const changed = current === null || Buffer.compare(current, bytes) !== 0;
+    const loaded = this.registered(kind);
+    if (loaded && (!changed || !reloadLoaded)) return true;
+    try { atomicWrite(definition.path, bytes, 0o600); } catch { return false; }
+    if (this.platform === "darwin") {
+      if (loaded) this.run("launchctl", ["bootout", this.#label(kind)]);
+      return this.#ok("launchctl", ["bootstrap", `gui/${this.uid}`, definition.path]);
+    }
+    if (this.platform === "linux") {
+      return this.#ok("systemctl", ["--user", "daemon-reload"]) && this.#ok("systemctl", ["--user", "enable", `${this.names[kind]}.service`]);
+    }
+    return this.#ok("schtasks", ["/Create", "/TN", this.#task(kind), "/XML", definition.path, "/F"]);
+  }
+
+  /** Start through the manager (a no-op when it already runs). */
+  start(kind) {
+    if (this.platform === "darwin") return this.#ok("launchctl", ["kickstart", this.#label(kind)]);
+    if (this.platform === "linux") return this.#ok("systemctl", ["--user", "start", `${this.names[kind]}.service`]);
+    return this.#ok("schtasks", ["/Run", "/TN", this.#task(kind)]);
+  }
+
+  /**
+   * Stop through the manager without it restarting the process. Only for a process that
+   * did not stop through its own protocol (Host ``/host/stop``, trading service drain).
+   */
+  stop(kind) {
+    if (!this.managed) return;
+    if (this.platform === "darwin") this.run("launchctl", ["bootout", this.#label(kind)]);
+    else if (this.platform === "linux") this.run("systemctl", ["--user", "stop", `${this.names[kind]}.service`]);
+    else this.run("schtasks", ["/End", "/TN", this.#task(kind)]);
+  }
+
+  /** Remove the definition. The caller has already stopped the service through its own protocol. */
+  unregister(kind) {
+    if (!this.managed) return;
+    const definition = this.#definition(kind);
+    if (this.platform === "darwin") this.run("launchctl", ["bootout", this.#label(kind)]);
+    else if (this.platform === "linux") this.run("systemctl", ["--user", "disable", `${this.names[kind]}.service`]);
+    else this.run("schtasks", ["/Delete", "/TN", this.#task(kind), "/F"]);
+    rmSync(definition.path, { force: true });
+    if (this.platform === "linux") this.run("systemctl", ["--user", "daemon-reload"]);
+  }
+
+  /**
+   * Make sure ``kind`` is registered and started. Falls back to starting the launcher
+   * detached (no autostart, no crash restart) when the manager is unavailable.
+   */
+  ensureRunning(kind) {
+    if (!(this.platform in MANAGED_MODES)) throw failure("platform_unsupported");
+    if (this.managed && this.register(kind) && this.start(kind)) {
+      this.mode = MANAGED_MODES[this.platform];
+      return this.mode;
+    }
+    this.spawnDetached({ platform: this.platform, launcher: this.launcher, kind, log: join(this.home, "runtime", "logs", `${kind}.log`) });
+    this.mode = "detached";
+    return this.mode;
+  }
+}
+
+function defaultSpawnDetached({ platform, launcher, kind, log }) {
+  mkdirSync(dirname(log), { recursive: true, mode: 0o700 });
+  const output = openSync(log, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, 0o600);
+  try {
+    const [command, args] = platform === "win32"
+      ? [join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", "wscript.exe"), ["//B", "//Nologo", launcher, kind]]
+      : ["/bin/sh", [launcher, kind]];
+    const child = spawn(command, args, { detached: true, stdio: ["ignore", output, output], windowsHide: true });
+    child.unref();
+  } finally { closeSync(output); }
+}
+
+/** ``runtime/services.json``: how the services run and the commands the Host may run (D43). */
+function writeServicesRecord(home, value) {
+  atomicWrite(join(home, "runtime", "services.json"), `${JSON.stringify({ schema: SERVICES_SCHEMA, ...value }, null, 2)}\n`, 0o600);
+}
+
+function readServicesRecord(home) {
+  const path = join(home, "runtime", "services.json");
+  try {
+    if (!lstatSync(path).isFile() || lstatSync(path).size > 64 * 1024) return null;
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    return value?.schema === SERVICES_SCHEMA ? value : null;
+  } catch { return null; }
+}
+return { ServiceManager, capturedEnvironment, launcherPath, readServicesRecord, writeLauncher, writeServicesRecord };
 })();
 
 const MANIFEST_DOMAIN = Buffer.from("EdgePilot Runtime Manifest V1\0", "utf8");
@@ -300,7 +626,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.8";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.14";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -950,23 +1276,70 @@ function directoryBytes(root) {
   return total;
 }
 
-function livePinnedRuntimeIds(liveStateRoot) {
-  const result = new Set();
-  if (liveStateRoot === null) return result;
-  const root = join(liveStateRoot, "runtime-live-process-jobs");
-  if (!existsSync(root)) return result;
-  if (lstatSync(root).isSymbolicLink() || !lstatSync(root).isDirectory()) fail("runtime_pin_state_invalid", "Live Runtime job root is invalid");
-  for (const name of readdirSync(root)) {
-    if (!/^job_[A-Za-z0-9_-]{20,128}\.json$/u.test(name)) continue;
-    const path = join(root, name);
+// -- v1 trading state (v2/11 section 5, v2/13 section 4; D46) ------------------------------
+const LEGACY_MAINTENANCE = "/edgepilot/runtime_maintenance.py";
+const LEGACY_JOBS = "runtime-live-process-jobs";
+
+function readSmallJson(path) {
+  try {
     const metadata = lstatSync(path);
-    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 1024 * 1024) fail("runtime_pin_state_invalid", "Live Runtime job record is invalid");
-    let value;
-    try { value = JSON.parse(readFileSync(path, "utf8")); } catch { fail("runtime_pin_state_invalid", "Live Runtime job record is invalid"); }
-    if (!isDigest(value?.runtime_id)) fail("runtime_pin_state_invalid", "Live job Runtime identity is invalid");
-    if (!["succeeded", "completed", "failed", "cancelled"].includes(value?.state)) result.add(value.runtime_id);
+    return metadata.isFile() && metadata.size <= 1024 * 1024 ? JSON.parse(readFileSync(path, "utf8")) : null;
+  } catch { return null; }
+}
+
+/** Whether v1 trading state that has not been handed over still records unfinished tasks. */
+export function legacyTradingStatePresent(liveStateRoot) {
+  const root = join(liveStateRoot, LEGACY_JOBS);
+  if (!existsSync(root)) return false;
+  if (lstatSync(root).isSymbolicLink() || !lstatSync(root).isDirectory()) fail("legacy_state_invalid", "Legacy trading job root is invalid");
+  return readdirSync(root).some((name) => /^job_[A-Za-z0-9_-]{20,128}\.json$/u.test(name)
+    && !["succeeded", "completed", "failed", "cancelled"].includes(readSmallJson(join(root, name))?.state));
+}
+
+/** v1 trading tasks, asked from the old Runtime's own maintenance entry. */
+async function legacyTradingJobs(old, liveStateRoot, operation = "inspect", options = {}) {
+  if (old === null || !old.manifest.payload.files.some((file) => file.path.endsWith(LEGACY_MAINTENANCE)) || !existsSync(join(liveStateRoot, LEGACY_JOBS)))
+    return { jobs: [], pinned_runtime_ids: [] };
+  return runLiveMaintenance({ python: old.python, liveStateRoot, runtimeId: old.manifest.runtime_id, operation, env: cleanHostEnvironment(), ...options });
+}
+
+/** Move v1 trading state into ``tradingd/legacy/<time>/`` after its processes are gone. */
+export function archiveLegacyTradingState(liveStateRoot, now = new Date()) {
+  const stamp = now.toISOString().replaceAll(/[-:]/gu, "").replace(/\.\d+Z$/u, "Z");
+  const archive = join(liveStateRoot, "tradingd", "legacy", stamp);
+  const moved = [];
+  const move = (relative) => {
+    const source = join(liveStateRoot, relative);
+    if (!existsSync(source)) return;
+    if (lstatSync(source).isSymbolicLink()) fail("legacy_state_invalid", "Legacy trading state contains a link");
+    const target = join(archive, relative);
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+    renameSync(source, target);
+    moved.push(relative.split(sep).join("/"));
+  };
+  move(LEGACY_JOBS);
+  move("runtime-live-intents");
+  const roots = ["strategies"];
+  const accounts = join(liveStateRoot, "accounts");
+  if (existsSync(accounts) && lstatSync(accounts).isDirectory())
+    for (const entry of readdirSync(accounts, { withFileTypes: true })) if (entry.isDirectory()) roots.push(join("accounts", entry.name, "strategies"));
+  for (const root of roots) {
+    const absolute = join(liveStateRoot, root);
+    if (!existsSync(absolute) || !lstatSync(absolute).isDirectory() || lstatSync(absolute).isSymbolicLink()) continue;
+    move(join(root, ".locks", "trading-start.lock"));
+    for (const strategy of readdirSync(absolute, { withFileTypes: true })) {
+      if (!strategy.isDirectory() || strategy.name.startsWith(".")) continue;
+      move(join(root, strategy.name, "running.json"));
+      const runs = join(absolute, strategy.name, "runs");
+      if (!existsSync(runs) || !lstatSync(runs).isDirectory()) continue;
+      for (const run of readdirSync(runs, { withFileTypes: true })) {
+        if (!run.isDirectory()) continue;
+        const mode = readSmallJson(join(runs, run.name, "run.json"))?.mode ?? readSmallJson(join(runs, run.name, "execution.json"))?.mode;
+        if (mode === "demo" || mode === "live") move(join(root, strategy.name, "runs", run.name));
+      }
+    }
   }
-  return result;
+  return { archive: moved.length ? archive : null, moved };
 }
 
 function removeGeneratedFilesystemMetadata(root, errorCode) {
@@ -979,7 +1352,7 @@ function removeGeneratedFilesystemMetadata(root, errorCode) {
   }
 }
 
-export async function garbageCollect({ stateRoot, liveStateRoot, pluginStateRoot = null, maximumReleases = 1, maximumBytes = 5 * 1024 ** 3, pinnedRuntimeIds = null }) {
+export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximumReleases = 1, maximumBytes = 5 * 1024 ** 3 }) {
   if (!Number.isSafeInteger(maximumReleases) || maximumReleases < 1 || !Number.isSafeInteger(maximumBytes) || maximumBytes < 1) fail("gc_policy_invalid", "Runtime GC policy is invalid");
   return withInstallLock(stateRoot, async () => {
     const releases = join(stateRoot, "releases");
@@ -987,7 +1360,8 @@ export async function garbageCollect({ stateRoot, liveStateRoot, pluginStateRoot
     await recoverRepairBackups(releases);
     removeGeneratedFilesystemMetadata(releases, "runtime_release_root_invalid");
     const pointer = readPointer(join(stateRoot, "current.json"));
-    const protectedIds = new Set([pointer.current_runtime_id, ...(pinnedRuntimeIds ?? livePinnedRuntimeIds(liveStateRoot))].filter(Boolean));
+    // A release whose interpreter still runs (a task finishing on the old Runtime, D44) is kept below.
+    const protectedIds = new Set([pointer.current_runtime_id]);
     const releaseEntries = readdirSync(releases, { withFileTypes: true });
     for (const entry of releaseEntries.filter((item) => item.name.startsWith(".candidate-"))) {
       const path = join(releases, entry.name);
@@ -1081,7 +1455,7 @@ async function recoverRepairBackups(releases, trustedKeys = null, enforcePlatfor
   }
 }
 
-export async function installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys, liveStateRoot = null, enforcePlatform = true, probe = probeRuntime, beforeActivate = null, repair = false, activate = true }) {
+export async function installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys, enforcePlatform = true, probe = probeRuntime, beforeActivate = null, repair = false, activate = true }) {
   const manifestBytes = readFileSync(manifestPath);
   if (manifestBytes.length < 2 || manifestBytes.length > MAX_MANIFEST_BYTES) fail("manifest_size_invalid", "Runtime manifest size is invalid");
   let parsed;
@@ -1116,8 +1490,6 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
         fail("runtime_downgrade_forbidden", "Runtime installation cannot implicitly downgrade the active release");
       }
     }
-    if (previous !== null && previous.current_runtime_id !== manifest.runtime_id && liveStateRoot !== null && livePinnedRuntimeIds(liveStateRoot).has(previous.current_runtime_id)) fail("runtime_pinned", "active Runtime is pinned by a persistent job");
-    if (repair && liveStateRoot !== null && livePinnedRuntimeIds(liveStateRoot).size > 0) fail("runtime_pinned", "Live jobs block Runtime repair");
     let reused = existsSync(final) && !repair;
     let activated = false;
     if (reused) {
@@ -1135,7 +1507,6 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
         atomicJson(join(candidate, "RUNTIME.json"), manifest);
         await probe(candidate, manifest, stateRoot);
         if (beforeActivate !== null) await beforeActivate(manifest);
-        if (liveStateRoot !== null && livePinnedRuntimeIds(liveStateRoot).size > 0) fail("runtime_pinned", "Live jobs block Runtime replacement");
         const backup = join(releases, `.repair-${runtimeDirectory(manifest.runtime_id)}`);
         const replacing = repair && existsSync(final);
         if (replacing) renameSync(final, backup);
@@ -1153,7 +1524,6 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
       }
     }
     if (!activated && beforeActivate !== null) await beforeActivate(manifest);
-    if (previous?.current_runtime_id !== manifest.runtime_id && liveStateRoot !== null && livePinnedRuntimeIds(liveStateRoot).size > 0) fail("runtime_pinned", "active or unreconciled Live jobs block Runtime replacement");
     if (activate) atomicJson(pointerPath, {
       schema: "edgepilot-runtime-pointer-v1",
       current_runtime_id: manifest.runtime_id,
@@ -1204,12 +1574,6 @@ export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product
   }
 }
 
-async function inspectPreparedJobs(prepared, liveStateRoot, operation = "reconcile", options = {}) {
-  if (!existsSync(join(liveStateRoot, "runtime-live-process-jobs"))) return { schema: "edgepilot-live-maintenance-v1", jobs: [], pinned_runtime_ids: [] };
-  return runLiveMaintenance({ python: safeDestination(prepared.runtimeRoot, prepared.manifest.payload.python.executable), liveStateRoot,
-    runtimeId: prepared.manifest.runtime_id, operation, env: cleanHostEnvironment(), ...options });
-}
-
 async function switchHostIdentity(pluginStateRoot, product) {
   const connection = registeredConnection(pluginStateRoot, product);
   if (!connection || !await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), connection.runtime_id)) return null;
@@ -1232,16 +1596,53 @@ function switchResult(transaction, state) {
     choices: ["defer", "stop_and_continue"] };
 }
 
-async function commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins }) {
-  transaction.advance("commit");
-  atomicJson(join(stateRoot, "current.json"), { schema: "edgepilot-runtime-pointer-v1", current_runtime_id: prepared.manifest.runtime_id, previous_runtime_id: null });
+/** The upgrade's readiness gate: release the trading hold once every engine migrated (D45). */
+async function resumeTradingAfterUpgrade(home, product) {
+  if (product !== "live") return null;
+  const result = await tradingdCommand(home, ["--resume-after-upgrade", "--wait", "300"], 330_000);
+  if (result?.result === "failed") fail("upgrade_trading_not_ready", `Trading stays paused: ${result.error?.code ?? "engines not ready"}`);
+  return result?.result ?? null;
+}
+
+/**
+ * After the commit point: start the trading service and the Host from the new Runtime,
+ * pass the readiness gate and finish (v2/11 section 3 steps 6-8). Failures stay on the
+ * new version; the next start repeats these steps.
+ */
+async function completeSwitch({ transaction, runtime, home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, marketplaceOrigin, environmentName, hostPort }) {
+  transaction.advance("start", { cutover_started: true });
+  const started = await startHost({ home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [],
+    marketplaceOrigin, environmentName, hostPort, selectedRuntime: runtime });
+  const trading = await resumeTradingAfterUpgrade(home, product);
   transaction.advance("ready", { blockers: [], last_error: null });
   try {
-    await garbageCollect({ stateRoot, liveStateRoot: product === "live" ? liveStateRoot : null, pluginStateRoot,
-      pinnedRuntimeIds: pins, maximumReleases: 1 });
+    await garbageCollect({ stateRoot, pluginStateRoot, maximumReleases: 1 });
     if (transaction.value.retired_directory) rmSync(join(stateRoot, "retired", transaction.value.retired_directory), { recursive: true, force: true });
   } catch { transaction.advance("ready", { cleanup_pending: true }); }
-  return { schema: "edgepilot-bootstrap-result-v1", runtime_id: prepared.manifest.runtime_id, reused: prepared.reused, offline: prepared.reused, host: started, lifecycle: transaction.value };
+  return { schema: "edgepilot-bootstrap-result-v1", runtime_id: runtime.manifest.runtime_id, reused: runtime.reused ?? false, offline: runtime.reused ?? false,
+    host: started, trading, lifecycle: transaction.value };
+}
+
+function previousRuntime(stateRoot, transaction, previousId, product) {
+  if (!previousId) return null;
+  const root = join(stateRoot, "releases", runtimeDirectory(previousId));
+  const manifestPath = existsSync(join(root, "RUNTIME.json")) ? join(root, "RUNTIME.json")
+    : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : null;
+  if (!manifestPath) fail("runtime_identity_invalid", "Previous Runtime manifest is missing");
+  const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
+  if (manifest.runtime_id !== previousId || manifestProduct(manifest) !== product) fail("runtime_identity_invalid", "Previous Runtime identity differs");
+  return { root, manifest, python: safeDestination(root, manifest.payload.python.executable) };
+}
+
+/**
+ * Old Host processes by their command line (v1 Hosts also ran a worker and a Dashboard),
+ * plus the Host's own process id as it reported it over the authenticated control channel.
+ */
+function oldHostProcesses(old, identity) {
+  const found = old === null ? [] : runtimeProcessesByRole({ python: old.python, roles: ["host", "worker", "dashboard"], birthOf: processBirth });
+  const birth = identity ? processBirth(identity.pid) : null;
+  if (birth && !found.some((item) => item.pid === identity.pid)) found.push({ pid: identity.pid, birth, role: "host" });
+  return found;
 }
 
 async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin, channelUrl, version, runtimeIds, repair, hostPort, choice = null }) {
@@ -1257,6 +1658,7 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
   }
   const transaction = new LifecycleTransaction(stateRoot, version, runtimeIds);
   let quiesced = false, oldRuntimeId = null;
+  const switchArguments = { home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, marketplaceOrigin, environmentName, hostPort };
   try {
     const prepared = await prepareBoundRuntime({ home, stateRoot, channelUrl, product, version, runtimeIds, repair });
     const productState = product === "live" ? liveStateRoot : researchStateRoot;
@@ -1268,111 +1670,76 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
         fail("product_state_incompatible", "Product state is newer or belongs to another product");
     }
     transaction.advance("inspect", { target_runtime_id: prepared.manifest.runtime_id });
-    let jobs = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : { jobs: [], pinned_runtime_ids: [] };
-    if (jobs.truncated) fail("runtime_process_inventory_exceeded", "Too many active tasks to confirm in one switch");
+    const final = join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id));
+    let pointer = null;
+    try { pointer = readPointer(join(stateRoot, "current.json")); } catch { /* first installation */ }
     const identity = await switchHostIdentity(pluginStateRoot, product);
-    if (identity?.runtime_id === prepared.manifest.runtime_id && previous?.cutover_started
-        && ["start", "commit"].includes(previous.interrupted_phase ?? previous.phase)
-        && prepared.runtimeRoot === join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id))) {
-      const started = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort,
-        selectedRuntime: { root: prepared.runtimeRoot, manifest: prepared.manifest } });
-      return commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins: jobs.pinned_runtime_ids });
+    // Past the commit point already (or the new Host already runs from an interrupted
+    // switch): continue from the start step, forward only.
+    if (previous?.cutover_started && previous.phase !== "ready" && prepared.runtimeRoot === final
+        && (pointer?.current_runtime_id === prepared.manifest.runtime_id || identity?.runtime_id === prepared.manifest.runtime_id)) {
+      transaction.advance("commit", { cutover_started: true });
+      atomicJson(join(stateRoot, "current.json"), { schema: "edgepilot-runtime-pointer-v1", current_runtime_id: prepared.manifest.runtime_id, previous_runtime_id: null });
+      return await completeSwitch({ transaction, runtime: { root: final, manifest: prepared.manifest, reused: prepared.reused }, ...switchArguments });
     }
-    let previousId = identity?.runtime_id ?? null;
-    if (!previousId) { try { previousId = readPointer(join(stateRoot, "current.json")).current_runtime_id; } catch {} }
+    const previousId = identity?.runtime_id ?? pointer?.current_runtime_id ?? null;
     oldRuntimeId = previousId;
-    let oldPython = null;
-    if (previousId) {
-      const previousRoot = join(stateRoot, "releases", runtimeDirectory(previousId));
-      const manifestPath = existsSync(join(previousRoot, "RUNTIME.json")) ? join(previousRoot, "RUNTIME.json")
-        : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : null;
-      if (!manifestPath) fail("runtime_identity_invalid", "Previous Runtime manifest is missing");
-      const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
-      if (manifest.runtime_id !== previousId || manifestProduct(manifest) !== product) fail("runtime_identity_invalid", "Previous Runtime identity differs");
-      oldPython = safeDestination(previousRoot, manifest.payload.python.executable);
-    }
+    const old = previousRuntime(stateRoot, transaction, previousId, product);
+    // A same-ID repair replaces byte-identical files: running engines are unaffected and
+    // the trading service keeps running; only the Host restarts.
+    const tradingAffected = product === "live" && previousId !== prepared.manifest.runtime_id;
     const inspect = async () => {
-      const live = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : { jobs: [], pinned_runtime_ids: [] };
-      const unverified = live.jobs.filter(job => job.runtime_in_use && (job.runtime_id !== previousId || job.process_evidence !== "running"));
-      if (live.truncated || unverified.length) {
-        transaction.advance("inspect", { blockers: unverified.map(job => ({ job_ref: job.job_ref, runtime_id: job.runtime_id, process_evidence: job.process_evidence })) });
+      const trading = tradingAffected ? await tradingdCommand(home, ["--status"]) : null;
+      const legacy = product === "live" ? await legacyTradingJobs(old, liveStateRoot) : { jobs: [] };
+      const running = legacy.jobs.filter((job) => job.runtime_in_use);
+      const unverified = running.filter((job) => job.runtime_id !== previousId || job.process_evidence !== "running");
+      if (legacy.truncated || unverified.length) {
+        transaction.advance("inspect", { blockers: unverified.map((job) => ({ job_ref: job.job_ref, runtime_id: job.runtime_id, process_evidence: job.process_evidence })) });
         fail("runtime_process_identity_unverified", "An old task process cannot be verified");
       }
-      const processes = oldPython ? snapshotRuntimeProcesses({ python: oldPython, hostPid: identity?.pid ?? null,
-        birthOf: processBirth, authorized: transaction.value.authorized?.processes ?? [] }) : [];
-      for (const job of live.jobs.filter(job => job.runtime_in_use)) {
-        const birth = processBirth(job.pid);
-        if (!birth) fail("runtime_process_identity_unverified", "An execution process cannot be verified");
-        if (!processes.some(item => item.pid === job.pid)) processes.push({ pid: job.pid, birth, role: "execution" });
-      }
-      const ordinary = [];
-      const directory = join(productState, "runtime-jobs");
-      if (existsSync(directory)) {
-        if (lstatSync(directory).isSymbolicLink()) fail("runtime_job_state_invalid", "Job store is invalid");
-        for (const name of readdirSync(directory).filter(name => /^job_[A-Za-z0-9_-]+\.json$/.test(name))) {
-          const path = join(directory, name);
-          if (lstatSync(path).isSymbolicLink() || lstatSync(path).size > 1024 * 1024) fail("runtime_job_state_invalid", "Job record is invalid");
-          const job = JSON.parse(readFileSync(path, "utf8"));
-          if (identity && ["queued", "running", "cancelling"].includes(job.state)) ordinary.push({ job_ref: job.job_ref ?? name.slice(0, -5), runtime_id: job.runtime_id ?? previousId, kind: job.kind ?? "background" });
-        }
-      }
-      return { processes, jobs: [...ordinary, ...live.jobs.filter(job => job.runtime_in_use).map(job => ({ job_ref: job.job_ref, account_ref: job.account_ref, runtime_id: job.runtime_id, kind: job.kind }))], live };
+      const jobs = running.map((job) => ({ job_ref: job.job_ref, account_ref: job.account_ref, runtime_id: job.runtime_id, kind: job.kind }));
+      // Open trading work pauses on upgrade: the user confirms it (D47).
+      if (trading?.work_open) jobs.push({ job_ref: "trading_service", runtime_id: previousId, kind: "trading" });
+      return { processes: [], jobs, trading, legacy: running };
     };
     let snapshot = await inspect();
     if (snapshot.jobs.length > 200) fail("runtime_process_inventory_exceeded", "Too many tasks to confirm in one switch");
-    let authorized = transaction.value.authorized ?? (choice?.action === "stop_and_continue" ? previous.selection : null);
-    // Local development Hosts are detached from the launcher so an interrupted
-    // terminal/IDE session can orphan them under launchd. If there are no
-    // active jobs, the process snapshot is safe to reclaim automatically; do
-    // not turn an idle local restart into a user confirmation gate.
-    if (!authorized && environmentName === "local" && snapshot.jobs.length === 0 && snapshot.processes.length > 0) {
-      switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
-      authorized = transaction.value.selection;
-    }
-    if ((snapshot.processes.length || snapshot.jobs.length) && !selectionCovers(authorized, snapshot)) {
-      switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
+    const authorized = transaction.value.authorized ?? (choice?.action === "stop_and_continue" ? previous.selection : null);
+    if (snapshot.jobs.length && !selectionCovers(authorized, snapshot)) {
+      switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, processes: [], jobs: snapshot.jobs });
       return switchResult(transaction, "awaiting_confirmation");
     }
+    const stuck = (snapshot.trading?.engines ?? []).find((engine) => ["crash_loop", "unresponsive"].includes(engine.process));
+    if (stuck) fail("trading_engine_unresponsive", "Restart the trading service before upgrading");
     if (authorized) transaction.advance("quiesce", { authorized });
-    if (identity && (snapshot.processes.length || snapshot.jobs.length)) {
+    if (identity) {
       const admission = await controlHost(pluginStateRoot, previousId, product, "quiesce");
       quiesced = admission !== null;
-      if (admission === null && snapshot.jobs.length) fail("host_quiesce_failed", "The old Host cannot close task admission");
-      if (admission?.blockers.some(item => item.code !== "job_active")) fail("host_quiesce_failed", "Requests or invalid task state prevent switching");
-      snapshot = await inspect();
-      if (!selectionCovers(authorized, snapshot)) {
-        if (quiesced) await controlHost(pluginStateRoot, previousId, product, "resume");
-        quiesced = false;
-        switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...snapshot });
-        return switchResult(transaction, "awaiting_confirmation");
-      }
+      // Tasks keep running on the old Runtime (D44); only requests in flight block.
+      if (admission?.blockers.some((item) => item.code !== "job_active")) fail("host_quiesce_failed", "Requests or invalid task state prevent switching");
     }
-    // Persist authorization before effects so an interrupted confirmed switch can resume.
-    if (snapshot.processes.length || snapshot.jobs.length) {
-      transaction.advance("retire", { cutover_started: true, authorized });
-      for (const job of snapshot.live.jobs.filter(job => job.runtime_in_use)) {
-        await inspectPreparedJobs(prepared, liveStateRoot, "stop", { jobRef: job.job_ref, accountRef: job.account_ref,
+    transaction.advance("retire", { cutover_started: true, authorized });
+    if (snapshot.legacy.length) {
+      for (const job of snapshot.legacy)
+        await legacyTradingJobs(old, liveStateRoot, "stop", { jobRef: job.job_ref, accountRef: job.account_ref,
           idempotencyKey: `runtime-switch-${transaction.value.operation_id}-${job.job_ref}` });
-      }
-      const beforeHostStop = await inspect();
-      const currentHost = await switchHostIdentity(pluginStateRoot, product);
-      if (!selectionCovers(authorized, beforeHostStop)
-          || (currentHost && !authorized.processes.some(item => item.pid === currentHost.pid && item.birth === processBirth(currentHost.pid)))) {
-        if (quiesced) await controlHost(pluginStateRoot, previousId, product, "resume");
-        quiesced = false;
-        switchSelection(transaction, { product, environment: environmentName, runtimeId: previousId, ...beforeHostStop });
-        return switchResult(transaction, "awaiting_confirmation");
-      }
-      // Host shutdown requests normal worker/Dashboard teardown; exact process identities
-      // still get checked before bounded escalation if the owner does not finish.
-      if (identity) await stopHost(pluginStateRoot, previousId, product);
-      await stopAuthorizedProcesses(snapshot.processes, { birthOf: processBirth });
-      const remaining = await inspect();
-      if (remaining.processes.length || remaining.live.pinned_runtime_ids.length)
-        fail("runtime_process_in_use", "A process survived the confirmed Runtime switch");
+      snapshot = await inspect();
+      if (snapshot.legacy.length) fail("runtime_process_in_use", "An old trading task survived the confirmed switch");
     }
-    jobs = product === "live" ? await inspectPreparedJobs(prepared, liveStateRoot) : jobs;
-    const final = join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id));
+    if (identity) await stopHost(pluginStateRoot, previousId, product);
+    if (oldHostProcesses(old, identity).length) {
+      // A Host that did not stop on request: the manager first, so it does not restart it
+      // from the old launcher, then by its command line.
+      serviceManager(home, product, environmentName).stop("host");
+      const remaining = oldHostProcesses(old, identity);
+      if (remaining.length) await stopAuthorizedProcesses(remaining, { birthOf: processBirth });
+    }
+    // The old Host (and a v1 Dashboard) read this state; move it only once they are gone.
+    if (product === "live" && old !== null && existsSync(join(liveStateRoot, LEGACY_JOBS))) archiveLegacyTradingState(liveStateRoot);
+    if (snapshot.trading?.running) {
+      const drained = await tradingdCommand(home, ["--drain", "--hold-upgrade"], 180_000);
+      if (drained?.result === "failed") fail("trading_service_drain_timeout", "The trading service did not drain");
+    }
     if (prepared.runtimeRoot !== final) {
       mkdirSync(dirname(final), { recursive: true, mode: 0o700 });
       if (existsSync(final)) {
@@ -1384,10 +1751,10 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
       }
       renameSync(prepared.runtimeRoot, final);
     }
-    transaction.advance("start", { cutover_started: true });
-    const started = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort,
-      selectedRuntime: { root: final, manifest: prepared.manifest } });
-    return await commitRuntimeSwitch({ transaction, prepared, started, stateRoot, pluginStateRoot, liveStateRoot, product, pins: jobs.pinned_runtime_ids });
+    // Commit point: from here the switch only moves forward.
+    transaction.advance("commit", { cutover_started: true });
+    atomicJson(join(stateRoot, "current.json"), { schema: "edgepilot-runtime-pointer-v1", current_runtime_id: prepared.manifest.runtime_id, previous_runtime_id: null });
+    return await completeSwitch({ transaction, runtime: { root: final, manifest: prepared.manifest, reused: prepared.reused }, ...switchArguments });
   } catch (error) {
     transaction.failure(error);
     if (quiesced && oldRuntimeId && !transaction.value.cutover_started) await controlHost(pluginStateRoot, oldRuntimeId, product, "resume");
@@ -1445,14 +1812,14 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
     runtimeInventoryPreflightScript(),
     "from edgepilot_runtime_host.contracts.runtime_manifest import RuntimeManifestEnvelope",
     "from edgepilot_runtime_host.release import RuntimeArtifactVerifier,RuntimePlatform",
-    "from edgepilot_runtime_host.release.probe import RuntimeWorkerProbe",
+    "from edgepilot_runtime_host.release.probe import RuntimeProbe",
     "after_import=runtime_inventory()",
     "(_ for _ in ()).throw(RuntimeError(f'Runtime import mutated tree dont_write={sys.dont_write_bytecode} extra={sorted(after_import-expected)[:10]}')) if after_import!=expected else None",
     "manifest=RuntimeManifestEnvelope.from_dict(raw)",
     "print('runtime_probe_stage=verify_tree',flush=True)",
     "RuntimeArtifactVerifier(RuntimePlatform.current()).verify_tree(root,manifest,allow_installed_manifest=True)",
-    "print('runtime_probe_stage=worker_probe',flush=True)",
-    "RuntimeWorkerProbe(pathlib.Path(sys.argv[2]),timeout=10.0)(root,manifest)",
+    "print('runtime_probe_stage=product_probe',flush=True)",
+    "RuntimeProbe(pathlib.Path(sys.argv[2]))(root,manifest)",
   ].join("\n");
   try {
     await new Promise((accept, reject) => {
@@ -1471,7 +1838,7 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
         settled = true;
         child.kill("SIGKILL");
         atomicJson(join(stateRoot, "probe-failure.json"), { schema: "edgepilot-runtime-probe-failure-v1", code: "runtime_probe_timeout", diagnostic: tail });
-        reject(new BootstrapError("runtime_probe_timeout", "Runtime worker probe timed out"));
+        reject(new BootstrapError("runtime_probe_timeout", "Runtime probe timed out"));
       }, RUNTIME_PROBE_TIMEOUT_MS);
       child.once("error", (error) => {
         if (settled) return;
@@ -1487,7 +1854,7 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
         if (code === 0) accept();
         else {
           atomicJson(join(stateRoot, "probe-failure.json"), { schema: "edgepilot-runtime-probe-failure-v1", code: "runtime_probe_failed", exit_code: code, diagnostic: tail || null });
-          reject(new BootstrapError("runtime_probe_failed", "Runtime worker probe failed"));
+          reject(new BootstrapError("runtime_probe_failed", "Runtime probe failed"));
         }
       });
     });
@@ -1521,7 +1888,7 @@ async function download(url, destination, maximumBytes, timeoutMs = METADATA_DOW
   }
 }
 
-export async function installFromFunctionalChannel({ home, stateRoot, channelUrl, expectedProduct, expectedProductVersion = null, expectedRuntimeIds = [], liveStateRoot = null, beforeActivate = null, enforcePlatform = true, probe = probeRuntime, repair = false }) {
+export async function installFromFunctionalChannel({ home, stateRoot, channelUrl, expectedProduct, expectedProductVersion = null, expectedRuntimeIds = [], beforeActivate = null, enforcePlatform = true, probe = probeRuntime, repair = false }) {
   const downloads = join(home, "downloads");
   mkdirSync(downloads, { recursive: true, mode: 0o700 });
   const channelPath = join(downloads, `channel-${randomUUID()}.json`);
@@ -1558,7 +1925,7 @@ export async function installFromFunctionalChannel({ home, stateRoot, channelUrl
     if (manifestProduct(manifest) !== expectedProduct) fail("runtime_product_incompatible", "Runtime manifest contains another product profile");
     if (manifest.runtime_id !== selected.target.runtime_id || manifest.payload.archive_size !== selected.target.archive_size || manifest.payload.archive_sha256 !== selected.target.archive_sha256) fail("channel_runtime_mismatch", "Runtime manifest differs from channel");
     await download(selected.target.archive_url, archivePath, selected.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS);
-    const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: null, liveStateRoot, beforeActivate, enforcePlatform, probe, repair });
+    const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: null, beforeActivate, enforcePlatform, probe, repair });
     atomicJson(join(stateRoot, "channel.json"), { schema: "edgepilot-installed-channel-v1", channel: selected.channel.channel, runtime_id: installed.manifest.runtime_id });
     return installed;
   } finally {
@@ -1587,7 +1954,7 @@ export async function installFromChannel({ home, stateRoot, config, runtimePin =
     if (selectedKey === undefined) fail("channel_runtime_signer_mismatch", "Runtime signer differs from the signed channel selection");
     verifyEnvelopeSignatures(manifest.signatures, new Map([[channel.target.signing_key_id, selectedKey]]), Buffer.concat([MANIFEST_DOMAIN, canonicalBytes(manifest.payload)]), "Runtime manifest");
     await download(channel.target.archive_url, archivePath, channel.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS);
-    const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: config.keys, liveStateRoot: config.liveStateRoot ?? null, enforcePlatform, probe });
+    const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: config.keys, enforcePlatform, probe });
     atomicJson(join(stateRoot, "channel.json"), {
       schema: "edgepilot-installed-channel-v1",
       channel: config.channel,
@@ -1683,35 +2050,10 @@ export async function stopHost(pluginStateRoot, runtimeId, product) {
   return false;
 }
 
-export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys, trustedKeyArguments, marketplaceOrigin = null, environmentName = "production", hostPort = DEFAULT_HOST_PORT, selectedRuntime = null }) {
-  const { root, manifest } = selectedRuntime ?? await activeRuntime(stateRoot, trustedKeys);
+function hostArguments({ root, manifest, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys, trustedKeyArguments, marketplaceOrigin, environmentName, hostPort, liveDashboardPort, researchDashboardPort }) {
   const product = manifestProduct(manifest);
-  const liveDashboardPort = Number(process.env.EDGEPILOT_LIVE_DASHBOARD_PORT ?? 8787);
-  const researchDashboardPort = Number(process.env.EDGEPILOT_RESEARCH_DASHBOARD_PORT ?? 8686);
-  validateEnvironmentIsolation({
-    product,
-    environmentName,
-    marketplaceOrigin,
-    runtimeHome: dirname(stateRoot),
-    liveStateRoot,
-    researchStateRoot,
-    liveDashboardPort,
-    researchDashboardPort,
-  });
-  const connections = join(pluginStateRoot, "connections");
-  if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) {
-    const dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product);
-    return { alreadyRunning: true, runtimeId: manifest.runtime_id, dashboard };
-  }
-  if (await switchHostIdentity(pluginStateRoot, product))
-    fail("runtime_switch_confirmation_required", "A different Host must be confirmed before replacement");
-  mkdirSync(join(stateRoot, "logs"), { recursive: true, mode: 0o700 });
-  const logPath = join(stateRoot, "logs", "host.log");
-  rotateHostLog(logPath);
-  const log = openSync(logPath, constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND, 0o600);
-  const python = safeDestination(root, manifest.payload.python.executable);
-  const hostArguments = [
-    "-I", "-B", "-m", "edgepilot_runtime_host.host_main",
+  if (product === "live" && !marketplaceOrigin) fail("marketplace_origin_missing", "Live Runtime requires --marketplace-origin");
+  const values = [
     "--runtime-state-root", stateRoot,
     "--runtime-id", manifest.runtime_id,
     "--plugin-state-root", pluginStateRoot,
@@ -1720,83 +2062,141 @@ export async function startHost({ stateRoot, pluginStateRoot, liveStateRoot, res
     "--research-plugin-template", join(root, "plugins", "edgepilot-research"),
     "--live-plugin-template", join(root, "plugins", "edgepilot-live"),
     "--host-port", String(hostPort),
+    "--environment", environmentName,
   ];
-  if (product === "live" && !marketplaceOrigin) fail("marketplace_origin_missing", "Live Runtime requires --marketplace-origin");
-  hostArguments.push("--environment", environmentName);
-  if (marketplaceOrigin) hostArguments.push("--marketplace-origin", marketplaceOrigin);
-  hostArguments.push("--live-dashboard-port", String(liveDashboardPort));
-  hostArguments.push("--research-dashboard-port", String(researchDashboardPort));
-  if (trustedKeys === null) hostArguments.push("--functional-unsigned");
-  for (const value of trustedKeyArguments) hostArguments.push("--trusted-key", value);
-  const child = spawn(python, hostArguments, { detached: true, stdio: ["ignore", log, log], windowsHide: true,
-    env: { ...cleanHostEnvironment(), EDGEPILOT_BOOTSTRAP_OWNS_CUTOVER: "1" } });
-  closeSync(log);
-  let spawnError = null;
-  child.once("error", (error) => { spawnError = error; });
+  if (marketplaceOrigin) values.push("--marketplace-origin", marketplaceOrigin);
+  values.push("--live-dashboard-port", String(liveDashboardPort), "--research-dashboard-port", String(researchDashboardPort));
+  if (trustedKeys === null) values.push("--functional-unsigned");
+  for (const value of trustedKeyArguments) values.push("--trusted-key", value);
+  return values;
+}
+
+function serviceManager(home, product, environmentName) {
+  return new ServiceManager({ home, product, environment: environmentName });
+}
+
+/**
+ * Rewrite the launcher for ``runtime`` and record how the Host may start and restart the
+ * trading service (D40, D43). Runs on every start so moved Node or bootstrap paths heal.
+ */
+function refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode }) {
+  writeLauncher(home, {
+    runtimeId: runtime.manifest.runtime_id,
+    python: safeDestination(runtime.root, runtime.manifest.payload.python.executable),
+    host: hostArgs,
+    tradingd: product === "live" ? { stateRoot: liveStateRoot, environment: environmentName } : null,
+    environment: capturedEnvironment(),
+  });
+  const common = ["--product", product, "--runtime-home", home, "--environment", environmentName,
+    "--live-state-root", liveStateRoot, "--research-state-root", researchStateRoot,
+    ...(marketplaceOrigin ? ["--marketplace-origin", marketplaceOrigin] : [])];
+  const bootstrap = realpathSync(fileURLToPath(import.meta.url));
+  const names = serviceManager(home, product, environmentName).names;
+  const python = safeDestination(runtime.root, runtime.manifest.payload.python.executable);
+  writeServicesRecord(home, {
+    product, environment: environmentName, mode, launcher: launcherPath(home), services: names,
+    // Windows runs trading service commands without the .vbs launcher (tradingdCommand).
+    ...(product === "live" ? {
+      tradingd_command: [python, "-I", "-B", "-m", "edgepilot.tradingd", "--environment", environmentName],
+      tradingd_environment: { ...capturedEnvironment(), EDGEPILOT_HOME: liveStateRoot, EDGEPILOT_RUNTIME_ID: runtime.manifest.runtime_id },
+    } : {}),
+    control: product === "live" ? {
+      start_tradingd: [process.execPath, bootstrap, "service", "start", "--service", "tradingd", ...common],
+      restart_tradingd: [process.execPath, bootstrap, "service", "restart", "--service", "tradingd", ...common],
+    } : {},
+  });
+}
+
+/**
+ * Run ``edgepilot.tradingd`` with a control flag through the launcher, so it resolves the
+ * same socket directory as the service (D45). Returns the printed JSON, or null when the
+ * launcher does not exist yet (nothing installed the trading service).
+ */
+export async function tradingdCommand(home, args, timeoutMs = 60_000) {
+  const launcher = launcherPath(home);
+  if (!existsSync(launcher)) return null;
+  let command, commandArguments, environment = { ...cleanHostEnvironment() };
+  if (process.platform === "win32") {
+    // The .vbs launcher cannot return output; named pipes do not depend on the environment.
+    const record = readServicesRecord(home);
+    if (!record?.tradingd_command) return null;
+    [command, ...commandArguments] = [...record.tradingd_command, ...args];
+    environment = { ...environment, ...record.tradingd_environment };
+  } else {
+    [command, commandArguments] = ["/bin/sh", [launcher, "tradingd", ...args]];
+  }
+  return new Promise((accept, reject) => {
+    const child = spawn(command, commandArguments, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true, env: environment });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output = (output + chunk.toString("utf8")).slice(-65536); });
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.once("error", () => { clearTimeout(timer); reject(new BootstrapError("trading_service_command_failed", "Trading service command could not start")); });
+    child.once("close", () => {
+      clearTimeout(timer);
+      try { accept(JSON.parse(output.trim().split("\n").at(-1))); }
+      catch { reject(new BootstrapError("trading_service_command_failed", "Trading service command returned no result")); }
+    });
+  });
+}
+
+async function waitForTradingService(home, timeoutMs = 30_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const status = await tradingdCommand(home, ["--status"]);
+    if (status?.running) return status;
+    await new Promise((accept) => setTimeout(accept, 500));
+  }
+  fail("trading_service_start_timeout", "The trading service did not start");
+}
+
+export async function startHost({ home = null, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys, trustedKeyArguments, marketplaceOrigin = null, environmentName = "production", hostPort = DEFAULT_HOST_PORT, selectedRuntime = null }) {
+  const runtime = selectedRuntime ?? await activeRuntime(stateRoot, trustedKeys);
+  const { manifest } = runtime;
+  const product = manifestProduct(manifest);
+  const runtimeHome = home ?? dirname(stateRoot);
+  const liveDashboardPort = Number(process.env.EDGEPILOT_LIVE_DASHBOARD_PORT ?? 8787);
+  const researchDashboardPort = Number(process.env.EDGEPILOT_RESEARCH_DASHBOARD_PORT ?? 8686);
+  validateEnvironmentIsolation({
+    product,
+    environmentName,
+    marketplaceOrigin,
+    runtimeHome,
+    liveStateRoot,
+    researchStateRoot,
+    liveDashboardPort,
+    researchDashboardPort,
+  });
+  const hostArgs = hostArguments({ root: runtime.root, manifest, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys,
+    trustedKeyArguments, marketplaceOrigin, environmentName, hostPort, liveDashboardPort, researchDashboardPort });
+  const connections = join(pluginStateRoot, "connections");
+  const services = serviceManager(runtimeHome, product, environmentName);
+  const refresh = (mode) => refreshServices({ home: runtimeHome, runtime, product, environmentName, marketplaceOrigin,
+    liveStateRoot, researchStateRoot, hostArgs, mode });
+  const running = await probeConnection(join(connections, `${product}.json`), manifest.runtime_id);
+  if (!running && await switchHostIdentity(pluginStateRoot, product))
+    fail("runtime_switch_confirmation_required", "A different Host must be confirmed before replacement");
+  refresh(readServicesRecord(runtimeHome)?.mode ?? null);
+  mkdirSync(join(stateRoot, "logs"), { recursive: true, mode: 0o700 });
+  // The trading service keeps running across Host restarts; start it whenever Live is used.
+  if (product === "live") {
+    rotateHostLog(join(stateRoot, "logs", "tradingd.log"));
+    services.ensureRunning("tradingd");
+  }
+  if (running) {
+    if (services.mode !== null) refresh(services.mode);
+    return { alreadyRunning: true, runtimeId: manifest.runtime_id };
+  }
+  rotateHostLog(join(stateRoot, "logs", "host.log"));
+  services.ensureRunning("host");
+  refresh(services.mode);
   const deadline = Date.now() + HOST_START_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    if (spawnError !== null) fail("host_start_failed", "Runtime Host process could not start");
-    if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) {
-      let dashboard;
-      try { dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product); } catch (error) { await stopChild(child); throw error; }
-      child.unref();
-      return { alreadyRunning: child.exitCode !== null, runtimeId: manifest.runtime_id, dashboard, ...(child.exitCode === null ? { pid: child.pid } : {}) };
-    }
-    if (child.exitCode !== null) {
-      await new Promise((accept) => setTimeout(accept, 100));
-      if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id)) { const dashboard = await startDashboard(pluginStateRoot, manifest.runtime_id, product); return { alreadyRunning: true, runtimeId: manifest.runtime_id, dashboard }; }
-      continue;
-    }
+    // The Host serves the product page itself; a ready Host is a ready page.
+    if (await probeConnection(join(connections, `${product}.json`), manifest.runtime_id))
+      return { alreadyRunning: false, runtimeId: manifest.runtime_id, service_mode: services.mode };
     await new Promise((accept) => setTimeout(accept, 100));
   }
-  await stopChild(child);
   fail("host_start_timeout", "Runtime Host did not become ready");
-}
-
-export async function startDashboard(pluginStateRoot, runtimeId, product) {
-  const connectionPath = join(pluginStateRoot, "connections", `${product}.json`);
-  if (!await probeConnection(connectionPath, runtimeId)) fail("host_not_ready", "target Host identity differs");
-  const connection = JSON.parse(await readFile(connectionPath, "utf8"));
-  if (!validControlConnection(connection, product)) fail("connection_state_invalid", "Dashboard connection must be loopback and product-bound");
-  const authority = JSON.parse(await readFile(join(pluginStateRoot, "connection-authority.json"), "utf8"));
-  const endpoint = new URL(connection.endpoint);
-  endpoint.pathname = `/peer/${product}`;
-  let response;
-  try { response = await fetch(endpoint, {
-    // Includes listener inspection (5s), readiness (10s), and bounded child cleanup.
-    // Host Dashboard readiness is bounded at 60 seconds on cold Windows starts;
-    // leave request headroom so Bootstrap does not abort the peer call first.
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(90_000),
-    headers: { Authorization: ["Bearer", authority[`${product}_app`]].join(" "), "Content-Type": "application/json" },
-    body: JSON.stringify({ method: "dashboard.start" }),
-  }); } catch (error) {
-    fail(error?.name === "TimeoutError" ? "dashboard_request_timeout" : "dashboard_request_failed", "Dashboard lifecycle request failed");
-  }
-  let body;
-  try { body = await response.json(); } catch { fail("dashboard_response_invalid", "Dashboard lifecycle response is invalid"); }
-  const ownerErrors = new Set(["dashboard_start_failed", "dashboard_start_timeout", "dashboard_identity_mismatch", "dashboard_handoff_failed", "dashboard_port_inspection_failed", "dashboard_port_stop_failed"]);
-  if (!response.ok && ownerErrors.has(body?.error?.code)) fail(body.error.code, "Dashboard owner rejected startup; inspect runtime/logs/dashboard-<product>-startup.json");
-  if (!response.ok || body?.result?.running !== true || body.result.runtime_id !== runtimeId || body.result.profile !== product) fail("dashboard_not_ready", "target Dashboard did not become ready");
-  if (!await probeConnection(connectionPath, runtimeId)) fail("host_not_ready", "Runtime changed during Dashboard startup");
-  return body.result;
-}
-
-async function stopChild(child) {
-  if (child.exitCode !== null) return;
-  try { child.kill("SIGTERM"); } catch { return; }
-  const graceful = await waitChild(child, 5_000);
-  if (graceful || child.exitCode !== null) return;
-  try { child.kill("SIGKILL"); } catch { return; }
-  await waitChild(child, 2_000);
-}
-
-function waitChild(child, milliseconds) {
-  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
-  return new Promise((accept) => {
-    const exited = () => { clearTimeout(timer); accept(true); };
-    const timer = setTimeout(() => { child.off("exit", exited); accept(false); }, milliseconds);
-    child.once("exit", exited);
-  });
 }
 
 function ensureLoopbackNoProxy(environment) {
@@ -1858,13 +2258,12 @@ export async function doctor({ stateRoot, pluginStateRoot, liveStateRoot, truste
       const response = await fetch(endpoint, { method: "POST", headers: { Authorization: ["Bearer", authority[`${product}_app`]].join(" "), "Content-Type": "application/json" }, body: "{}", redirect: "error", signal: AbortSignal.timeout(2_000) });
       if (response.ok) {
         const value = await response.json();
-        if (value.runtime_id === runtimeId) host = { pid: value.pid, running: true, started_at: value.started_at, endpoint: `${endpoint.origin}`, workers: value.workers };
+        if (value.runtime_id === runtimeId) host = { pid: value.pid, running: true, started_at: value.started_at, endpoint: `${endpoint.origin}`, products: value.products };
       }
     } catch { /* the process/connection summary above remains authoritative */ }
   }
   const logs = join(stateRoot, "logs");
   const logBytes = existsSync(logs) ? directoryBytes(logs) : 0;
-  const pins = product === "live" ? [...await reconciledPins(stateRoot, liveStateRoot)].sort() : [];
   let recentError = null;
   try { recentError = JSON.parse(readFileSync(join(stateRoot, "probe-failure.json"), "utf8"))?.code ?? null; } catch { recentError = null; }
   return {
@@ -1880,36 +2279,37 @@ export async function doctor({ stateRoot, pluginStateRoot, liveStateRoot, truste
       tree_verified: true,
     },
     host,
-    workers: profiles,
-    active_pinned_runtime_ids: pins,
+    connections: profiles,
+    services: readServicesRecord(dirname(stateRoot))?.mode ?? null,
+    legacy_trading_state: product === "live" ? legacyTradingStatePresent(liveStateRoot) : false,
     lifecycle: readLifecycleState(stateRoot),
     recent_error_code: recentError,
     logs: { directory: "runtime/logs", bytes: logBytes, maximum_file_bytes: 10 * 1024 * 1024, retained_files: 3 },
   };
 }
 
-async function reconciledPins(stateRoot, liveStateRoot) {
-  const pins = livePinnedRuntimeIds(liveStateRoot);
-  if (!existsSync(join(liveStateRoot, "runtime-live-process-jobs"))) return pins;
-  let active;
-  try { active = await activeRuntime(stateRoot, null); }
-  catch {
-    const pending = readLifecycleState(stateRoot);
-    if (!pending?.target_runtime_id) return pins;
-    try { active = await runtimeById(stateRoot, pending.target_runtime_id, null); }
-    catch {
-      try { active = await runtimeById(join(stateRoot, "prepared"), pending.target_runtime_id, null); }
-      catch { return pins; }
-    }
+/**
+ * v2/11 section 4: refuse while trading work is unfinished, drain and unregister the
+ * services, then delete the Runtime. Product state is kept; deleting it is left to the
+ * user (D46).
+ */
+export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName = "production" }) {
+  const home = dirname(stateRoot);
+  if (product === "live" && legacyTradingStatePresent(liveStateRoot))
+    fail("legacy_trading_state_present", "Upgrade once so the old trading tasks are handed over before uninstalling");
+  const trading = product === "live" ? await tradingdCommand(home, ["--status"]) : null;
+  if (trading?.work_open) fail("trading_work_open", "Stop the running strategies before uninstalling");
+  const releases = join(stateRoot, "releases");
+  const executables = existsSync(releases) ? readdirSync(releases).filter((name) => /^[0-9a-f]{64}$/u.test(name)).flatMap((name) => {
+    try {
+      const manifest = validateManifest(JSON.parse(readFileSync(join(releases, name, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
+      return [safeDestination(join(releases, name), manifest.payload.python.executable)];
+    } catch { return []; }
+  }) : [];
+  if (trading?.running) {
+    const drained = await tradingdCommand(home, ["--drain"], 180_000);
+    if (drained?.result === "failed") fail("trading_service_drain_timeout", "The trading service did not drain");
   }
-  if (!active.manifest.payload.files.some(file => file.path.endsWith("/edgepilot/runtime_maintenance.py"))) return pins;
-  const result = await inspectPreparedJobs({ runtimeRoot: active.root, manifest: active.manifest }, liveStateRoot, "inspect");
-  return new Set(result.pinned_runtime_ids);
-}
-
-export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product }) {
-  const pins = product === "live" ? await reconciledPins(stateRoot, liveStateRoot) : new Set();
-  if (pins.size > 0) fail("runtime_pinned", "Runtime uninstall is blocked by active persistent jobs");
   let running = false;
   let runtimeId = null;
   const registered = registeredConnection(pluginStateRoot, product);
@@ -1919,6 +2319,11 @@ export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRo
   }
   if (running && !(await stopHost(pluginStateRoot, runtimeId, product))) fail("host_stop_failed", "verified Runtime Host must stop before uninstall");
   if (recordedHostAlive(stateRoot)) fail("host_stop_failed", "An unresponsive Host must retire before uninstall");
+  // A task finishing on this Runtime (D44) still runs its interpreter.
+  if (executables.length && runtimeExecutablesInUse(executables).size) fail("runtime_in_use", "A task still runs on this Runtime; wait for it or cancel it");
+  const services = serviceManager(home, product, environmentName);
+  for (const kind of services.kinds()) services.unregister(kind);
+  for (const path of [launcherPath(home), join(stateRoot, "services.json")]) rmSync(path, { force: true });
   return withInstallLock(stateRoot, async () => {
     for (const name of ["releases", "probes", "logs"]) {
       const path = join(stateRoot, name);
@@ -1956,6 +2361,59 @@ function recordedHostAlive(stateRoot) {
   if (!existsSync(path)) return false;
   try { const owner = JSON.parse(readFileSync(path, "utf8")); return Number.isSafeInteger(owner.pid) && owner.pid > 0 && processExists(owner.pid); }
   catch { fail("host_state_invalid", "Host ownership cannot be verified"); }
+}
+
+/**
+ * ``bootstrap service <status|start|restart|stop> --service host|tradingd [--force yes]``
+ * (v2/11 section 2). The Host runs ``start`` and ``restart`` of the trading service
+ * through the commands recorded in ``services.json`` (D43).
+ */
+async function serviceCommand({ action, kind, force, home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin }) {
+  if (!["status", "start", "restart", "stop"].includes(action) || !["host", "tradingd"].includes(kind)) fail("usage", "service <status|start|restart|stop> --service host|tradingd");
+  if (kind === "tradingd" && product !== "live") fail("usage", "Only Live has a trading service");
+  const services = serviceManager(home, product, environmentName);
+  const status = async () => ({
+    mode: readServicesRecord(home)?.mode ?? null,
+    registered: services.registered(kind),
+    ...(kind === "tradingd" ? { tradingd: await tradingdCommand(home, ["--status"]) }
+      : { host: await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), (await activeRuntime(stateRoot, null)).manifest.runtime_id) }),
+  });
+  if (action === "status") return { schema: "edgepilot-bootstrap-result-v1", service: await status() };
+  if (kind === "host") {
+    const runtime = await activeRuntime(stateRoot, null);
+    if (action !== "start") {
+      const running = await probeConnection(join(pluginStateRoot, "connections", `${product}.json`), runtime.manifest.runtime_id);
+      if (running && !(await stopHost(pluginStateRoot, runtime.manifest.runtime_id, product))) fail("host_stop_failed", "the verified Runtime Host did not stop");
+    }
+    if (action !== "stop") await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [],
+      marketplaceOrigin, environmentName, selectedRuntime: runtime });
+    return { schema: "edgepilot-bootstrap-result-v1", service: await status() };
+  }
+  if (action !== "start") {
+    const drained = await tradingdCommand(home, ["--drain"], 180_000);
+    if (drained?.result === "failed") {
+      // An engine that does not answer cannot drain; only an explicit restart or a forced
+      // stop ends it, by its command line (11 section 1.3).
+      if (action === "stop" && !force) fail("trading_service_drain_timeout", "The trading service did not drain; use --force yes to stop it");
+      const runtime = await activeRuntime(stateRoot, null);
+      const python = safeDestination(runtime.root, runtime.manifest.payload.python.executable);
+      const processes = runtimeProcessesByRole({ python, roles: ["tradingd", "engine"], birthOf: processBirth });
+      await stopAuthorizedProcesses(processes, { birthOf: processBirth });
+    }
+  }
+  if (action !== "stop") {
+    const runtime = await activeRuntime(stateRoot, null);
+    const liveDashboardPort = Number(process.env.EDGEPILOT_LIVE_DASHBOARD_PORT ?? 8787);
+    const researchDashboardPort = Number(process.env.EDGEPILOT_RESEARCH_DASHBOARD_PORT ?? 8686);
+    const hostArgs = hostArguments({ root: runtime.root, manifest: runtime.manifest, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot,
+      trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, hostPort: DEFAULT_HOST_PORT, liveDashboardPort, researchDashboardPort });
+    refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode: readServicesRecord(home)?.mode ?? null });
+    rotateHostLog(join(stateRoot, "logs", "tradingd.log"));
+    services.ensureRunning("tradingd");
+    refreshServices({ home, runtime, product, environmentName, marketplaceOrigin, liveStateRoot, researchStateRoot, hostArgs, mode: services.mode });
+    await waitForTradingService(home);
+  }
+  return { schema: "edgepilot-bootstrap-result-v1", service: await status() };
 }
 
 function trustedKeyOptions(options) {
@@ -1999,26 +2457,34 @@ function absoluteOption(options, name, fallback) {
   return resolve(value);
 }
 
-const LIFECYCLE_COMMANDS = ["ensure-start", "start", "update", "repair", "status", "stop", "restart", "runtime-blockers", "stop-job", "uninstall", "gc", "doctor"];
+const LIFECYCLE_COMMANDS = ["ensure-start", "start", "update", "repair", "status", "stop", "restart", "service", "uninstall", "gc", "doctor"];
+const SERVICE_ACTIONS = ["status", "start", "restart", "stop"];
+
+// ``service <action> --name value ...``: the action is the only positional argument.
+function commandOptions(arguments_) {
+  if (arguments_[0] !== "service") return parseOptions(arguments_.slice(1));
+  if (!SERVICE_ACTIONS.includes(arguments_[1])) fail("usage", "service <status|start|restart|stop> --service host|tradingd");
+  return parseOptions(arguments_.slice(2));
+}
 
 export async function cli(arguments_) {
   const command = arguments_[0];
   // Reject unknown commands before any lock or state directory is created.
   if (!LIFECYCLE_COMMANDS.includes(command)) fail("usage", "Unknown Runtime lifecycle command");
-  const options = parseOptions(arguments_.slice(1));
+  const options = commandOptions(arguments_);
   const product = option(options, "product", null);
   if (!["live", "research"].includes(product)) fail("usage", "bootstrap requires --product live|research");
   const home = absoluteOption(options, "runtime-home", join(homedir(), `.edgepilot-runtime-${product}-production`));
   const environmentName = option(options, "environment", "production");
   validateEnvironmentIsolation({ product, environmentName, marketplaceOrigin: option(options, "marketplace-origin", product === "live" ? (environmentName === "local" ? LOCAL_MARKETPLACE_ORIGIN : PRODUCTION_MARKETPLACE_ORIGIN) : null), runtimeHome: home, liveStateRoot: absoluteOption(options, "live-state-root", join(homedir(), ".edgepilot")), researchStateRoot: absoluteOption(options, "research-state-root", join(homedir(), ".edgepilot-research")), liveDashboardPort: Number(process.env.EDGEPILOT_LIVE_DASHBOARD_PORT ?? 8787), researchDashboardPort: Number(process.env.EDGEPILOT_RESEARCH_DASHBOARD_PORT ?? 8686) });
-  if (["status", "doctor"].includes(command)) return cliUnlocked(arguments_);
+  if (["status", "doctor"].includes(command) || (command === "service" && arguments_[1] === "status")) return cliUnlocked(arguments_);
   return withLifecycleLock(join(home, "runtime"), () => cliUnlocked(arguments_));
 }
 
 async function cliUnlocked(arguments_) {
   const command = arguments_[0];
   if (!LIFECYCLE_COMMANDS.includes(command)) fail("usage", "Unknown Runtime lifecycle command");
-  const options = parseOptions(arguments_.slice(1));
+  const options = commandOptions(arguments_);
   const product = option(options, "product", null);
   if (!["live", "research"].includes(product)) fail("usage", "bootstrap requires --product live|research");
   const environmentName = option(options, "environment", "production");
@@ -2030,13 +2496,11 @@ async function cliUnlocked(arguments_) {
   const liveStateRoot = absoluteOption(options, "live-state-root", join(homedir(), ".edgepilot"));
   const researchStateRoot = absoluteOption(options, "research-state-root", join(homedir(), ".edgepilot-research"));
   const trusted = optionMany(options, "trusted-key").length === 0 ? { keys: null, values: [] } : trustedKeyOptions(options);
-  if (["runtime-blockers", "stop-job"].includes(command)) {
-    if (product !== "live") fail("maintenance_operation_invalid", "Live management is unavailable for Research");
-    const prepared = await prepareBoundRuntime({ home, stateRoot, channelUrl: option(options, "channel-url"), product,
-      version: option(options, "expected-product-version"), runtimeIds: optionMany(options, "expected-runtime-id") });
-    return inspectPreparedJobs(prepared, liveStateRoot, command === "stop-job" ? "stop" : "inspect", command !== "runtime-blockers" ? {
-      jobRef: option(options, "job-ref"), accountRef: option(options, "account-ref"), idempotencyKey: option(options, "idempotency-key"),
-    } : {});
+  if (command === "service") {
+    const force = option(options, "force", "no");
+    if (!["yes", "no"].includes(force)) fail("usage", "--force takes yes or no");
+    return serviceCommand({ action: arguments_[1], kind: option(options, "service", null), force: force === "yes", home, stateRoot, pluginStateRoot,
+      liveStateRoot, researchStateRoot, product, environmentName, marketplaceOrigin });
   }
   if (command === "doctor") {
     const value = await doctor({ stateRoot, pluginStateRoot, liveStateRoot, trustedKeys: trusted.keys, product });
@@ -2044,9 +2508,9 @@ async function cliUnlocked(arguments_) {
     if (output !== null) atomicJson(absoluteOption(options, "output"), value);
     return { ...value, diagnostic_output: output === null ? null : absoluteOption(options, "output") };
   }
-  if (command === "gc") return { schema: "edgepilot-bootstrap-result-v1", gc: await garbageCollect({ stateRoot, liveStateRoot: product === "live" ? liveStateRoot : null, pluginStateRoot, pinnedRuntimeIds: product === "live" ? await reconciledPins(stateRoot, liveStateRoot) : [], maximumReleases: Number(option(options, "maximum-releases", "1")), maximumBytes: Number(option(options, "maximum-bytes", String(5 * 1024 ** 3))) }) };
+  if (command === "gc") return { schema: "edgepilot-bootstrap-result-v1", gc: await garbageCollect({ stateRoot, pluginStateRoot, maximumReleases: Number(option(options, "maximum-releases", "1")), maximumBytes: Number(option(options, "maximum-bytes", String(5 * 1024 ** 3))) }) };
   if (command === "uninstall") {
-    return uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product });
+    return uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, environmentName });
   }
   if (["status", "stop"].includes(command)) {
     const registered = registeredConnection(pluginStateRoot, product);
@@ -2097,14 +2561,12 @@ async function cliUnlocked(arguments_) {
       fail("plugin_session_stale", "An older plugin cannot replace a newer lifecycle transaction");
     }
     if (active !== null && expectedProductVersion !== null && compareSemver(active.manifest.payload.release_version, expectedProductVersion) > 0) fail("plugin_session_stale", "older plugin cannot alter the active Runtime");
-    const resumeTarget = pending?.cutover_started && ["start", "commit"].includes(pending.interrupted_phase ?? pending.phase)
-      && pending.target_runtime_id === active?.manifest.runtime_id;
     const ordinaryStart = command !== "repair" && !pending?.cutover_started;
     const currentHost = active === null ? null : await switchHostIdentity(pluginStateRoot, product);
     if (active !== null && choice?.action !== "defer" && active.manifest.payload.release_version === expectedProductVersion
         && (currentHost === null || currentHost.runtime_id === active.manifest.runtime_id)
         && expectedRuntimeIds.includes(active.manifest.runtime_id)
-        && (ordinaryStart || resumeTarget || (command !== "repair" && pending?.phase === "ready"))) {
+        && (ordinaryStart || (command !== "repair" && pending?.phase === "ready"))) {
       const host = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, selectedRuntime: active });
       if (pending && pending.target_version === expectedProductVersion && pending.target_ids.includes(active.manifest.runtime_id)
           && (!pending.target_runtime_id || pending.target_runtime_id === active.manifest.runtime_id) && pending.phase !== "ready") {
