@@ -15,6 +15,9 @@ const SEARCH_FORWARD_TIMEOUT_MS = 4_000;
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const searchResultsResourceUri = (runtimeId) => `ui://edgepilot/strategy-search-results-v1/${runtimeId.slice("sha256:".length)}.html`;
+// A release directory is named by the first 16 hex digits of the Runtime ID (Bootstrap
+// runtimeDirectory); its manifest's runtime_id stays the identity.
+const releaseDirectory = (runtimeId) => runtimeId.slice("sha256:".length, "sha256:".length + 16);
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
   "edgepilot_tool_search",
@@ -80,9 +83,10 @@ async function handleRequest(request) {
     }
     if (name === "edgepilot_runtime_diagnose") {
       requireEmpty(argumentsValue);
+      const diagnosis = await runtimeDiagnosis();
       return resultResponse(id, {
-        content: [{ type: "text", text: "Read-only Runtime install/startup diagnostics collected. Explain the failing step from lifecycle, host_log and last_operation evidence; separate confirmed causes from guesses. Do not start, update, repair or stop anything unless the user asks." }],
-        structuredContent: await runtimeDiagnosis(),
+        content: [{ type: "text", text: diagnosisText(diagnosis) }],
+        structuredContent: diagnosis,
       });
     }
     if (name === "edgepilot_strategy_search") return resultResponse(id, await executeStrategySearch(argumentsValue));
@@ -195,7 +199,7 @@ function lifecycleTools(runtimeId = null) {
     additionalProperties: false,
   };
   const definitions = [
-    ["edgepilot_runtime_status", "Runtime Status", "Inspect local EdgePilot Runtime and Host readiness without starting them.", true],
+    ["edgepilot_runtime_status", "Runtime Status", "Inspect local EdgePilot Runtime and Host readiness without starting them. The text includes the current phase, download progress, last error, and recent redacted log lines.", true],
     ["edgepilot_runtime_start", "Runtime Start", "Download/install when needed and start the local EdgePilot Runtime Host.", false],
     ["edgepilot_runtime_update", "Runtime Update", "Update to the channel Runtime and restart the local Host.", false],
     ["edgepilot_runtime_repair", "Runtime Repair", "Reinstall the channel Runtime and restart the local Host.", false],
@@ -204,7 +208,7 @@ function lifecycleTools(runtimeId = null) {
     name, title, description: readOnly ? description : `${description} If the switch would pause work, returns awaiting_confirmation with the exact snapshot: a "trading" entry means running strategies pause during the switch and resume automatically after it; other entries are old trading tasks of the previous version that will be stopped keeping their positions. Only submit stop_and_continue after the user agrees; defer leaves the old installation running. Background tasks such as backtests keep running either way.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: !readOnly },
   }));
-  tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures (lifecycle state, Host log and the last lifecycle operation output). Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
+  tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures. The text includes the current phase, download progress, last error, and recent log lines, including while installation is still running. Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
   tools.push({
     name: "edgepilot_strategy_search", title: "Search Strategies",
@@ -411,7 +415,8 @@ function readSearchResultsResource(uri) {
   const runtimeId = `sha256:${match[1]}`;
   const runtimeRoot = join(runtimeHome, "runtime");
   const releasesRoot = join(runtimeRoot, "releases");
-  const release = join(runtimeHome, "runtime", "releases", match[1]);
+  const currentRelease = join(releasesRoot, releaseDirectory(runtimeId));
+  const release = existsSync(currentRelease) ? currentRelease : join(releasesRoot, match[1]);
   const appsRoot = join(release, "apps");
   const appRoot = join(release, "apps", "mcp-app");
   const path = join(appRoot, "search-results.html");
@@ -583,11 +588,15 @@ function lifecycleSnapshot() {
     const metadata = lstatSync(path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 65536) return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
     const value = JSON.parse(readFileSync(path, "utf8"));
-    if (value === null || typeof value !== "object" || Array.isArray(value)
-        || !["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(value.phase)) {
+    const phases = ["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"];
+    if (value === null || typeof value !== "object" || Array.isArray(value) || !phases.includes(value.phase)) {
       return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
     }
-    return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
+    const snapshot = Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
+    if (Number.isSafeInteger(value.download_received) && value.download_received >= 0) snapshot.download_received = value.download_received;
+    if (Number.isSafeInteger(value.download_total) && value.download_total >= 0) snapshot.download_total = value.download_total;
+    if (phases.includes(value.interrupted_phase)) snapshot.interrupted_phase = value.interrupted_phase;
+    return snapshot;
   } catch { return { phase: "repair_required", last_error: "lifecycle_state_invalid" }; }
 }
 
@@ -757,13 +766,18 @@ function readInstalledRuntimeId() {
 
 function readInstalledRuntime(runtimeId) {
   if (runtimeId === null || !/^sha256:[0-9a-f]{64}$/.test(runtimeId)) return null;
-  try {
-    const manifest = JSON.parse(readFileSync(join(runtimeHome, "runtime", "releases", runtimeId.slice(7), "RUNTIME.json"), "utf8"));
-    const releaseVersion = manifest?.payload?.release_version;
-    const contractVersion = manifest?.payload?.contract_version;
+  // Migration (WP-098): until the first switch away from it, a release installed before
+  // 16-digit names sits in a directory named by the whole digest.
+  for (const directory of [releaseDirectory(runtimeId), runtimeId.slice("sha256:".length)]) {
+    let manifest;
+    try { manifest = JSON.parse(readFileSync(join(runtimeHome, "runtime", "releases", directory, "RUNTIME.json"), "utf8")); } catch { continue; }
+    if (manifest?.runtime_id !== runtimeId) continue;
+    const releaseVersion = manifest.payload?.release_version;
+    const contractVersion = manifest.payload?.contract_version;
     if (typeof releaseVersion !== "string" || !Number.isInteger(contractVersion?.major) || !Number.isInteger(contractVersion?.minor)) return null;
     return { releaseVersion, contractVersion };
-  } catch { return null; }
+  }
+  return null;
 }
 
 function supportsRuntimeContract(value) {
@@ -872,13 +886,17 @@ function matchesRelease(runtimeId, runtime) {
 function toolResult(value, isError = false) {
   isError ||= value?.state === "error" || value?.state === "stale_session";
   const pending = value?.message === "runtime_operation_pending";
+  const unfinished = pending || isError || (typeof value?.state === "string" && value.state !== "ready");
+  const progress = installProgressText(value?.lifecycle);
+  const recentLines = unfinished && value?.state !== "awaiting_confirmation" && value?.state !== "deferred" ? recentOperationEvidence() : [];
+  const recent = recentLines.length ? ` Recent: ${recentLines.join(" | ")}.` : "";
   const text = value?.state === "awaiting_confirmation"
     ? "The target Runtime is prepared. Show the listed old processes/tasks and ask once: defer the switch, or stop the listed old version and continue. Stopping programs does not guarantee cancelling orders or closing positions. Only after that explicit choice call the same lifecycle tool with action, operation_id and snapshot_digest. Do not open the old Dashboard or onboarding as target success."
     : value?.state === "deferred" ? "Runtime switch deferred. The old environment is preserved; this target startup request has ended."
     : pending
-    ? "EdgePilot Runtime installation or startup is still pending. Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation."
-    : isError || (typeof value?.state === "string" && value.state !== "ready")
-      ? "EdgePilot Runtime is not ready. Follow required_action before opening Dashboard or onboarding."
+    ? `EdgePilot Runtime installation or startup is still pending.${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
+    : unfinished
+      ? `EdgePilot Runtime is not ready.${progress}${recent} Follow required_action before opening Dashboard or onboarding.`
       : value?.state === "ready"
         ? "EdgePilot Runtime is ready. Installation and startup have completed; Dashboard and onboarding may now be opened."
         : "EdgePilot Runtime operation completed.";
@@ -887,6 +905,55 @@ function toolResult(value, isError = false) {
     structuredContent: value,
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function installProgressText(lifecycle) {
+  if (lifecycle === null || typeof lifecycle !== "object") return "";
+  const parts = [];
+  if (typeof lifecycle.phase === "string") parts.push(`phase=${lifecycle.phase}`);
+  if (typeof lifecycle.interrupted_phase === "string") parts.push(`interrupted_phase=${lifecycle.interrupted_phase}`);
+  if (Number.isSafeInteger(lifecycle.download_received)) {
+    parts.push(`download=${lifecycle.download_received}/${Number.isSafeInteger(lifecycle.download_total) ? lifecycle.download_total : "?"}`);
+  }
+  if (typeof lifecycle.last_error === "string" && lifecycle.last_error) parts.push(`last_error=${lifecycle.last_error}`);
+  if (typeof lifecycle.updated_at === "string" && lifecycle.updated_at) parts.push(`updated_at=${lifecycle.updated_at}`);
+  return parts.length ? ` ${parts.join(" ")}.` : "";
+}
+
+function diagnosisText(value) {
+  const progress = installProgressText(value.lifecycle);
+  const lines = [
+    ...(value.last_operation?.stderr ?? []).slice(-4),
+    ...(Array.isArray(value.last_failed_operation?.stderr) ? value.last_failed_operation.stderr.slice(-2) : []),
+    ...(value.host_log ?? []).slice(-2),
+  ].filter(line => typeof line === "string" && line);
+  const unique = [];
+  for (const line of lines) if (unique.at(-1) !== line) unique.push(line);
+  const recent = unique.length ? ` Recent: ${unique.join(" | ")}.` : "";
+  const gaps = Array.isArray(value.gaps) && value.gaps.length ? ` gaps=${value.gaps.join(",")}.` : "";
+  return `Runtime install/startup diagnostics.${progress} state=${value.status?.state ?? "unknown"} message=${value.status?.message ?? "none"}.${recent}${gaps} Explain the failing step from this text; separate confirmed causes from guesses. Do not start, update, repair or stop anything unless the user asks.`;
+}
+
+function recentOperationEvidence(limit = 4) {
+  const logs = join(runtimeHome, "runtime", "logs");
+  let stderr = [];
+  try {
+    const operations = readdirSync(logs).filter(name => /^operation-[0-9a-f-]{36}\.err$/u.test(name))
+      .map(name => ({ name, modified: lstatSync(join(logs, name)).mtimeMs }))
+      .sort((left, right) => right.modified - left.modified);
+    if (operations.length > 0) stderr = diagnosticLines(tailText(join(logs, operations[0].name)), 30, 8);
+  } catch { /* No lifecycle operation is running. */ }
+  let failed = [];
+  try {
+    const path = join(logs, "last-failed-operation.json");
+    if (lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink() && lstatSync(path).size <= 65536) {
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      if (Array.isArray(record.stderr)) failed = record.stderr.filter(line => typeof line === "string").map(scrubDiagnosticLine);
+    }
+  } catch { /* No failed lifecycle operation recorded. */ }
+  const lines = [];
+  for (const line of [...stderr, ...failed]) if (lines.at(-1) !== line) lines.push(line);
+  return lines.slice(-limit);
 }
 
 function resultResponse(id, result) { return { jsonrpc: "2.0", id, result }; }

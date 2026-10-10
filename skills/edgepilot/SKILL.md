@@ -77,7 +77,9 @@ Diagnosis is read-only: never start, stop, retry, repair, cancel orders or close
 as part of it.
 
 1. Install, update or startup problems, or Host tools unavailable: call
-   `edgepilot_runtime_diagnose` (works without a running Runtime).
+   `edgepilot_runtime_diagnose` (works without a running Runtime). Its text includes the
+   current phase, download progress, last error and recent redacted log lines; while an
+   install is still pending, `edgepilot_runtime_status` text has the same progress.
 2. Everything else: search the `diagnostics` toolkit and execute
    `diagnostics.failure.explain` with the reference. Without one, execute
    `diagnostics.failure.list` first and let the user pick if several failures match.
@@ -120,7 +122,8 @@ must go directly to that outcome and must not force the questionnaire.
    historical lifecycle phases and do not assemble alternative shell recovery commands.
    Wait for the original call's final result; yielded/running is not completed. If the
    script reports `runtime_operation_pending`, wait on that call or query status with
-   bounded backoff, without parallel open calls or duplicate installations.
+   bounded backoff, without parallel open calls or duplicate installations. Status text
+   includes the phase, download progress, last error and recent log lines.
    When `state=awaiting_confirmation`, show `switch.jobs` and ask once: “暂不切换”
    (`defer`) or “暂停并继续升级” (`stop_and_continue`), translated into the user's
    language. A `kind: "trading"` entry means running strategies pause during the switch
@@ -135,6 +138,11 @@ must go directly to that outcome and must not force the questionnaire.
    startup request and leave the old environment alone; do not open old onboarding as
    target success. Report other failures and their script-provided recovery action.
    For `stale_session`, reload the plugin session rather than attempting a downgrade.
+   For `host_start_timeout`, tell the user that reloading or restarting Cursor does not
+   restart the Host. The Host is a separate sign-in task. Do not invent a shell command
+   to end it, and do not ask the user to end it in Task Scheduler. Call
+   `edgepilot_runtime_start` again: that start ends a Host task that is still occupying
+   the slot, then starts the current Runtime. If the same timeout returns, report it.
 2. For this Dashboard-and-onboarding request, all successful paths (already running,
    stopped target started, first installation, upgrade or repair) continue identically.
    Only after `state=ready` and `connection_ready=true`, call
