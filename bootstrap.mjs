@@ -26,7 +26,7 @@ import {
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, platform as hostPlatform, arch as hostArch, release as hostRelease } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep, toNamespacedPath, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { Transform, Readable, Writable } from "node:stream";
@@ -635,7 +635,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.15";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.16";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -712,6 +712,80 @@ export function validateWindowsReleasePathBudget(directory, manifest, platform =
       `Windows Runtime file ${worst.path} would reach ${worst.length} characters under ${directory} (limit ${worst.limit}); choose a --runtime-home at least ${worst.excess} characters shorter`,
       { runtime_id: manifest.runtime_id, directory, path: worst.path, length: worst.length, limit: worst.limit, required_reduction: worst.excess });
   }
+}
+
+// Python file APIs honor this machine setting when python.exe is longPathAware.
+// LoadLibrary of a .pyd/.dll still ignores it, so the release path budget above stays.
+const WINDOWS_LONG_PATHS_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem";
+
+function windowsSystemExecutable(...parts) {
+  return win32.join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", ...parts);
+}
+
+function windowsLongPathsEnabled(stdout) {
+  const match = /LongPathsEnabled\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(String(stdout ?? ""));
+  return match !== null && Number.parseInt(match[1], 16) === 1;
+}
+
+function powershellLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+const WINDOWS_LONG_PATHS_PROMPT = {
+  zh: {
+    title: "EdgePilot 需要打开 Windows 长路径",
+    body: [
+      "接下来会弹出 Windows 的管理员授权窗口，只修改一项系统设置：允许超过 260 个字符的文件路径（LongPathsEnabled）。",
+      "需要它的原因：检查策略时要保存结果文件。路径太长时，没有这项设置就创建不了临时文件，回测会在开始计算前失败。",
+      "如果拒绝授权：这次安装或升级会停止。较短的路径不受影响，但超过限制的策略无法完成检查。",
+      "请先点“确定”，再在随后的 Windows 窗口里选择“是”。点“取消”则不会提权。",
+    ].join("\n"),
+  },
+  en: {
+    title: "EdgePilot needs Windows long paths",
+    body: [
+      "Windows will ask for administrator approval next. EdgePilot changes one setting: allow file paths longer than 260 characters (LongPathsEnabled).",
+      "Why: a strategy check saves a result file. Without this setting, a path that is too long cannot be created, and a backtest fails before it starts.",
+      "If you decline: this install or upgrade stops. Shorter paths are unaffected, but a strategy whose path is too long cannot be checked.",
+      "Choose OK here, then Yes on the Windows prompt. Cancel does not request administrator approval.",
+    ].join("\n"),
+  },
+};
+
+function windowsLongPathsElevationScript(reg) {
+  const zh = WINDOWS_LONG_PATHS_PROMPT.zh;
+  const en = WINDOWS_LONG_PATHS_PROMPT.en;
+  return [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$zh = (Get-UICulture).Name -like 'zh*'",
+    `$title = if ($zh) { ${powershellLiteral(zh.title)} } else { ${powershellLiteral(en.title)} }`,
+    `$body = if ($zh) { ${powershellLiteral(zh.body)} } else { ${powershellLiteral(en.body)} }`,
+    "$answer = [System.Windows.Forms.MessageBox]::Show($body, $title, [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Information, [System.Windows.Forms.MessageBoxDefaultButton]::Button1, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)",
+    "if ($answer -ne 'OK') { exit 2 }",
+    `$p=Start-Process -FilePath ${powershellLiteral(reg)} -ArgumentList @('add','${WINDOWS_LONG_PATHS_KEY}','/v','LongPathsEnabled','/t','REG_DWORD','/d','1','/f') -Verb RunAs -Wait -PassThru -WindowStyle Hidden`,
+    "if ($null -eq $p -or $p.ExitCode -ne 0) { exit 1 }",
+    "exit 0",
+  ].join("; ");
+}
+
+export function ensureWindowsLongPaths({ platform = process.platform, run = spawnSync } = {}) {
+  if (platform !== "win32") return;
+  const reg = windowsSystemExecutable("reg.exe");
+  const options = { encoding: "utf8", timeout: 180_000, windowsHide: true };
+  const query = () => run(reg, ["query", WINDOWS_LONG_PATHS_KEY, "/v", "LongPathsEnabled"], options);
+  const current = query();
+  if (current.status === 0 && windowsLongPathsEnabled(current.stdout)) return;
+  const added = run(reg, ["add", WINDOWS_LONG_PATHS_KEY, "/v", "LongPathsEnabled", "/t", "REG_DWORD", "/d", "1", "/f"], options);
+  if (added.status === 0) return;
+  const powershell = windowsSystemExecutable("WindowsPowerShell", "v1.0", "powershell.exe");
+  const elevated = run(powershell, ["-NoProfile", "-STA", "-Command", windowsLongPathsElevationScript(reg)], { ...options, timeout: 300_000 });
+  const confirmed = elevated.status === 0 ? query() : null;
+  if (confirmed?.status === 0 && windowsLongPathsEnabled(confirmed.stdout)) return;
+  throw new BootstrapError(
+    "windows_long_paths_denied",
+    "Windows long path support could not be enabled; approve the administrator prompt for LongPathsEnabled",
+  );
 }
 
 function physicalStatePath(value) {
@@ -2819,6 +2893,7 @@ async function cliUnlocked(arguments_) {
 
     if ((expectedProductVersion !== null && !isSemver(expectedProductVersion)) || expectedRuntimeIds.some((id) => !isDigest(id))) fail("usage", "plugin Runtime binding is invalid");
     if (channelUrl === null) fail("usage", `${command} requires --channel-url`);
+    ensureWindowsLongPaths();
     let active = null;
     try { active = await activeRuntime(stateRoot, null); } catch { /* missing or damaged install needs preparation */ }
     if (active !== null && manifestProduct(active.manifest) !== product) fail("runtime_product_incompatible", "installed Runtime belongs to another product");
@@ -2861,6 +2936,9 @@ function fail(code, message) { throw new BootstrapError(code, message); }
 export function formatBootstrapError(error) {
   const code = /^[a-z][a-z0-9_]{0,100}$/.test(error?.code) ? error.code : "bootstrap_internal_failure";
   const lines = [`EdgePilot bootstrap: ${code}`];
+  if (code === "windows_long_paths_denied") {
+    lines.push("EdgePilot bootstrap: approve the administrator prompt to set LongPathsEnabled=1");
+  }
   if (code === "runtime_path_too_long" && error instanceof BootstrapError && error.details !== null) {
     const { length, limit, required_reduction, runtime_id, directory, path } = error.details;
     lines.push(`EdgePilot bootstrap path budget: ${JSON.stringify({ length, limit, required_reduction })}`,

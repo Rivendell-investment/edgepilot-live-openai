@@ -887,16 +887,18 @@ function toolResult(value, isError = false) {
   isError ||= value?.state === "error" || value?.state === "stale_session";
   const pending = value?.message === "runtime_operation_pending";
   const unfinished = pending || isError || (typeof value?.state === "string" && value.state !== "ready");
+  const upgrading = value?.state === "update_required";
   const progress = installProgressText(value?.lifecycle);
-  const recentLines = unfinished && value?.state !== "awaiting_confirmation" && value?.state !== "deferred" ? recentOperationEvidence() : [];
+  const lifecycleText = upgrading && progress ? ` previous_lifecycle${progress}` : progress;
+  const recentLines = unfinished && !upgrading && value?.state !== "awaiting_confirmation" && value?.state !== "deferred" ? recentOperationEvidence() : [];
   const recent = recentLines.length ? ` Recent: ${recentLines.join(" | ")}.` : "";
   const text = value?.state === "awaiting_confirmation"
     ? "The target Runtime is prepared. Show the listed old processes/tasks and ask once: defer the switch, or stop the listed old version and continue. Stopping programs does not guarantee cancelling orders or closing positions. Only after that explicit choice call the same lifecycle tool with action, operation_id and snapshot_digest. Do not open the old Dashboard or onboarding as target success."
     : value?.state === "deferred" ? "Runtime switch deferred. The old environment is preserved; this target startup request has ended."
     : pending
-    ? `EdgePilot Runtime installation or startup is still pending.${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
+    ? `EdgePilot Runtime installation or startup is still pending.${decisionText(value)}${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
     : unfinished
-      ? `EdgePilot Runtime is not ready.${progress}${recent} Follow required_action before opening Dashboard or onboarding.`
+      ? `EdgePilot Runtime is not ready.${decisionText(value)}${lifecycleText}${recent} Follow required_action before opening Dashboard or onboarding.`
       : value?.state === "ready"
         ? "EdgePilot Runtime is ready. Installation and startup have completed; Dashboard and onboarding may now be opened."
         : "EdgePilot Runtime operation completed.";
@@ -905,6 +907,13 @@ function toolResult(value, isError = false) {
     structuredContent: value,
     ...(isError ? { isError: true } : {}),
   };
+}
+
+function decisionText(value) {
+  if (typeof value?.state !== "string" || value.state === "ready") return "";
+  const message = typeof value.message === "string" && value.message ? ` message=${value.message}` : "";
+  const action = typeof value.required_action === "string" && value.required_action ? ` required_action=${value.required_action}` : "";
+  return ` state=${value.state}${message}${action}.`;
 }
 
 function installProgressText(lifecycle) {

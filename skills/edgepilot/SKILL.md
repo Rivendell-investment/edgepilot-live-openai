@@ -106,8 +106,8 @@ as part of it.
 ## First-use onboarding
 
 Run this flow when the user's entire message is only an EdgePilot Live plugin mention
-(apart from whitespace), when the user selects an interactive-onboarding starter prompt,
-or when the user explicitly asks to open/start the questionnaire or onboarding. Treat a
+(apart from whitespace), when the `edgepilot-setup` skill runs (plugin setup after
+installation), when the user selects an interactive-onboarding starter prompt, or when the user explicitly asks to open/start the questionnaire or onboarding. Treat a
 mention-only message as a request to launch the Dashboard and interactive onboarding;
 do not reply with a generic menu or ask what the user wants to do. A plain request to find
 or recommend a strategy is not onboarding. Reply in the user's current language (`en`,
@@ -123,7 +123,10 @@ must go directly to that outcome and must not force the questionnaire.
    Wait for the original call's final result; yielded/running is not completed. If the
    script reports `runtime_operation_pending`, wait on that call or query status with
    bounded backoff, without parallel open calls or duplicate installations. Status text
-   includes the phase, download progress, last error and recent log lines.
+   includes the current state, required action, phase, download progress, last error and recent log lines.
+   When `state=update_required`, call `edgepilot_runtime_start`; that start upgrades to the
+   plugin-bound release. `previous_lifecycle`, including an earlier `host_start_timeout`, belongs
+   to the previous release. Do not diagnose or restart that old Host before this start.
    When `state=awaiting_confirmation`, show `switch.jobs` and ask once: “暂不切换”
    (`defer`) or “暂停并继续升级” (`stop_and_continue`), translated into the user's
    language. A `kind: "trading"` entry means running strategies pause during the switch
