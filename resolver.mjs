@@ -77,7 +77,7 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
-    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open"].includes(name))) {
+    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open", "edgepilot_redeem_code_open"].includes(name))) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
@@ -103,6 +103,7 @@ async function handleRequest(request) {
     if (name === "edgepilot_dashboard_open") {
       return resultResponse(id, dashboardOpenResult(await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue))));
     }
+    if (name === "edgepilot_redeem_code_open") return resultResponse(id, await executeRedeemCodeOpen(argumentsValue));
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
       const response = resultResponse(id, toolResult(result));
@@ -236,13 +237,88 @@ function lifecycleTools(runtimeId = null) {
       },
     }),
   });
+  if (profile === "live") tools.push({
+    name: "edgepilot_redeem_code_open", title: "Open Redeem Code",
+    description: "Use when the user's message contains an EdgePilot agent redeem code (EP-XXXX-XXXX-XXXX-XXXX, any letter case, spaces allowed), for example \"请使用 EdgePilot 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略\". Reads which strategy and agent the code belongs to without using it, and returns a Dashboard link where the user signs in if needed, redeems and installs. Never redeem the code or install the strategy from chat.",
+    inputSchema: { type: "object", properties: { code: { type: "string", minLength: 1, maxLength: 64 } }, required: ["code"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  });
   tools.push({
     name: "edgepilot_dashboard_open", title: "Open Dashboard",
-    description: "Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.",
+    description: `Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.${profile === "live" ? " A custom_strategy target opens one of the user's custom strategies (custom_id from custom_strategy.*), at one revision when given." : ""}`,
     inputSchema: dashboardSchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   });
   return tools;
+}
+
+const REDEEM_TARGET_CODE = /^[0-9A-Za-z-]{16,32}$/;
+
+function completedOutput(result, operationId) {
+  const outcomes = result?.structuredContent?.outcomes;
+  const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
+  return outcome?.operation_id === operationId ? outcome : null;
+}
+
+function redeemResult(payload, text, isError = false) {
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { schema: "edgepilot-redeem-code-v1", profile, ...payload },
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+// The Server owns codes and redeeming; chat only previews a code and hands the user to the
+// Dashboard, so the model can never use a code on the user's behalf.
+async function executeRedeemCodeOpen(value) {
+  if (profile !== "live" || Object.keys(value).join(",") !== "code" || typeof value.code !== "string"
+      || value.code.length > 64) throw new BridgeError("invalid_tool_call");
+  const code = value.code.replace(/\s+/g, "");
+  if (!REDEEM_TARGET_CODE.test(code)) {
+    return redeemResult({ code_status: "invalid" }, "This is not an EdgePilot redeem code. Ask the user to check it; codes look like EP-XXXX-XXXX-XXXX-XXXX.", true);
+  }
+  const resolved = await executeHostOperation("redeem.code.resolve", { code });
+  if (resolved?.isError === true) return resolved;
+  const outcome = completedOutput(resolved, "redeem.code.resolve");
+  if (outcome?.status !== "completed") {
+    const failure = typeof outcome?.failure?.code === "string" ? outcome.failure.code : "redeem_check_failed";
+    const text = failure === "redeem_code_invalid"
+      ? "This redeem code does not exist. Ask the user to check it or ask their agent for the correct code."
+      : failure === "rate_limited" ? "Too many redeem code checks. Ask the user to try again in a minute."
+        : `The redeem code could not be checked (${failure}). Ask the user to try again later.`;
+    return redeemResult({ code_status: "unchecked", failure }, text, true);
+  }
+  const { code_status: status, strategy, agent, viewer } = outcome.output ?? {};
+  const facts = { code_status: status, strategy: { slug: strategy?.slug, name: strategy?.name }, agent: { display_name: agent?.display_name }, ...(viewer ? { viewer } : {}) };
+  const named = `the strategy "${strategy?.name}" (${strategy?.slug}), shared by agent ${agent?.display_name}`;
+  let target = null;
+  let text = "";
+  if (viewer?.entitled === true && strategy?.available === true && strategy?.current_version) {
+    // Without a content digest the exact strategy target is impossible; the redeem dialog installs entitled users too.
+    target = strategy.content_sha256
+      ? { kind: "strategy", slug: strategy.slug, version: strategy.current_version, content_sha256: strategy.content_sha256 }
+      : { kind: "redeem", code };
+    text = `The signed-in account already has ${named}; the code is not needed and will not be used. Give the user this Dashboard link to install it:`;
+  } else if (status === "available" && strategy?.available === true) {
+    target = { kind: "redeem", code };
+    text = `The redeem code is valid for ${named}. Give the user this Dashboard link; they sign in if needed, then redeem and install there. Do not redeem or install it from chat. The link works for about 10 minutes; if it expires, ask the user to send the code again:`;
+  } else if (viewer?.entitled === true) {
+    return redeemResult(facts, `The signed-in account already has ${named}, but it cannot be installed right now; the code is not needed. Ask the user to try again later.`, true);
+  } else if (status === "used") {
+    return redeemResult(facts, viewer === undefined
+      ? `This code for ${named} has already been used. If the user redeemed it with their own account, ask them to sign in to the Dashboard, where the strategy is available to that account.`
+      : viewer.used_by_viewer === true
+        ? `This account already used this code for ${named}, but its access is no longer active. Ask the user to contact their agent.`
+        : `This code for ${named} was already used by another account. Ask the user to get a new code from their agent.`, true);
+  } else if (status === "disabled") {
+    return redeemResult(facts, `This code for ${named} has been disabled. Ask the user to get a new code from their agent.`, true);
+  } else {
+    return redeemResult(facts, `${named} cannot be installed right now; the code was not used. Ask the user to try again later.`, true);
+  }
+  const opened = completedOutput(await executeHostOperation("dashboard.open", { target }), "dashboard.open");
+  const url = opened?.status === "completed" ? opened.output?.url : null;
+  if (!dashboardLoopbackUrl(url)) return redeemResult(facts, "The Dashboard could not be opened. Ask the user to open EdgePilot Dashboard and enter the code on the strategy page.", true);
+  return redeemResult({ ...facts, dashboard_url: url }, `${text} ${url}`);
 }
 
 function recommendationSchema() {
@@ -274,11 +350,30 @@ function dashboardTargetSchema() {
   };
 }
 
-function dashboardSchema() {
+// Live also opens one custom strategy. One flat object (not oneOf) keeps the schema usable by
+// every MCP client; dashboardArguments accepts exactly one of the two shapes.
+function liveDashboardTargetSchema() {
+  const strategy = dashboardTargetSchema();
   return {
     type: "object",
     additionalProperties: false,
-    properties: { target: dashboardTargetSchema() },
+    description: "Either {kind: \"strategy\", slug, version, content_sha256} or {kind: \"custom_strategy\", custom_id, revision (optional)}.",
+    properties: {
+      ...strategy.properties,
+      kind: { enum: ["strategy", "custom_strategy"] },
+      custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
+      revision: { type: "integer", minimum: 1, maximum: 999999 },
+    },
+    required: ["kind"],
+  };
+}
+
+function dashboardSchema() {
+  const target = profile === "live" ? liveDashboardTargetSchema() : dashboardTargetSchema();
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: { target },
     required: [],
   };
 }
@@ -288,6 +383,15 @@ function dashboardArguments(value) {
   if (Object.keys(value).sort().join(",") !== "target" || value.target === null
       || typeof value.target !== "object" || Array.isArray(value.target)) throw new BridgeError("invalid_tool_call");
   const target = value.target;
+  if (target.kind === "custom_strategy" && profile === "live") {
+    const keys = Object.keys(target).sort().join(",");
+    if ((keys !== "custom_id,kind" && keys !== "custom_id,kind,revision")
+        || typeof target.custom_id !== "string" || !/^[a-z0-9]{6}$/.test(target.custom_id)
+        || (keys.endsWith("revision") && (!Number.isInteger(target.revision) || target.revision < 1 || target.revision > 999999))) {
+      throw new BridgeError("invalid_tool_call");
+    }
+    return { target: { ...target } };
+  }
   if (Object.keys(target).sort().join(",") !== "content_sha256,kind,slug,version"
       || target.kind !== "strategy" || typeof target.slug !== "string"
       || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(target.slug) || target.slug.length > 80

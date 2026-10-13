@@ -1,6 +1,6 @@
 ---
 name: edgepilot
-description: Route strategy discovery, configuration, backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
+description: Route strategy discovery, configuration, custom strategies (changing a strategy's parameters, markets, logic or code as the user's own local copy), backtesting, demo/live trading instances (deploy, stop, resume, flatten) and failure diagnosis (why an install, backtest, trading instance or request failed) through the local EdgePilot Runtime Host. Use for EdgePilot Live workflows; never expose credentials or bypass confirmation gates.
 ---
 
 # EdgePilot Live router
@@ -61,6 +61,97 @@ opened, `[在 EdgePilot 中查看 <strategy name> <version>](<url>)`.
   would open the Dashboard without the strategy.
 - A link signs the browser in once within 10 minutes. When the user asks to open it again
   later, call `edgepilot_dashboard_open` again with the same `target` as before.
+
+## Custom strategies
+
+A custom strategy is the user's own copy of an installed strategy, saved as revisions r1, r2…
+It stays on this computer. Its revisions are installed packages with slug `custom-<id>-r<N>`
+and version `0.0.<N>`; backtest and deploy them like any other installed strategy.
+
+Where a change goes:
+
+- Panel settings (target exchange, starting balance, fees, leverage, order fraction, max
+  equivalent leverage) of any strategy: `workspace.configuration.get`, then
+  `workspace.configuration.save` on that strategy's directory name. No custom strategy, no
+  question.
+- Anything else on an original Marketplace strategy (strategy parameters, even "just backtest
+  it with length 20", instruments, bars, indicators, entries, exits, sizing, code): ask first,
+  in the user's language: "This change goes beyond the panel settings, so it is saved as a
+  custom strategy『<strategy name> · <label>』; the original stays unchanged. Create it?"
+  Suggest the label yourself (2–4 words naming the change, at most 8 CJK characters or 16
+  letters) and say the user can reply with another one. Create only after a yes. On a no,
+  change nothing; mention a panel setting when one achieves something similar.
+- A change to an existing custom strategy: no question; save its next revision.
+- "Make another version" or "keep both": ask for a label, then create a new custom strategy
+  whose source is that custom revision's slug and version.
+- Deleting a custom strategy happens only in the Dashboard; point the user there.
+- Runs never override parameters: `overrides` take only `venue`, `period_days` and `workspace`.
+
+Steps:
+
+1. The source must be installed (`strategy.installed.list`); `custom_strategy.create` refuses
+   others with `custom_source_not_installed`. When it is not, tell the user and, with their
+   consent, install that exact version first (`strategy.install`, wait for the job). A custom
+   strategy is a full copy: uninstalling the original later does not affect it.
+   Then call `custom_strategy.create` with the source `slug` and `version` and the label. When
+   `label_adjusted` is true a number was added to keep it unique; use the returned
+   `display_name`. A refused label (`custom_label_invalid`) breaks a rule: 2–16 display width,
+   letters, digits, spaces and `· - + % . / ( )`, not only words like "custom", not the
+   strategy name itself.
+2. Existing strategy parameters: pass them as `parameters` to the commit. Code, markets or new
+   parameters: `custom_strategy.draft.read` (without `path` lists the files), then
+   `custom_strategy.draft.write` with the whole file and the `sha256` you read as
+   `expected_sha256`. A market change updates both the `strategy` instrument and bar fields
+   and `backtest.markets` (and `venue_variants`) of `configs/default.json`; every preset trades
+   exactly one venue.
+3. `custom_strategy.revision.commit` with a one-line `change_summary` in the user's language.
+   `committed` gives the new revision: report "已保存为『<display name>』r<N>（<change>）".
+   `unchanged` means nothing differed. `problems` name the file and line, or the preset,
+   venue and parameter: fix them in the draft and commit again; show them to the user only when
+   you cannot fix them.
+4. When the user asks to backtest while `draft.state` is `modified`, commit first and say which
+   revision runs. A deployed instance stays on its revision. One trading account runs one
+   instance, so moving to a new revision means stopping the old instance (the user confirms)
+   and deploying the new one.
+5. After saving a custom strategy's first revision, and whenever the user asks to see it, call
+   `edgepilot_dashboard_open` with target `{"kind": "custom_strategy", "custom_id": <id>,
+   "revision": <N>}` and show the link labelled with its display name, for example
+   `[在 EdgePilot 中查看『自适应 ADX 策略 · 周期20』r1](<url>)`. Never open a custom revision with a
+   `{"kind": "strategy"}` target: that one is for Marketplace versions.
+
+Name custom strategies『<strategy name> · <label>』r<N>, never by slug or id. When "this
+strategy" or a name could mean several targets (the original, several custom strategies,
+revisions or instances), list numbered candidates with display name, revision and running
+state (add "based on <source version>" when originals share a name) and ask. When the user
+does not choose and goes on:
+
+- reading, comparing, explaining: answer for every candidate;
+- changing: never change an existing custom strategy. Create a new one from the original the
+  user last named explicitly, without a label (it is named "自定义 N" / "Custom N"), and say
+  so: "因为没有确认目标，已另建『… · 自定义 2』，原有的自定义策略没有变动". When even the
+  original is unclear, keep asking;
+- backtesting: keep asking;
+- deploying, stopping, flattening: never guess; require an explicit target.
+
+## Agent redeem codes
+
+Some strategies are sold through agents: the user needs a one-time redeem code before the
+strategy can be downloaded. When a message contains an EdgePilot redeem code
+(`EP-XXXX-XXXX-XXXX-XXXX`, any letter case, spaces allowed), for example
+"请使用 EdgePilot 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略", call `edgepilot_redeem_code_open` with
+that code, even when the user only pasted it.
+
+- The tool only previews the code and returns a Dashboard link; redeeming happens in the
+  Dashboard after the user confirms there. Never redeem a code from chat, never retry it, and
+  never call `strategy.install` for a strategy the tool reports as needing a code.
+- Relay the tool's result in the user's language: the strategy name, the agent, and the
+  Dashboard link (Dashboard links above). When the account already has the strategy, say the
+  code is not needed and will not be used.
+- When the code is invalid, already used, disabled or its strategy is unavailable, explain that
+  reason and do not open the Dashboard; the user gets a new code from their agent.
+- The link works for about 10 minutes; when it expires, ask the user to send the code again.
+- An install that fails with `entitlement_required` means the strategy needs a redeem code:
+  ask the user for the code their agent gave them instead of retrying.
 
 ## Upgrade recovery
 
