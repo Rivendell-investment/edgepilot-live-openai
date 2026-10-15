@@ -101,9 +101,16 @@ Steps:
 2. Existing strategy parameters: pass them as `parameters` to the commit. Code, markets or new
    parameters: `custom_strategy.draft.read` (without `path` lists the files), then
    `custom_strategy.draft.write` with the whole file and the `sha256` you read as
-   `expected_sha256`. A market change updates both the `strategy` instrument and bar fields
-   and `backtest.markets` (and `venue_variants`) of `configs/default.json`; every preset trades
-   exactly one venue.
+   `expected_sha256`. To trade another symbol or timeframe, call `custom_strategy.draft.market`
+   with `symbol` (e.g. `SOL`) and `timeframe` (e.g. `4-HOUR`) first without `apply`: it changes
+   the strategy fields, `backtest.markets` and every venue variant together. Tell the user the
+   plan, especially `remove_venues` (exchanges that do not list the symbol), and call it again
+   with `apply: true`, the plan's `preset_sha256` as `expected_sha256` and `remove_venues` only
+   after they agree. `custom_market_unsupported` means the preset has several markets or an
+   unsupported exchange: then edit the `strategy` instrument and bar fields and
+   `backtest.markets` (and `venue_variants`) of `configs/default.json` together; a bar type is
+   `<instrument_id>-<step>-<aggregation>-<price type>-<source>`, e.g.
+   `BTCUSDT-PERP.BINANCE-1-HOUR-LAST-EXTERNAL`, and every preset trades exactly one venue.
 3. `custom_strategy.revision.commit` with a one-line `change_summary` in the user's language.
    `committed` gives the new revision: report "已保存为『<display name>』r<N>（<change>）".
    `unchanged` means nothing differed. `problems` name the file and line, or the preset,
