@@ -15,20 +15,46 @@ const SEARCH_FORWARD_TIMEOUT_MS = 4_000;
 const SUPPORTED_RUNTIME_CONTRACT = Object.freeze({ major: 1, minor: 0 });
 const onboardingResourceUri = (runtimeId) => `ui://edgepilot/strategy-onboarding-v1/${runtimeId.slice("sha256:".length)}.html`;
 const searchResultsResourceUri = (runtimeId) => `ui://edgepilot/strategy-search-results-v1/${runtimeId.slice("sha256:".length)}.html`;
+// A release directory is named by the first 16 hex digits of the Runtime ID (Bootstrap
+// runtimeDirectory); its manifest's runtime_id stays the identity.
+const releaseDirectory = (runtimeId) => runtimeId.slice("sha256:".length, "sha256:".length + 16);
+// App-only tools: in-chat cards read and change their Host-owned state (ADR 0020); never listed to
+// the model. A card call never installs, updates or starts the Runtime: a card that mounts in an
+// old thread must not start EdgePilot, so these answer runtime_not_ready instead.
+const CARD_TOOL_NAMES = new Set([
+  "edgepilot_result_state",
+  "edgepilot_view_open",
+  "edgepilot_view_get",
+  "edgepilot_view_act",
+]);
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
   "edgepilot_tool_search",
   "edgepilot_tool_get",
   "edgepilot_tool_execute",
   "edgepilot_result_present",
-  // App-only: the confirmation card submits through the host, never listed to the model.
-  "edgepilot_result_state",
+  "edgepilot_view_present",
+  ...CARD_TOOL_NAMES,
 ]);
+// Pages an old thread may ask for: any earlier Runtime's digest serves the installed page.
+const APP_RESOURCE_URI = /^ui:\/\/edgepilot\/([a-z0-9-]+)\/([0-9a-f]{64})\.html$/;
+const APP_RESOURCES = Object.freeze({
+  "strategy-onboarding-v1": { file: "onboarding.html", dashboardLinks: true },
+  "strategy-search-results-v1": { file: "search-results.html", dashboardLinks: true },
+  "runtime-confirmation-v1": { file: "confirmation.html", dashboardLinks: false },
+  "runtime-view-v1": { file: "view.html", dashboardLinks: true },
+});
 const profile = process.argv[2];
 if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DISCOVER_INPUT_SCHEMA = readDiscoverSchema();
+// What the model may pass: the discover request without include_access, which Live always adds itself
+// so result cards can mark redeem-code strategies (Research has no redeem codes).
+const SEARCH_INPUT_SCHEMA = (() => {
+  const { include_access: _includeAccess, ...properties } = DISCOVER_INPUT_SCHEMA.properties ?? {};
+  return Object.freeze({ ...DISCOVER_INPUT_SCHEMA, properties });
+})();
 const DISCOVER_OUTPUT_SCHEMA = readDiscoverOutputSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
@@ -74,15 +100,16 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
-    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open"].includes(name))) {
+    if (!(name in LIFECYCLE_HANDLERS) && !CARD_TOOL_NAMES.has(name) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open", "edgepilot_redeem_code_open"].includes(name))) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
     if (name === "edgepilot_runtime_diagnose") {
       requireEmpty(argumentsValue);
+      const diagnosis = await runtimeDiagnosis();
       return resultResponse(id, {
-        content: [{ type: "text", text: "Read-only Runtime install/startup diagnostics collected. Explain the failing step from lifecycle, host_log and last_operation evidence; separate confirmed causes from guesses. Do not start, update, repair or stop anything unless the user asks." }],
-        structuredContent: await runtimeDiagnosis(),
+        content: [{ type: "text", text: diagnosisText(diagnosis) }],
+        structuredContent: diagnosis,
       });
     }
     if (name === "edgepilot_strategy_search") return resultResponse(id, await executeStrategySearch(argumentsValue));
@@ -90,15 +117,28 @@ async function handleRequest(request) {
     if (name === "edgepilot_onboarding_open") {
       const locale = argumentsValue.locale;
       if (!new Set(["en", "ko", "zh-CN", "zh-TW"]).has(locale)) throw new BridgeError("invalid_locale");
-      if (await healthyConnection() === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
+      const connection = await healthyConnection();
+      if (connection === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
+      // The Host issues the view and keeps its answers and recommendation; the thread id in _meta
+      // (Codex) binds the view to this conversation.
+      const opened = await forward(connection, { jsonrpc: "2.0", id: "bridge-view-open", method: "tools/call", params: {
+        name: "edgepilot_view_open", arguments: { kind: "onboarding", params: { locale } },
+        ...(isPlainObject(request.params?._meta) ? { _meta: request.params._meta } : {}),
+      } });
+      const viewId = opened?.result?.structuredContent?.view_id;
+      if (opened?.result?.isError === true || typeof viewId !== "string" || !/^view_[0-9a-f]{32}$/.test(viewId)) {
+        return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "onboarding_unavailable" }, true));
+      }
       return resultResponse(id, {
-        ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }),
+        ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0", view_id: viewId }),
         content: [{ type: "text", text: "Onboarding App requested. Let the user continue in the interactive card and end this turn without repeating questionnaire choices or opening another question tool. Rendering visibility is unknown to this tool; do not claim that the App failed to appear. Use text onboarding only if the host explicitly reports App rendering unsupported/failed, or the user reports the card unusable or explicitly requests text onboarding." }],
+        _meta: { "edgepilot/view": { view_id: viewId } },
       });
     }
     if (name === "edgepilot_dashboard_open") {
       return resultResponse(id, dashboardOpenResult(await executeHostOperation("dashboard.open", dashboardArguments(argumentsValue))));
     }
+    if (name === "edgepilot_redeem_code_open") return resultResponse(id, await executeRedeemCodeOpen(argumentsValue));
     if (name in LIFECYCLE_HANDLERS) {
       const result = await LIFECYCLE_HANDLERS[name](argumentsValue);
       const response = resultResponse(id, toolResult(result));
@@ -114,12 +154,19 @@ async function handleRequest(request) {
     return forward(connection, request);
   }
   if (request.method === "resources/read") {
-    const local = readSearchResultsResource(request.params?.uri);
+    // The running Host knows the Dashboard's actual port; the installed release still serves the
+    // page when the Runtime is stopped, so a card can say so instead of staying blank.
+    let hosted = null;
+    if ((await runtimeStatus()).state === "ready") {
+      const connection = await healthyConnection();
+      if (connection !== null) {
+        try { hosted = await forward(connection, request); } catch { hosted = null; }
+        if (hosted?.result) return hosted;
+      }
+    }
+    const local = readLocalAppResource(request.params?.uri);
     if (local !== null) return resultResponse(id, { contents: [local] });
-    if ((await runtimeStatus()).state !== "ready") return errorResponse(id, -32001, "runtime_not_ready");
-    const connection = await healthyConnection();
-    if (connection === null) return errorResponse(id, -32001, "runtime_not_ready");
-    return forward(connection, request);
+    return hosted ?? errorResponse(id, -32001, "runtime_not_ready");
   }
   return errorResponse(id, -32601, "method_not_found");
 }
@@ -195,7 +242,7 @@ function lifecycleTools(runtimeId = null) {
     additionalProperties: false,
   };
   const definitions = [
-    ["edgepilot_runtime_status", "Runtime Status", "Inspect local EdgePilot Runtime and Host readiness without starting them.", true],
+    ["edgepilot_runtime_status", "Runtime Status", "Inspect local EdgePilot Runtime and Host readiness without starting them. The text includes the current phase, download progress, last error, and recent redacted log lines.", true],
     ["edgepilot_runtime_start", "Runtime Start", "Download/install when needed and start the local EdgePilot Runtime Host.", false],
     ["edgepilot_runtime_update", "Runtime Update", "Update to the channel Runtime and restart the local Host.", false],
     ["edgepilot_runtime_repair", "Runtime Repair", "Reinstall the channel Runtime and restart the local Host.", false],
@@ -204,7 +251,7 @@ function lifecycleTools(runtimeId = null) {
     name, title, description: readOnly ? description : `${description} If the switch would pause work, returns awaiting_confirmation with the exact snapshot: a "trading" entry means running strategies pause during the switch and resume automatically after it; other entries are old trading tasks of the previous version that will be stopped keeping their positions. Only submit stop_and_continue after the user agrees; defer leaves the old installation running. Background tasks such as backtests keep running either way.`, inputSchema: readOnly ? emptyInput : switchInput, outputSchema: output,
     annotations: { readOnlyHint: readOnly, destructiveHint: !readOnly, idempotentHint: true, openWorldHint: !readOnly },
   }));
-  tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures (lifecycle state, Host log and the last lifecycle operation output). Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
+  tools.push({ name: "edgepilot_runtime_diagnose", title: "Diagnose Runtime", description: "Collect redacted, read-only evidence for EdgePilot Runtime install, update and startup failures. The text includes the current phase, download progress, last error, and recent log lines, including while installation is still running. Works even when the Runtime is not installed or not running. For failed jobs, backtests or trading runs use the Runtime diagnostics.failure operations instead.", inputSchema: emptyInput,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } });
   tools.push({
     name: "edgepilot_strategy_search", title: "Search Strategies",
@@ -223,7 +270,7 @@ function lifecycleTools(runtimeId = null) {
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
     description: `Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.${profile === "live" ? " A Live plugin mention with no other message content requests this onboarding after Dashboard opens." : ""}`,
     inputSchema: { type: "object", properties: { locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] } }, required: ["locale"], additionalProperties: false },
-    outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" } }, required: ["schema", "profile", "locale", "questionnaire_version"], additionalProperties: false },
+    outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" }, view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" } }, required: ["schema", "profile", "locale", "questionnaire_version", "view_id"], additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     ...(runtimeId === null ? {} : {
       _meta: {
@@ -232,13 +279,90 @@ function lifecycleTools(runtimeId = null) {
       },
     }),
   });
+  if (profile === "live") tools.push({
+    name: "edgepilot_redeem_code_open", title: "Open Redeem Code",
+    description: "Use when the user's message contains an EdgePilot agent redeem code (EP-XXXX-XXXX-XXXX-XXXX, any letter case, spaces allowed), for example \"请使用 EdgePilot 兑换码 EP-7K3M-9QX2-H8WD-4TRC 安装策略\". Reads which strategy and agent the code belongs to without using it, and returns a Dashboard link where the user signs in if needed, redeems and installs. Never redeem the code or install the strategy from chat.",
+    inputSchema: { type: "object", properties: { code: { type: "string", minLength: 1, maxLength: 64 } }, required: ["code"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  });
   tools.push({
     name: "edgepilot_dashboard_open", title: "Open Dashboard",
-    description: "Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.",
+    description: `Start or reuse the Host-owned profile Dashboard and optionally open one exact typed target. A target only controls navigation; it never installs or runs anything.${profile === "live" ? " A custom_strategy target opens one of the user's custom strategies (custom_id from custom_strategy.*), at one revision when given." : ""}`,
     inputSchema: dashboardSchema(),
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   });
   return tools;
+}
+
+const REDEEM_TARGET_CODE = /^[0-9A-Za-z-]{16,32}$/;
+// Live Dashboard pages a card may open; the Host contract's own list.
+const DASHBOARD_PAGES = ["strategies", "live", "tasks"];
+
+function completedOutput(result, operationId) {
+  const outcomes = result?.structuredContent?.outcomes;
+  const outcome = Array.isArray(outcomes) && outcomes.length === 1 ? outcomes[0] : null;
+  return outcome?.operation_id === operationId ? outcome : null;
+}
+
+function redeemResult(payload, text, isError = false) {
+  return {
+    content: [{ type: "text", text }],
+    structuredContent: { schema: "edgepilot-redeem-code-v1", profile, ...payload },
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
+// The Server owns codes and redeeming; chat only previews a code and hands the user to the
+// Dashboard, so the model can never use a code on the user's behalf.
+async function executeRedeemCodeOpen(value) {
+  if (profile !== "live" || Object.keys(value).join(",") !== "code" || typeof value.code !== "string"
+      || value.code.length > 64) throw new BridgeError("invalid_tool_call");
+  const code = value.code.replace(/\s+/g, "");
+  if (!REDEEM_TARGET_CODE.test(code)) {
+    return redeemResult({ code_status: "invalid" }, "This is not an EdgePilot redeem code. Ask the user to check it; codes look like EP-XXXX-XXXX-XXXX-XXXX.", true);
+  }
+  const resolved = await executeHostOperation("redeem.code.resolve", { code });
+  if (resolved?.isError === true) return resolved;
+  const outcome = completedOutput(resolved, "redeem.code.resolve");
+  if (outcome?.status !== "completed") {
+    const failure = typeof outcome?.failure?.code === "string" ? outcome.failure.code : "redeem_check_failed";
+    const text = failure === "redeem_code_invalid"
+      ? "This redeem code does not exist. Ask the user to check it or ask their agent for the correct code."
+      : failure === "rate_limited" ? "Too many redeem code checks. Ask the user to try again in a minute."
+        : `The redeem code could not be checked (${failure}). Ask the user to try again later.`;
+    return redeemResult({ code_status: "unchecked", failure }, text, true);
+  }
+  const { code_status: status, strategy, agent, viewer } = outcome.output ?? {};
+  const facts = { code_status: status, strategy: { slug: strategy?.slug, name: strategy?.name }, agent: { display_name: agent?.display_name }, ...(viewer ? { viewer } : {}) };
+  const named = `the strategy "${strategy?.name}" (${strategy?.slug}), shared by agent ${agent?.display_name}`;
+  let target = null;
+  let text = "";
+  if (viewer?.entitled === true && strategy?.available === true && strategy?.current_version) {
+    // Without a content digest the exact strategy target is impossible; the redeem dialog installs entitled users too.
+    target = strategy.content_sha256
+      ? { kind: "strategy", slug: strategy.slug, version: strategy.current_version, content_sha256: strategy.content_sha256 }
+      : { kind: "redeem", code };
+    text = `The signed-in account already has ${named}; the code is not needed and will not be used. Give the user this Dashboard link to install it:`;
+  } else if (status === "available" && strategy?.available === true) {
+    target = { kind: "redeem", code };
+    text = `The redeem code is valid for ${named}. Give the user this Dashboard link; they sign in if needed, then redeem and install there. Do not redeem or install it from chat. The link works for about 10 minutes; if it expires, ask the user to send the code again:`;
+  } else if (viewer?.entitled === true) {
+    return redeemResult(facts, `The signed-in account already has ${named}, but it cannot be installed right now; the code is not needed. Ask the user to try again later.`, true);
+  } else if (status === "used") {
+    return redeemResult(facts, viewer === undefined
+      ? `This code for ${named} has already been used. If the user redeemed it with their own account, ask them to sign in to the Dashboard, where the strategy is available to that account.`
+      : viewer.used_by_viewer === true
+        ? `This account already used this code for ${named}, but its access is no longer active. Ask the user to contact their agent.`
+        : `This code for ${named} was already used by another account. Ask the user to get a new code from their agent.`, true);
+  } else if (status === "disabled") {
+    return redeemResult(facts, `This code for ${named} has been disabled. Ask the user to get a new code from their agent.`, true);
+  } else {
+    return redeemResult(facts, `${named} cannot be installed right now; the code was not used. Ask the user to try again later.`, true);
+  }
+  const opened = completedOutput(await executeHostOperation("dashboard.open", { target }), "dashboard.open");
+  const url = opened?.status === "completed" ? opened.output?.url : null;
+  if (!dashboardLoopbackUrl(url)) return redeemResult(facts, "The Dashboard could not be opened. Ask the user to open EdgePilot Dashboard and enter the code on the strategy page.", true);
+  return redeemResult({ ...facts, dashboard_url: url }, `${text} ${url}`);
 }
 
 function recommendationSchema() {
@@ -270,11 +394,32 @@ function dashboardTargetSchema() {
   };
 }
 
-function dashboardSchema() {
+// Live also opens one custom strategy. One flat object (not oneOf) keeps the schema usable by
+// every MCP client; dashboardArguments accepts exactly one of the two shapes.
+function liveDashboardTargetSchema() {
+  const strategy = dashboardTargetSchema();
   return {
     type: "object",
     additionalProperties: false,
-    properties: { target: dashboardTargetSchema() },
+    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"} or {kind: \"task\", view_id} (a conversation's task).",
+    properties: {
+      ...strategy.properties,
+      kind: { enum: ["strategy", "custom_strategy", "page", "task"] },
+      custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
+      revision: { type: "integer", minimum: 1, maximum: 999999 },
+      page: { enum: DASHBOARD_PAGES },
+      view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" },
+    },
+    required: ["kind"],
+  };
+}
+
+function dashboardSchema() {
+  const target = profile === "live" ? liveDashboardTargetSchema() : dashboardTargetSchema();
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: { target },
     required: [],
   };
 }
@@ -284,6 +429,25 @@ function dashboardArguments(value) {
   if (Object.keys(value).sort().join(",") !== "target" || value.target === null
       || typeof value.target !== "object" || Array.isArray(value.target)) throw new BridgeError("invalid_tool_call");
   const target = value.target;
+  // A Live page or a conversation's task: what in-chat cards hand over to (ADR 0022, ADR 0023).
+  if (target.kind === "page" && profile === "live") {
+    if (Object.keys(target).sort().join(",") !== "kind,page" || !DASHBOARD_PAGES.includes(target.page)) throw new BridgeError("invalid_tool_call");
+    return { target: { kind: "page", page: target.page } };
+  }
+  if (target.kind === "task" && profile === "live") {
+    if (Object.keys(target).sort().join(",") !== "kind,view_id" || typeof target.view_id !== "string"
+        || !/^view_[0-9a-f]{32}$/.test(target.view_id)) throw new BridgeError("invalid_tool_call");
+    return { target: { kind: "task", view_id: target.view_id } };
+  }
+  if (target.kind === "custom_strategy" && profile === "live") {
+    const keys = Object.keys(target).sort().join(",");
+    if ((keys !== "custom_id,kind" && keys !== "custom_id,kind,revision")
+        || typeof target.custom_id !== "string" || !/^[a-z0-9]{6}$/.test(target.custom_id)
+        || (keys.endsWith("revision") && (!Number.isInteger(target.revision) || target.revision < 1 || target.revision > 999999))) {
+      throw new BridgeError("invalid_tool_call");
+    }
+    return { target: { ...target } };
+  }
   if (Object.keys(target).sort().join(",") !== "content_sha256,kind,slug,version"
       || target.kind !== "strategy" || typeof target.slug !== "string"
       || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(target.slug) || target.slug.length > 80
@@ -323,7 +487,7 @@ function recommendationArguments(value) {
 }
 
 function searchSchema() {
-  return DISCOVER_INPUT_SCHEMA;
+  return SEARCH_INPUT_SCHEMA;
 }
 
 function searchOutputSchema() {
@@ -343,7 +507,10 @@ function searchOutputSchema() {
 function searchArguments(value) {
   const allowed = new Set(Object.keys(searchSchema().properties));
   if (Object.keys(value).some(key => !allowed.has(key))) throw new BridgeError("invalid_tool_call");
-  return { ...value, diversity: value.diversity ?? "none", limit: value.limit ?? 10 };
+  return {
+    ...value, diversity: value.diversity ?? "none", limit: value.limit ?? 10,
+    ...(profile === "live" ? { include_access: true } : {}),
+  };
 }
 
 function readDiscoverSchema() {
@@ -397,24 +564,43 @@ function searchFallback(payload) {
       : payload.request.locale === "ko" ? `${count}개의 검색 결과가 준비되었습니다`
         : `${count} search results are ready`;
   const identities = strategies
-    .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})`)
+    .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})${redeemNote(strategy)}`)
     .join(", ");
   const notes = [...(payload.result.needs_clarification ?? []), ...(payload.result.unsupported_constraints ?? []), ...(payload.result.relaxed_filters ?? [])];
   return `${prefix}${identities ? `: ${identities}` : ""}${notes.length ? `. Notes: ${notes.join("; ")}` : ""}. Use the interactive strategy result cards to open a strategy in Dashboard.`;
 }
 
+// The text the model reads names redeem-code strategies like the cards do; redeeming stays in Dashboard.
+function redeemNote(strategy) {
+  if (strategy.access?.mode !== "redeem_code") return "";
+  return strategy.access.entitled === true ? " [redeem code, unlocked]"
+    : strategy.access.entitled === false ? " [needs a redeem code]" : " [redeem-code strategy]";
+}
+
 // 只读搜索卡必须绑定请求中的精确 Runtime release，但不应被 Host 会话准入状态阻断。
-function readSearchResultsResource(uri) {
+function readLocalAppResource(uri) {
   if (typeof uri !== "string") return null;
-  const match = /^ui:\/\/edgepilot\/strategy-search-results-v1\/([0-9a-f]{64})\.html$/.exec(uri);
-  if (match === null) return null;
-  const runtimeId = `sha256:${match[1]}`;
+  const match = APP_RESOURCE_URI.exec(uri);
+  if (match === null || !Object.hasOwn(APP_RESOURCES, match[1])) return null;
+  // The installed Runtime's page first, whatever Runtime the thread recorded; then the recorded
+  // Runtime's own page while that release is still on disk. Either must pass the same checks.
+  for (const runtimeId of new Set([readInstalledRuntimeId(), `sha256:${match[2]}`])) {
+    const content = readReleaseAppResource(runtimeId, APP_RESOURCES[match[1]], uri);
+    if (content !== null) return content;
+  }
+  return null;
+}
+
+function readReleaseAppResource(runtimeId, resource, uri) {
+  if (typeof runtimeId !== "string" || !/^sha256:[0-9a-f]{64}$/.test(runtimeId)) return null;
+  const digest = runtimeId.slice("sha256:".length);
   const runtimeRoot = join(runtimeHome, "runtime");
   const releasesRoot = join(runtimeRoot, "releases");
-  const release = join(runtimeHome, "runtime", "releases", match[1]);
+  const currentRelease = join(releasesRoot, releaseDirectory(runtimeId));
+  const release = existsSync(currentRelease) ? currentRelease : join(releasesRoot, digest);
   const appsRoot = join(release, "apps");
   const appRoot = join(release, "apps", "mcp-app");
-  const path = join(appRoot, "search-results.html");
+  const path = join(appRoot, resource.file);
   try {
     const runtimeMetadata = lstatSync(runtimeRoot);
     const releasesMetadata = lstatSync(releasesRoot);
@@ -445,7 +631,7 @@ function readSearchResultsResource(uri) {
         || !supportsRuntimeContract(runtime.contractVersion) || !matchesRelease(runtimeId, runtime)) return null;
     const entries = manifest.payload.files;
     const expected = Array.isArray(entries)
-      ? entries.filter(entry => entry?.path === "apps/mcp-app/search-results.html")
+      ? entries.filter(entry => entry?.path === `apps/mcp-app/${resource.file}`)
       : [];
     if (expected.length !== 1 || expected[0].kind !== "file" || expected[0].executable !== false
         || expected[0].size !== metadata.size || !/^sha256:[0-9a-f]{64}$/.test(expected[0].sha256)) return null;
@@ -455,6 +641,7 @@ function readSearchResultsResource(uri) {
     const port = process.env[profile === "live" ? "EDGEPILOT_LIVE_DASHBOARD_PORT" : "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]
       ?? (profile === "live" ? "8787" : "8686");
     if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) return null;
+    // Without a running Host the actual port is unknown; the default is a known limitation (ADR 0020).
     const origin = `http://127.0.0.1:${port}`;
     return {
       uri,
@@ -469,7 +656,7 @@ function readSearchResultsResource(uri) {
         "openai/widgetCSP": {
           connect_domains: [],
           resource_domains: [],
-          redirect_domains: [origin],
+          ...(resource.dashboardLinks ? { redirect_domains: [origin] } : {}),
         },
       },
     };
@@ -583,11 +770,15 @@ function lifecycleSnapshot() {
     const metadata = lstatSync(path);
     if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size > 65536) return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
     const value = JSON.parse(readFileSync(path, "utf8"));
-    if (value === null || typeof value !== "object" || Array.isArray(value)
-        || !["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(value.phase)) {
+    const phases = ["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"];
+    if (value === null || typeof value !== "object" || Array.isArray(value) || !phases.includes(value.phase)) {
       return { phase: "repair_required", last_error: "lifecycle_state_invalid" };
     }
-    return Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
+    const snapshot = Object.fromEntries(["operation_id", "target_version", "target_runtime_id", "phase", "last_error", "updated_at", "cleanup_pending", "selection", "blockers"].map(key => [key, value[key] ?? null]));
+    if (Number.isSafeInteger(value.download_received) && value.download_received >= 0) snapshot.download_received = value.download_received;
+    if (Number.isSafeInteger(value.download_total) && value.download_total >= 0) snapshot.download_total = value.download_total;
+    if (phases.includes(value.interrupted_phase)) snapshot.interrupted_phase = value.interrupted_phase;
+    return snapshot;
   } catch { return { phase: "repair_required", last_error: "lifecycle_state_invalid" }; }
 }
 
@@ -757,13 +948,18 @@ function readInstalledRuntimeId() {
 
 function readInstalledRuntime(runtimeId) {
   if (runtimeId === null || !/^sha256:[0-9a-f]{64}$/.test(runtimeId)) return null;
-  try {
-    const manifest = JSON.parse(readFileSync(join(runtimeHome, "runtime", "releases", runtimeId.slice(7), "RUNTIME.json"), "utf8"));
-    const releaseVersion = manifest?.payload?.release_version;
-    const contractVersion = manifest?.payload?.contract_version;
+  // Migration (WP-098): until the first switch away from it, a release installed before
+  // 16-digit names sits in a directory named by the whole digest.
+  for (const directory of [releaseDirectory(runtimeId), runtimeId.slice("sha256:".length)]) {
+    let manifest;
+    try { manifest = JSON.parse(readFileSync(join(runtimeHome, "runtime", "releases", directory, "RUNTIME.json"), "utf8")); } catch { continue; }
+    if (manifest?.runtime_id !== runtimeId) continue;
+    const releaseVersion = manifest.payload?.release_version;
+    const contractVersion = manifest.payload?.contract_version;
     if (typeof releaseVersion !== "string" || !Number.isInteger(contractVersion?.major) || !Number.isInteger(contractVersion?.minor)) return null;
     return { releaseVersion, contractVersion };
-  } catch { return null; }
+  }
+  return null;
 }
 
 function supportsRuntimeContract(value) {
@@ -872,13 +1068,19 @@ function matchesRelease(runtimeId, runtime) {
 function toolResult(value, isError = false) {
   isError ||= value?.state === "error" || value?.state === "stale_session";
   const pending = value?.message === "runtime_operation_pending";
+  const unfinished = pending || isError || (typeof value?.state === "string" && value.state !== "ready");
+  const upgrading = value?.state === "update_required";
+  const progress = installProgressText(value?.lifecycle);
+  const lifecycleText = upgrading && progress ? ` previous_lifecycle${progress}` : progress;
+  const recentLines = unfinished && !upgrading && value?.state !== "awaiting_confirmation" && value?.state !== "deferred" ? recentOperationEvidence() : [];
+  const recent = recentLines.length ? ` Recent: ${recentLines.join(" | ")}.` : "";
   const text = value?.state === "awaiting_confirmation"
     ? "The target Runtime is prepared. Show the listed old processes/tasks and ask once: defer the switch, or stop the listed old version and continue. Stopping programs does not guarantee cancelling orders or closing positions. Only after that explicit choice call the same lifecycle tool with action, operation_id and snapshot_digest. Do not open the old Dashboard or onboarding as target success."
     : value?.state === "deferred" ? "Runtime switch deferred. The old environment is preserved; this target startup request has ended."
     : pending
-    ? "EdgePilot Runtime installation or startup is still pending. Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation."
-    : isError || (typeof value?.state === "string" && value.state !== "ready")
-      ? "EdgePilot Runtime is not ready. Follow required_action before opening Dashboard or onboarding."
+    ? `EdgePilot Runtime installation or startup is still pending.${decisionText(value)}${progress}${recent} Wait for runtime_status to report ready with connection_ready=true before opening Dashboard or onboarding. Do not start another installation.`
+    : unfinished
+      ? `EdgePilot Runtime is not ready.${decisionText(value)}${lifecycleText}${recent} Follow required_action before opening Dashboard or onboarding.`
       : value?.state === "ready"
         ? "EdgePilot Runtime is ready. Installation and startup have completed; Dashboard and onboarding may now be opened."
         : "EdgePilot Runtime operation completed.";
@@ -889,6 +1091,63 @@ function toolResult(value, isError = false) {
   };
 }
 
+function decisionText(value) {
+  if (typeof value?.state !== "string" || value.state === "ready") return "";
+  const message = typeof value.message === "string" && value.message ? ` message=${value.message}` : "";
+  const action = typeof value.required_action === "string" && value.required_action ? ` required_action=${value.required_action}` : "";
+  return ` state=${value.state}${message}${action}.`;
+}
+
+function installProgressText(lifecycle) {
+  if (lifecycle === null || typeof lifecycle !== "object") return "";
+  const parts = [];
+  if (typeof lifecycle.phase === "string") parts.push(`phase=${lifecycle.phase}`);
+  if (typeof lifecycle.interrupted_phase === "string") parts.push(`interrupted_phase=${lifecycle.interrupted_phase}`);
+  if (Number.isSafeInteger(lifecycle.download_received)) {
+    parts.push(`download=${lifecycle.download_received}/${Number.isSafeInteger(lifecycle.download_total) ? lifecycle.download_total : "?"}`);
+  }
+  if (typeof lifecycle.last_error === "string" && lifecycle.last_error) parts.push(`last_error=${lifecycle.last_error}`);
+  if (typeof lifecycle.updated_at === "string" && lifecycle.updated_at) parts.push(`updated_at=${lifecycle.updated_at}`);
+  return parts.length ? ` ${parts.join(" ")}.` : "";
+}
+
+function diagnosisText(value) {
+  const progress = installProgressText(value.lifecycle);
+  const lines = [
+    ...(value.last_operation?.stderr ?? []).slice(-4),
+    ...(Array.isArray(value.last_failed_operation?.stderr) ? value.last_failed_operation.stderr.slice(-2) : []),
+    ...(value.host_log ?? []).slice(-2),
+  ].filter(line => typeof line === "string" && line);
+  const unique = [];
+  for (const line of lines) if (unique.at(-1) !== line) unique.push(line);
+  const recent = unique.length ? ` Recent: ${unique.join(" | ")}.` : "";
+  const gaps = Array.isArray(value.gaps) && value.gaps.length ? ` gaps=${value.gaps.join(",")}.` : "";
+  return `Runtime install/startup diagnostics.${progress} state=${value.status?.state ?? "unknown"} message=${value.status?.message ?? "none"}.${recent}${gaps} Explain the failing step from this text; separate confirmed causes from guesses. Do not start, update, repair or stop anything unless the user asks.`;
+}
+
+function recentOperationEvidence(limit = 4) {
+  const logs = join(runtimeHome, "runtime", "logs");
+  let stderr = [];
+  try {
+    const operations = readdirSync(logs).filter(name => /^operation-[0-9a-f-]{36}\.err$/u.test(name))
+      .map(name => ({ name, modified: lstatSync(join(logs, name)).mtimeMs }))
+      .sort((left, right) => right.modified - left.modified);
+    if (operations.length > 0) stderr = diagnosticLines(tailText(join(logs, operations[0].name)), 30, 8);
+  } catch { /* No lifecycle operation is running. */ }
+  let failed = [];
+  try {
+    const path = join(logs, "last-failed-operation.json");
+    if (lstatSync(path).isFile() && !lstatSync(path).isSymbolicLink() && lstatSync(path).size <= 65536) {
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      if (Array.isArray(record.stderr)) failed = record.stderr.filter(line => typeof line === "string").map(scrubDiagnosticLine);
+    }
+  } catch { /* No failed lifecycle operation recorded. */ }
+  const lines = [];
+  for (const line of [...stderr, ...failed]) if (lines.at(-1) !== line) lines.push(line);
+  return lines.slice(-limit);
+}
+
+function isPlainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
 function resultResponse(id, result) { return { jsonrpc: "2.0", id, result }; }
 function errorResponse(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 function writeResponse(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }

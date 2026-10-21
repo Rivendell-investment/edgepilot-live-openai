@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Dependency-free installer/launcher for the EdgePilot Runtime.
 
-import { createHash, createPublicKey, verify as verifySignature, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, verify as verifySignature, randomBytes, randomUUID } from "node:crypto";
 import {
   chmodSync,
   closeSync,
@@ -21,13 +21,15 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
+  fsyncSync,
 } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, platform as hostPlatform, arch as hostArch, release as hostRelease } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep, toNamespacedPath } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep, toNamespacedPath, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
-import { Transform, Readable } from "node:stream";
+import { Transform, Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createInflateRaw } from "node:zlib";
 import * as __edgepilot_lifecycle_dependency_0 from "node:fs";
@@ -55,6 +57,10 @@ function writeLifecycleState(path, value) {
   try { renameSync(temporary, path); } finally { rmSync(temporary, { force: true }); }
 }
 
+// A retired release keeps its directory name plus a UUID. Migration (WP-098): a switch an
+// earlier Bootstrap interrupted names it by the whole 64-digit digest.
+const RETIRED_DIRECTORY = /^(?:[0-9a-f]{16}|[0-9a-f]{64})-[0-9a-f-]{36}$/;
+
 function readLifecycleState(root) {
   const path = join(root, "lifecycle.json");
   if (!existsSync(path)) return null;
@@ -66,7 +72,7 @@ function readLifecycleState(root) {
       || !["prepare", "inspect", "awaiting_confirmation", "deferred", "quiesce", "retire", "migrate", "start", "commit", "ready", "blocked", "repair_required"].includes(state.phase)
       || !/^\d+\.\d+\.\d+$/.test(state.target_version) || !Array.isArray(state.target_ids)
       || state.target_ids.some(id => !/^sha256:[0-9a-f]{64}$/.test(id))
-      || (state.retired_directory !== undefined && !/^[0-9a-f]{64}-[0-9a-f-]{36}$/.test(state.retired_directory))) throw lifecycleError("lifecycle_state_invalid");
+      || (state.retired_directory !== undefined && !RETIRED_DIRECTORY.test(state.retired_directory))) throw lifecycleError("lifecycle_state_invalid");
   for (const selection of [state.selection, state.authorized]) {
     if (selection == null) continue;
     if (selection.operation_id !== state.operation_id || selection.target_version !== state.target_version
@@ -621,12 +627,15 @@ const MAX_CHANNEL_BYTES = 512 * 1024;
 const MAX_FILES = 200_000;
 const METADATA_DOWNLOAD_TIMEOUT_MS = 120_000;
 const RUNTIME_DOWNLOAD_TIMEOUT_MS = 15 * 60_000;
+const ARCHIVE_DOWNLOAD_ATTEMPTS = 3;
+const ARCHIVE_STALL_MS = 120_000;
+const DOWNLOAD_PROGRESS_INTERVAL_MS = 5_000;
 export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // Windows cold starts re-hash the full installed Runtime tree before the Host
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.13";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.19";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -641,9 +650,10 @@ const ENVIRONMENT_PORTS = Object.freeze({
 });
 
 export class BootstrapError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details = null) {
     super(message);
     this.code = code;
+    this.details = details;
   }
 }
 
@@ -679,19 +689,103 @@ export function validateEnvironmentIsolation({ product, environmentName, marketp
   }
 }
 
-// MAX_PATH is 260 WCHARs including the terminator. LoadLibrary still applies it
-// to extension modules with embedded manifests even when long paths are enabled,
-// so the budget is measured against the real file inventory, not a guess.
+// Python runs a Runtime only from its release directory and, for the install probe, from
+// a candidate beside it whose name is exactly as long; Node's own file operations accept
+// long paths. Python opens files within MAX_PATH (260 WCHARs including the terminator).
+// LoadLibrary also opens "<module>.2.Config" for an extension module with an embedded
+// manifest, even when long paths are enabled, so a .pyd or .dll must leave room for that
+// suffix (the same 250 as packaging/platform_build_home.py). The budget is measured
+// against the real file inventory, not a guess.
 const WINDOWS_MAX_PATH_CHARS = 259;
+export const WINDOWS_EXTENSION_MODULE_CHARS = WINDOWS_MAX_PATH_CHARS - ".2.Config".length;
 
-export function validateWindowsReleasePathBudget(releaseRoot, manifest, platform = process.platform) {
+export function validateWindowsReleasePathBudget(directory, manifest, platform = process.platform) {
   if (platform !== "win32") return;
-  let deepest = 0;
-  for (const entry of manifest.payload.files) if (entry.path.length > deepest) deepest = entry.path.length;
-  const longest = releaseRoot.length + 1 + deepest;
-  if (longest > WINDOWS_MAX_PATH_CHARS) {
-    fail("runtime_path_too_long", `Windows Runtime path would reach ${longest} characters; choose a --runtime-home at least ${longest - WINDOWS_MAX_PATH_CHARS} characters shorter`);
+  let worst = null;
+  for (const entry of manifest.payload.files) {
+    const length = directory.length + 1 + entry.path.length;
+    const limit = /\.(?:pyd|dll)$/iu.test(entry.path) ? WINDOWS_EXTENSION_MODULE_CHARS : WINDOWS_MAX_PATH_CHARS;
+    if (length - limit > (worst?.excess ?? 0)) worst = { path: entry.path, length, limit, excess: length - limit };
   }
+  if (worst !== null) {
+    throw new BootstrapError("runtime_path_too_long",
+      `Windows Runtime file ${worst.path} would reach ${worst.length} characters under ${directory} (limit ${worst.limit}); choose a --runtime-home at least ${worst.excess} characters shorter`,
+      { runtime_id: manifest.runtime_id, directory, path: worst.path, length: worst.length, limit: worst.limit, required_reduction: worst.excess });
+  }
+}
+
+// Python file APIs honor this machine setting when python.exe is longPathAware.
+// LoadLibrary of a .pyd/.dll still ignores it, so the release path budget above stays.
+const WINDOWS_LONG_PATHS_KEY = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\FileSystem";
+
+function windowsSystemExecutable(...parts) {
+  return win32.join(process.env.SYSTEMROOT ?? "C:\\Windows", "System32", ...parts);
+}
+
+function windowsLongPathsEnabled(stdout) {
+  const match = /LongPathsEnabled\s+REG_DWORD\s+0x([0-9a-f]+)/i.exec(String(stdout ?? ""));
+  return match !== null && Number.parseInt(match[1], 16) === 1;
+}
+
+function powershellLiteral(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+const WINDOWS_LONG_PATHS_PROMPT = {
+  zh: {
+    title: "EdgePilot 需要打开 Windows 长路径",
+    body: [
+      "接下来会弹出 Windows 的管理员授权窗口，只修改一项系统设置：允许超过 260 个字符的文件路径（LongPathsEnabled）。",
+      "需要它的原因：检查策略时要保存结果文件。路径太长时，没有这项设置就创建不了临时文件，回测会在开始计算前失败。",
+      "如果拒绝授权：这次安装或升级会停止。较短的路径不受影响，但超过限制的策略无法完成检查。",
+      "请先点“确定”，再在随后的 Windows 窗口里选择“是”。点“取消”则不会提权。",
+    ].join("\n"),
+  },
+  en: {
+    title: "EdgePilot needs Windows long paths",
+    body: [
+      "Windows will ask for administrator approval next. EdgePilot changes one setting: allow file paths longer than 260 characters (LongPathsEnabled).",
+      "Why: a strategy check saves a result file. Without this setting, a path that is too long cannot be created, and a backtest fails before it starts.",
+      "If you decline: this install or upgrade stops. Shorter paths are unaffected, but a strategy whose path is too long cannot be checked.",
+      "Choose OK here, then Yes on the Windows prompt. Cancel does not request administrator approval.",
+    ].join("\n"),
+  },
+};
+
+function windowsLongPathsElevationScript(reg) {
+  const zh = WINDOWS_LONG_PATHS_PROMPT.zh;
+  const en = WINDOWS_LONG_PATHS_PROMPT.en;
+  return [
+    "$ErrorActionPreference='Stop'",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$zh = (Get-UICulture).Name -like 'zh*'",
+    `$title = if ($zh) { ${powershellLiteral(zh.title)} } else { ${powershellLiteral(en.title)} }`,
+    `$body = if ($zh) { ${powershellLiteral(zh.body)} } else { ${powershellLiteral(en.body)} }`,
+    "$answer = [System.Windows.Forms.MessageBox]::Show($body, $title, [System.Windows.Forms.MessageBoxButtons]::OKCancel, [System.Windows.Forms.MessageBoxIcon]::Information, [System.Windows.Forms.MessageBoxDefaultButton]::Button1, [System.Windows.Forms.MessageBoxOptions]::DefaultDesktopOnly)",
+    "if ($answer -ne 'OK') { exit 2 }",
+    `$p=Start-Process -FilePath ${powershellLiteral(reg)} -ArgumentList @('add','${WINDOWS_LONG_PATHS_KEY}','/v','LongPathsEnabled','/t','REG_DWORD','/d','1','/f') -Verb RunAs -Wait -PassThru -WindowStyle Hidden`,
+    "if ($null -eq $p -or $p.ExitCode -ne 0) { exit 1 }",
+    "exit 0",
+  ].join("; ");
+}
+
+export function ensureWindowsLongPaths({ platform = process.platform, run = spawnSync } = {}) {
+  if (platform !== "win32") return;
+  const reg = windowsSystemExecutable("reg.exe");
+  const options = { encoding: "utf8", timeout: 180_000, windowsHide: true };
+  const query = () => run(reg, ["query", WINDOWS_LONG_PATHS_KEY, "/v", "LongPathsEnabled"], options);
+  const current = query();
+  if (current.status === 0 && windowsLongPathsEnabled(current.stdout)) return;
+  const added = run(reg, ["add", WINDOWS_LONG_PATHS_KEY, "/v", "LongPathsEnabled", "/t", "REG_DWORD", "/d", "1", "/f"], options);
+  if (added.status === 0) return;
+  const powershell = windowsSystemExecutable("WindowsPowerShell", "v1.0", "powershell.exe");
+  const elevated = run(powershell, ["-NoProfile", "-STA", "-Command", windowsLongPathsElevationScript(reg)], { ...options, timeout: 300_000 });
+  const confirmed = elevated.status === 0 ? query() : null;
+  if (confirmed?.status === 0 && windowsLongPathsEnabled(confirmed.stdout)) return;
+  throw new BootstrapError(
+    "windows_long_paths_denied",
+    "Windows long path support could not be enabled; approve the administrator prompt for LongPathsEnabled",
+  );
 }
 
 function physicalStatePath(value) {
@@ -1184,9 +1278,51 @@ function atomicJson(path, value, mode = 0o600) {
   }
 }
 
+// A release directory is named by the first 16 hex digits of its Runtime ID, which keeps
+// 48 characters of the Windows path budget. The full ID stays the identity: every reader
+// compares the directory's RUNTIME.json runtime_id. The Host (release/resolver.py) and the
+// plugin resolvers name it the same way.
+const RELEASE_DIRECTORY_CHARS = 16;
+const RELEASE_DIRECTORY = /^[0-9a-f]{16}$/u;
+
 function runtimeDirectory(runtimeId) {
   if (!isDigest(runtimeId)) fail("runtime_identity_invalid", "Runtime ID is invalid");
-  return runtimeId.slice("sha256:".length);
+  return runtimeId.slice("sha256:".length, "sha256:".length + RELEASE_DIRECTORY_CHARS);
+}
+
+function releaseRoot(stateRoot, runtimeId) {
+  return join(stateRoot, "releases", runtimeDirectory(runtimeId));
+}
+
+// WP-098：尚未迁移的 64 字符目录仍可查询、启动、停止和修复；新安装只写入短目录。
+// 升级后的旧目录由 gc 在解释器退出后清理。受支持版本全部采用短目录后删除旧格式读取。
+const LEGACY_RELEASE_DIRECTORY = /^[0-9a-f]{64}$/u;
+
+function legacyReleaseRoot(stateRoot, runtimeId) {
+  return join(stateRoot, "releases", runtimeId.slice("sha256:".length));
+}
+
+// 新目录存在时必须验证它；只有尚未建立新目录的安装才读取旧目录。
+function installedReleaseRoot(stateRoot, runtimeId) {
+  const current = releaseRoot(stateRoot, runtimeId);
+  const legacy = legacyReleaseRoot(stateRoot, runtimeId);
+  return !existsSync(current) && existsSync(legacy) ? legacy : current;
+}
+
+/** Whether the release directory ``name`` (current or legacy form) is the one for ``runtimeId``. */
+function releaseDirectoryHolds(name, runtimeId) {
+  return RELEASE_DIRECTORY.test(name) ? runtimeDirectory(runtimeId) === name : `sha256:${name}` === runtimeId;
+}
+
+/**
+ * Refuse a release directory that already holds another Runtime: two IDs sharing a 16-digit
+ * prefix must never replace or reuse each other's files. A directory without a readable
+ * manifest is left to the caller's own verification.
+ */
+function requireReleaseSlot(root, runtimeId) {
+  let installed;
+  try { installed = JSON.parse(readFileSync(join(root, "RUNTIME.json"), "utf8"))?.runtime_id; } catch { return; }
+  if (installed !== runtimeId) fail("runtime_directory_conflict", "Runtime release directory holds another Runtime");
 }
 
 function readPointer(path) {
@@ -1360,36 +1496,46 @@ export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximu
     await recoverRepairBackups(releases);
     removeGeneratedFilesystemMetadata(releases, "runtime_release_root_invalid");
     const pointer = readPointer(join(stateRoot, "current.json"));
-    // A release whose interpreter still runs (a task finishing on the old Runtime, D44) is kept below.
-    const protectedIds = new Set([pointer.current_runtime_id]);
     const releaseEntries = readdirSync(releases, { withFileTypes: true });
-    for (const entry of releaseEntries.filter((item) => item.name.startsWith(".candidate-"))) {
+    // An install candidate left by an interrupted install (installRuntime holds the same lock).
+    const candidate = (name) => name.startsWith(".c-") || name.startsWith(".candidate-");
+    for (const entry of releaseEntries.filter((item) => candidate(item.name))) {
       const path = join(releases, entry.name);
       if (!entry.isDirectory() || entry.isSymbolicLink() || lstatSync(path).isSymbolicLink()) fail("runtime_release_root_invalid", "Runtime candidate path is invalid");
       rmSync(path, { recursive: true, force: true });
     }
-    const entries = releaseEntries.filter((entry) => !entry.name.startsWith(".candidate-")).map((entry) => {
-      if (!/^[0-9a-f]{64}$/u.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink()) fail("runtime_release_root_invalid", "Runtime releases root contains an unmanaged entry");
+    const entries = releaseEntries.filter((entry) => !candidate(entry.name)).map((entry) => {
+      const legacy = LEGACY_RELEASE_DIRECTORY.test(entry.name);
+      if (!(legacy || RELEASE_DIRECTORY.test(entry.name)) || !entry.isDirectory() || entry.isSymbolicLink()) fail("runtime_release_root_invalid", "Runtime releases root contains an unmanaged entry");
       const path = join(releases, entry.name);
       const metadata = lstatSync(path);
-      return { runtimeId: `sha256:${entry.name}`, path, bytes: directoryBytes(path), modified: metadata.mtimeMs };
+      return { name: entry.name, legacy, path, bytes: directoryBytes(path), modified: metadata.mtimeMs };
     }).sort((left, right) => right.modified - left.modified);
-    const keep = new Set(protectedIds);
-    const executableById = new Map(entries.filter(entry => !keep.has(entry.runtimeId)).map(entry => {
+    // The pointer protects its release; before the first switch that is still a legacy directory.
+    const currentName = entries.some((entry) => entry.name === runtimeDirectory(pointer.current_runtime_id))
+      ? runtimeDirectory(pointer.current_runtime_id) : pointer.current_runtime_id.slice("sha256:".length);
+    for (const entry of entries) entry.current = entry.name === currentName;
+    // Every release other than the current one proves which Runtime it holds before it is kept or removed.
+    for (const entry of entries) {
+      if (entry.current) { entry.runtimeId = pointer.current_runtime_id; continue; }
       const manifest = validateManifest(JSON.parse(readFileSync(join(entry.path, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
-      if (manifest.runtime_id !== entry.runtimeId) fail("runtime_identity_invalid", "Cleanup Runtime identity differs");
-      return [entry.runtimeId, safeDestination(entry.path, manifest.payload.python.executable)];
-    }));
-    const inUse = executableById.size ? runtimeExecutablesInUse([...executableById.values()]) : new Set();
-    for (const [id, executable] of executableById) if (inUse.has(executable)) keep.add(id);
-    for (const entry of entries) if (keep.size < maximumReleases) keep.add(entry.runtimeId);
-    let retainedBytes = entries.filter((entry) => keep.has(entry.runtimeId)).reduce((sum, entry) => sum + entry.bytes, 0);
-    const removed = [];
+      if (!releaseDirectoryHolds(entry.name, manifest.runtime_id)) fail("runtime_identity_invalid", "Cleanup Runtime identity differs");
+      entry.runtimeId = manifest.runtime_id;
+      entry.executable = safeDestination(entry.path, manifest.payload.python.executable);
+    }
+    const others = entries.filter((entry) => !entry.current);
+    const inUse = others.length ? runtimeExecutablesInUse(others.map((entry) => entry.executable)) : new Set();
+    // A release whose interpreter still runs (a task finishing on the old Runtime, D44) is kept.
+    const keep = new Set(entries.filter((entry) => entry.current || inUse.has(entry.executable)));
+    // Any other legacy release is never a rollback candidate: it stays only while its interpreter runs.
+    for (const entry of entries) if (!entry.legacy && keep.size < maximumReleases) keep.add(entry);
+    let retainedBytes = [...keep].reduce((sum, entry) => sum + entry.bytes, 0);
+    const removed = new Set();
     for (const entry of [...entries].reverse()) {
-      if (keep.has(entry.runtimeId)) continue;
-      if (entries.length - removed.length <= maximumReleases && retainedBytes <= maximumBytes) continue;
+      if (keep.has(entry)) continue;
+      if (!entry.legacy && entries.length - removed.size <= maximumReleases && retainedBytes <= maximumBytes) continue;
       rmSync(entry.path, { recursive: true, force: true });
-      removed.push(entry.runtimeId);
+      removed.add(entry);
     }
     for (const root of [join(dirname(stateRoot), "downloads"), join(stateRoot, "probes")]) {
       if (!existsSync(root)) continue;
@@ -1401,7 +1547,7 @@ export async function garbageCollect({ stateRoot, pluginStateRoot = null, maximu
       }
     }
     const pluginStagesRemoved = pluginStateRoot === null ? [] : garbageCollectPluginStages(pluginStateRoot);
-    return { removed: removed.sort(), retained: entries.filter((entry) => !removed.includes(entry.runtimeId)).map((entry) => entry.runtimeId).sort(), bytes: retainedBytes, plugin_stages_removed: pluginStagesRemoved };
+    return { removed: [...removed].map((entry) => entry.runtimeId).sort(), retained: entries.filter((entry) => !removed.has(entry)).map((entry) => entry.runtimeId).sort(), bytes: retainedBytes, plugin_stages_removed: pluginStagesRemoved };
   });
 }
 
@@ -1441,14 +1587,16 @@ function rotateHostLog(logPath, maximumBytes = 10 * 1024 * 1024, retainedFiles =
 
 async function recoverRepairBackups(releases, trustedKeys = null, enforcePlatform = true) {
   for (const entry of readdirSync(releases, { withFileTypes: true })) {
-    if (!/^\.repair-[0-9a-f]{64}$/u.test(entry.name)) continue;
+    if (!entry.name.startsWith(".repair-")) continue;
+    const name = entry.name.slice(".repair-".length);
+    if (!RELEASE_DIRECTORY.test(name) && !LEGACY_RELEASE_DIRECTORY.test(name)) continue;
     if (!entry.isDirectory() || entry.isSymbolicLink()) fail("runtime_path_invalid", "Runtime repair backup is invalid");
-    const backup = join(releases, entry.name), final = join(releases, entry.name.slice(8));
+    const backup = join(releases, entry.name), final = join(releases, name);
     if (!existsSync(final)) {
       renameSync(backup, final);
     } else {
       const manifest = validateManifest(JSON.parse(readFileSync(join(final, "RUNTIME.json"), "utf8")), trustedKeys, { enforcePlatform });
-      if (manifest.runtime_id !== `sha256:${entry.name.slice(8)}`) fail("runtime_identity_invalid", "Runtime repair recovery identity differs");
+      if (!releaseDirectoryHolds(name, manifest.runtime_id)) fail("runtime_identity_invalid", "Runtime repair recovery identity differs");
       await verifyTree(final, manifest);
       rmSync(backup, { recursive: true, force: true });
     }
@@ -1469,15 +1617,16 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
     const releases = join(stateRoot, "releases");
     mkdirSync(releases, { recursive: true, mode: 0o700 });
     await recoverRepairBackups(releases, trustedKeys, enforcePlatform);
-    const final = join(releases, runtimeDirectory(manifest.runtime_id));
+    const final = installedReleaseRoot(stateRoot, manifest.runtime_id);
     validateWindowsReleasePathBudget(final, manifest);
+    requireReleaseSlot(final, manifest.runtime_id);
     const pointerPath = join(stateRoot, "current.json");
     let previous = null;
     if (existsSync(pointerPath)) {
       previous = readPointer(pointerPath);
     }
     if (previous !== null && previous.current_runtime_id !== manifest.runtime_id) {
-      const currentPath = join(releases, runtimeDirectory(previous.current_runtime_id), "RUNTIME.json");
+      const currentPath = join(installedReleaseRoot(stateRoot, previous.current_runtime_id), "RUNTIME.json");
       let current;
       try {
         current = validateManifest(JSON.parse(readFileSync(currentPath, "utf8")), trustedKeys, { enforcePlatform });
@@ -1498,16 +1647,17 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
       if (canonical(installed) !== canonical(manifest)) fail("runtime_identity_invalid", "installed Runtime manifest differs");
       await probe(final, manifest, stateRoot);
     } else {
-      // Keep the temporary Windows import path below DLL loader limits; the
-      // activated content-addressed release path remains unchanged.
-      const candidate = join(releases, `.c-${randomUUID().slice(0, 12)}`);
+      // The probe runs Python from the candidate, so its name is exactly as long as the
+      // release directory: a probe that loads here proves the same depth loads after the
+      // rename, and the path budget above covers both.
+      const candidate = join(releases, `.c-${randomBytes(32).toString("hex").slice(0, basename(final).length - ".c-".length)}`);
       try {
         await extractZip(archivePath, candidate, manifest);
         await verifyTree(candidate, manifest);
         atomicJson(join(candidate, "RUNTIME.json"), manifest);
         await probe(candidate, manifest, stateRoot);
         if (beforeActivate !== null) await beforeActivate(manifest);
-        const backup = join(releases, `.repair-${runtimeDirectory(manifest.runtime_id)}`);
+        const backup = join(releases, `.repair-${basename(final)}`);
         const replacing = repair && existsSync(final);
         if (replacing) renameSync(final, backup);
         try { renameSync(candidate, final); } catch (error) {
@@ -1533,7 +1683,7 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
   });
 }
 
-export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product, version, runtimeIds, repair = false }) {
+export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product, version, runtimeIds, repair = false, resumeRuntimeId = null, onProgress = null }) {
   if (!isSemver(version) || runtimeIds.length === 0 || runtimeIds.some(id => !isDigest(id))) fail("runtime_binding_missing", "A fixed release binding is required");
   const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : "linux";
   const arch = process.arch === "x64" ? "amd64" : process.arch;
@@ -1541,13 +1691,17 @@ export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product
   const downloads = join(home, "downloads");
   mkdirSync(downloads, { recursive: true, mode: 0o700 });
   const manifestPath = join(downloads, `manifest-${randomUUID()}.json`);
-  const archivePath = join(downloads, `runtime-${randomUUID()}.zip`);
+  const archiveUrl = new URL("runtime.zip", base).href;
+  const archivePath = resumableArchivePath(downloads, archiveUrl);
+  let keepPartial = false;
   {
     for (const id of runtimeIds) {
       for (const cacheRoot of [stateRoot, join(stateRoot, "prepared")]) {
-        if (repair && cacheRoot === stateRoot) continue;
+        const resumeCurrent = cacheRoot === stateRoot && id === resumeRuntimeId
+          && existsSync(join(stateRoot, "current.json")) && readPointer(join(stateRoot, "current.json")).current_runtime_id === id;
+        if (repair && cacheRoot === stateRoot && !resumeCurrent) continue;
         try {
-          const cached = await runtimeById(cacheRoot, id, null);
+          const cached = await runtimeById(cacheRoot, id, null, { allowLegacy: resumeCurrent });
           if (manifestProduct(cached.manifest) === product && cached.manifest.payload.release_version === version) {
             try {
               await verifyTree(cached.root, cached.manifest);
@@ -1566,11 +1720,16 @@ export async function prepareBoundRuntime({ home, stateRoot, channelUrl, product
     await download(new URL("RUNTIME.json", base).href, manifestPath, MAX_MANIFEST_BYTES);
     const manifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")), null);
     if (manifestProduct(manifest) !== product || manifest.payload.release_version !== version || !runtimeIds.includes(manifest.runtime_id)) fail("runtime_identity_incompatible", "Fixed release identity differs");
-    await download(new URL("runtime.zip", base).href, archivePath, manifest.payload.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS);
+    // Checked again by installRuntime; here it spares a Runtime download that cannot install.
+    validateWindowsReleasePathBudget(installedReleaseRoot(join(stateRoot, "prepared"), manifest.runtime_id), manifest);
+    await download(archiveUrl, archivePath, manifest.payload.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS, { resume: true, attempts: ARCHIVE_DOWNLOAD_ATTEMPTS, onProgress });
     return await installRuntime({ archivePath, manifestPath, stateRoot: join(stateRoot, "prepared"), trustedKeys: null, repair, activate: false });
+  } catch (error) {
+    keepPartial = retryableDownload(error);
+    throw error;
   } finally {
     rmSync(manifestPath, { force: true });
-    rmSync(archivePath, { force: true });
+    if (!keepPartial) rmSync(archivePath, { force: true });
   }
 }
 
@@ -1625,7 +1784,10 @@ async function completeSwitch({ transaction, runtime, home, stateRoot, pluginSta
 
 function previousRuntime(stateRoot, transaction, previousId, product) {
   if (!previousId) return null;
-  const root = join(stateRoot, "releases", runtimeDirectory(previousId));
+  // ``root`` is where the old Host ran from, also when a switch already retired the directory.
+  const installed = releaseRoot(stateRoot, previousId), legacy = legacyReleaseRoot(stateRoot, previousId);
+  const legacyRetired = transaction.value.retired_directory?.startsWith(`${basename(legacy)}-`) ?? false;
+  const root = !existsSync(join(installed, "RUNTIME.json")) && (existsSync(join(legacy, "RUNTIME.json")) || legacyRetired) ? legacy : installed;
   const manifestPath = existsSync(join(root, "RUNTIME.json")) ? join(root, "RUNTIME.json")
     : transaction.value.retired_directory ? join(stateRoot, "retired", transaction.value.retired_directory, "RUNTIME.json") : null;
   if (!manifestPath) fail("runtime_identity_invalid", "Previous Runtime manifest is missing");
@@ -1660,7 +1822,12 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
   let quiesced = false, oldRuntimeId = null;
   const switchArguments = { home, stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, product, marketplaceOrigin, environmentName, hostPort };
   try {
-    const prepared = await prepareBoundRuntime({ home, stateRoot, channelUrl, product, version, runtimeIds, repair });
+    const resumeRuntimeId = previous?.cutover_started && previous.phase !== "ready"
+      && previous.target_version === version && runtimeIds.includes(previous.target_runtime_id) ? previous.target_runtime_id : null;
+    const prepared = await prepareBoundRuntime({
+      home, stateRoot, channelUrl, product, version, runtimeIds, repair, resumeRuntimeId,
+      onProgress: (received, total) => transaction.advance("prepare", { download_received: received, download_total: total }),
+    });
     const productState = product === "live" ? liveStateRoot : researchStateRoot;
     const stateMarker = join(productState, "runtime-state-format.json");
     if (existsSync(stateMarker)) {
@@ -1670,9 +1837,16 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
         fail("product_state_incompatible", "Product state is newer or belongs to another product");
     }
     transaction.advance("inspect", { target_runtime_id: prepared.manifest.runtime_id });
-    const final = join(stateRoot, "releases", runtimeDirectory(prepared.manifest.runtime_id));
     let pointer = null;
     try { pointer = readPointer(join(stateRoot, "current.json")); } catch { /* first installation */ }
+    const shortFinal = releaseRoot(stateRoot, prepared.manifest.runtime_id);
+    const legacyFinal = legacyReleaseRoot(stateRoot, prepared.manifest.runtime_id);
+    // 同 ID 修复保留原布局；旧 Host 仍按完整摘要查找目录，中断后也沿原目录恢复。
+    const preserveLegacy = pointer?.current_runtime_id === prepared.manifest.runtime_id && !existsSync(shortFinal)
+      && (existsSync(legacyFinal) || previous?.retired_directory?.startsWith(`${basename(legacyFinal)}-`));
+    const final = preserveLegacy ? legacyFinal : shortFinal;
+    validateWindowsReleasePathBudget(final, prepared.manifest);
+    requireReleaseSlot(final, prepared.manifest.runtime_id);
     const identity = await switchHostIdentity(pluginStateRoot, product);
     // Past the commit point already (or the new Host already runs from an interrupted
     // switch): continue from the start step, forward only.
@@ -1727,13 +1901,12 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
       if (snapshot.legacy.length) fail("runtime_process_in_use", "An old trading task survived the confirmed switch");
     }
     if (identity) await stopHost(pluginStateRoot, previousId, product);
-    if (oldHostProcesses(old, identity).length) {
-      // A Host that did not stop on request: the manager first, so it does not restart it
-      // from the old launcher, then by its command line.
-      serviceManager(home, product, environmentName).stop("host");
-      const remaining = oldHostProcesses(old, identity);
-      if (remaining.length) await stopAuthorizedProcesses(remaining, { birthOf: processBirth });
-    }
+    // End the service task even when no Python Host is visible. The Windows launcher
+    // sleeps for a minute after a non-zero exit; during that sleep the task is still
+    // running, and a later start is ignored as a second instance.
+    serviceManager(home, product, environmentName).stop("host");
+    const remaining = oldHostProcesses(old, identity);
+    if (remaining.length) await stopAuthorizedProcesses(remaining, { birthOf: processBirth });
     // The old Host (and a v1 Dashboard) read this state; move it only once they are gone.
     if (product === "live" && old !== null && existsSync(join(liveStateRoot, LEGACY_JOBS))) archiveLegacyTradingState(liveStateRoot);
     if (snapshot.trading?.running) {
@@ -1745,7 +1918,7 @@ async function forwardUpgrade({ home, stateRoot, pluginStateRoot, liveStateRoot,
       if (existsSync(final)) {
         const retired = join(stateRoot, "retired");
         mkdirSync(retired, { recursive: true, mode: 0o700 });
-        const retiredName = `${runtimeDirectory(prepared.manifest.runtime_id)}-${randomUUID()}`;
+        const retiredName = `${basename(final)}-${randomUUID()}`;
         transaction.advance("retire", { retired_directory: retiredName });
         renameSync(final, join(retired, retiredName));
       }
@@ -1864,27 +2037,182 @@ async function probeRuntime(runtimeRoot, manifest, stateRoot) {
   }
 }
 
-async function download(url, destination, maximumBytes, timeoutMs = METADATA_DOWNLOAD_TIMEOUT_MS) {
+function retryableDownload(error) {
+  return error instanceof BootstrapError && ["download_interrupted", "download_timeout", "channel_unavailable"].includes(error.code);
+}
+
+function resumableArchivePath(directory, url) {
+  return join(directory, `runtime-${createHash("sha256").update(String(url)).digest("hex").slice(0, 32)}.partial`);
+}
+
+function downloadProgress(total, onProgress, enabled) {
+  let lastAt = 0;
+  let lastBytes = -1;
+  return (received, force = false, heartbeat = false) => {
+    if (!enabled) return;
+    const now = Date.now();
+    if (!heartbeat && received === lastBytes) return;
+    if (!heartbeat && !force && received !== total && now - lastAt < DOWNLOAD_PROGRESS_INTERVAL_MS) return;
+    lastAt = now;
+    lastBytes = received;
+    bootstrapNote(`EdgePilot bootstrap: download_progress ${received}/${total}`);
+    onProgress?.(received, total);
+  };
+}
+
+function bootstrapNote(line) {
+  try { writeSync(2, `${line}\n`); } catch { /* A progress line must not fail the download. */ }
+}
+
+function linkAbortSignals(signals) {
+  const controller = new AbortController();
+  const abortFrom = (source) => { if (!controller.signal.aborted) controller.abort(source.reason); };
+  for (const source of signals) {
+    if (source.aborted) {
+      abortFrom(source);
+      break;
+    }
+    source.addEventListener("abort", () => abortFrom(source), { once: true });
+  }
+  return controller.signal;
+}
+
+function partialSize(destination, maximumBytes) {
+  if (!existsSync(destination)) return 0;
+  const metadata = lstatSync(destination);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size <= 0 || metadata.size > maximumBytes) {
+    rmSync(destination, { force: true });
+    return 0;
+  }
+  return metadata.size;
+}
+
+async function download(url, destination, maximumBytes, timeoutMs = METADATA_DOWNLOAD_TIMEOUT_MS, options = {}) {
   const parsed = validateFunctionalUrl(url);
+  const attempts = options.attempts ?? 1;
+  const resume = options.resume === true;
+  const report = downloadProgress(maximumBytes, options.onProgress ?? null, resume);
+  const signal = AbortSignal.timeout(timeoutMs);
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    if (signal.aborted) break;
+    try {
+      return await downloadOnce(parsed, destination, maximumBytes, signal, resume, report);
+    } catch (error) {
+      lastError = error;
+      if (!resume || !retryableDownload(error)) rmSync(destination, { force: true });
+      if (!resume || !retryableDownload(error) || signal.aborted || attempt === attempts) throw error;
+      bootstrapNote(`EdgePilot bootstrap: download_retry ${attempt + 1}/${attempts} ${error.code}`);
+    }
+  }
+  throw lastError ?? new BootstrapError("download_timeout", "Runtime download timed out");
+}
+
+async function downloadOnce(parsed, destination, maximumBytes, signal, resume, report) {
+  let existing = resume ? partialSize(destination, maximumBytes) : 0;
+  if (existing === maximumBytes) {
+    report(existing, true);
+    return existing;
+  }
+  const headers = existing > 0 ? { Range: `bytes=${existing}-` } : undefined;
+  let written = existing;
+  const stall = new AbortController();
+  let stallTimer = null;
+  let heartbeat = null;
+  const stopWatch = () => {
+    clearTimeout(stallTimer);
+    clearInterval(heartbeat);
+  };
+  const armStall = () => {
+    if (!resume) return;
+    clearTimeout(stallTimer);
+    stallTimer = setTimeout(() => stall.abort(new DOMException("stalled", "TimeoutError")), ARCHIVE_STALL_MS);
+  };
+  if (resume) {
+    armStall();
+    heartbeat = setInterval(() => report(written, false, true), DOWNLOAD_PROGRESS_INTERVAL_MS);
+  }
+  const requestSignal = resume ? linkAbortSignals([signal, stall.signal]) : signal;
+  try {
   let response;
   try {
-    response = await fetch(parsed, { redirect: "error", signal: AbortSignal.timeout(timeoutMs) });
+    response = await fetch(parsed, { redirect: "error", signal: requestSignal, ...(headers === undefined ? {} : { headers }) });
   } catch (error) {
-    fail(error?.name === "TimeoutError" ? "download_timeout" : "channel_unavailable", "Runtime source is unavailable");
+    fail(error?.name === "TimeoutError" || signal.aborted ? "download_timeout" : "channel_unavailable", "Runtime source is unavailable");
   }
-  if (!response.ok || !response.body) fail("download_failed", `Runtime download failed with HTTP ${response.status}`);
+  if (response.status === 416) {
+    rmSync(destination, { force: true });
+    fail("download_interrupted", "Runtime download resume was rejected");
+  }
+  const appending = response.status === 206 && existing > 0;
+  if (response.status !== 200 && !appending) fail("download_failed", `Runtime download failed with HTTP ${response.status}`);
+  if (!response.body) fail("download_failed", `Runtime download failed with HTTP ${response.status}`);
+  if (!appending && existing > 0) {
+    rmSync(destination, { force: true });
+    existing = 0;
+    written = 0;
+  }
+  if (appending) {
+    const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/.exec(response.headers.get("content-range") ?? "");
+    const total = match === null ? null : match[3] === "*" ? maximumBytes : Number(match[3]);
+    if (match === null || Number(match[1]) !== existing || total !== maximumBytes) {
+      rmSync(destination, { force: true });
+      fail("download_interrupted", "Runtime download resume was rejected");
+    }
+  }
   const declared = Number(response.headers.get("content-length"));
-  if (Number.isSafeInteger(declared) && declared > maximumBytes) fail("download_size_invalid", "Runtime download exceeds its signed size");
-  let written = 0;
-  const meter = new Transform({ transform(chunk, _encoding, callback) { written += chunk.length; callback(written > maximumBytes ? new BootstrapError("download_size_invalid", "Runtime download exceeds its signed size") : null, chunk); } });
+  if (Number.isSafeInteger(declared) && declared > maximumBytes - existing) fail("download_size_invalid", "Runtime download exceeds its signed size");
+  const descriptor = openSync(destination, appending ? "a" : "wx", 0o600);
+  let closed = false;
+  const closeDestination = (sync) => {
+    if (closed) return;
+    closed = true;
+    if (sync) {
+      try { fsyncSync(descriptor); } catch { /* Closing still releases the descriptor. */ }
+    }
+    closeSync(descriptor);
+  };
+  const meter = new Transform({
+    transform(chunk, _encoding, callback) {
+      written += chunk.length;
+      if (written > maximumBytes) {
+        callback(new BootstrapError("download_size_invalid", "Runtime download exceeds its signed size"));
+        return;
+      }
+      try {
+        writeSync(descriptor, chunk);
+      } catch (error) {
+        callback(error);
+        return;
+      }
+      armStall();
+      report(written);
+      callback();
+    },
+  });
+  const sink = new Writable({
+    write(_chunk, _encoding, callback) { callback(); },
+  });
   try {
-    await pipeline(Readable.fromWeb(response.body), meter, createWriteStream(destination, { flags: "wx", mode: 0o600 }));
+    await pipeline(Readable.fromWeb(response.body), meter, sink);
+    closeDestination(true);
+    report(written, true);
     return written;
   } catch (error) {
-    rmSync(destination, { force: true });
-    if (error instanceof BootstrapError) throw error;
-    if (error?.code === "ENOSPC") fail("disk_full", "Runtime download stopped because disk space is exhausted");
+    try { closeDestination(resume); } catch { /* Closing a failed download must not hide its cause. */ }
+    if (error instanceof BootstrapError) {
+      if (error.code !== "download_interrupted") rmSync(destination, { force: true });
+      throw error;
+    }
+    if (error?.code === "ENOSPC") {
+      rmSync(destination, { force: true });
+      fail("disk_full", "Runtime download stopped because disk space is exhausted");
+    }
+    if (!resume) rmSync(destination, { force: true });
     fail("download_interrupted", "Runtime download was interrupted");
+  }
+  } finally {
+    stopWatch();
   }
 }
 
@@ -1893,7 +2221,8 @@ export async function installFromFunctionalChannel({ home, stateRoot, channelUrl
   mkdirSync(downloads, { recursive: true, mode: 0o700 });
   const channelPath = join(downloads, `channel-${randomUUID()}.json`);
   const manifestPath = join(downloads, `manifest-${randomUUID()}.json`);
-  const archivePath = join(downloads, `runtime-${randomUUID()}.zip`);
+  let archivePath = null;
+  let keepPartial = false;
   try {
     await download(channelUrl, channelPath, MAX_CHANNEL_BYTES);
     const selected = validateFunctionalChannel(JSON.parse(readFileSync(channelPath, "utf8")), channelUrl, { enforcePlatform, expectedProduct });
@@ -1924,12 +2253,19 @@ export async function installFromFunctionalChannel({ home, stateRoot, channelUrl
     }
     if (manifestProduct(manifest) !== expectedProduct) fail("runtime_product_incompatible", "Runtime manifest contains another product profile");
     if (manifest.runtime_id !== selected.target.runtime_id || manifest.payload.archive_size !== selected.target.archive_size || manifest.payload.archive_sha256 !== selected.target.archive_sha256) fail("channel_runtime_mismatch", "Runtime manifest differs from channel");
-    await download(selected.target.archive_url, archivePath, selected.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS);
+    validateWindowsReleasePathBudget(installedReleaseRoot(stateRoot, manifest.runtime_id), manifest);
+    archivePath = resumableArchivePath(downloads, selected.target.archive_url);
+    await download(selected.target.archive_url, archivePath, selected.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS, { resume: true, attempts: ARCHIVE_DOWNLOAD_ATTEMPTS });
     const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: null, beforeActivate, enforcePlatform, probe, repair });
     atomicJson(join(stateRoot, "channel.json"), { schema: "edgepilot-installed-channel-v1", channel: selected.channel.channel, runtime_id: installed.manifest.runtime_id });
     return installed;
+  } catch (error) {
+    keepPartial = retryableDownload(error);
+    throw error;
   } finally {
-    for (const path of [channelPath, manifestPath, archivePath]) rmSync(path, { force: true });
+    rmSync(channelPath, { force: true });
+    rmSync(manifestPath, { force: true });
+    if (archivePath !== null && !keepPartial) rmSync(archivePath, { force: true });
   }
 }
 
@@ -1938,7 +2274,8 @@ export async function installFromChannel({ home, stateRoot, config, runtimePin =
   mkdirSync(downloads, { recursive: true, mode: 0o700 });
   const channelPath = join(downloads, `channel-${randomUUID()}.json`);
   const manifestPath = join(downloads, `manifest-${randomUUID()}.json`);
-  const archivePath = join(downloads, `runtime-${randomUUID()}.zip`);
+  let archivePath = null;
+  let keepPartial = false;
   try {
     await download(config.channel_url, channelPath, MAX_CHANNEL_BYTES);
     const channel = validateChannel(JSON.parse(readFileSync(channelPath, "utf8")), config.keys, config.channel_url, {
@@ -1953,7 +2290,9 @@ export async function installFromChannel({ home, stateRoot, config, runtimePin =
     const selectedKey = config.keys.get(channel.target.signing_key_id);
     if (selectedKey === undefined) fail("channel_runtime_signer_mismatch", "Runtime signer differs from the signed channel selection");
     verifyEnvelopeSignatures(manifest.signatures, new Map([[channel.target.signing_key_id, selectedKey]]), Buffer.concat([MANIFEST_DOMAIN, canonicalBytes(manifest.payload)]), "Runtime manifest");
-    await download(channel.target.archive_url, archivePath, channel.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS);
+    validateWindowsReleasePathBudget(installedReleaseRoot(stateRoot, manifest.runtime_id), manifest);
+    archivePath = resumableArchivePath(downloads, channel.target.archive_url);
+    await download(channel.target.archive_url, archivePath, channel.target.archive_size, RUNTIME_DOWNLOAD_TIMEOUT_MS, { resume: true, attempts: ARCHIVE_DOWNLOAD_ATTEMPTS });
     const installed = await installRuntime({ archivePath, manifestPath, stateRoot, trustedKeys: config.keys, enforcePlatform, probe });
     atomicJson(join(stateRoot, "channel.json"), {
       schema: "edgepilot-installed-channel-v1",
@@ -1962,8 +2301,13 @@ export async function installFromChannel({ home, stateRoot, config, runtimePin =
       runtime_id: installed.manifest.runtime_id,
     });
     return installed;
+  } catch (error) {
+    keepPartial = retryableDownload(error);
+    throw error;
   } finally {
-    for (const path of [channelPath, manifestPath, archivePath]) rmSync(path, { force: true });
+    rmSync(channelPath, { force: true });
+    rmSync(manifestPath, { force: true });
+    if (archivePath !== null && !keepPartial) rmSync(archivePath, { force: true });
   }
 }
 
@@ -1972,8 +2316,8 @@ async function activeRuntime(stateRoot, trustedKeys) {
   return runtimeById(stateRoot, pointer.current_runtime_id, trustedKeys);
 }
 
-async function runtimeById(stateRoot, runtimeId, trustedKeys) {
-  const root = join(stateRoot, "releases", runtimeDirectory(runtimeId));
+async function runtimeById(stateRoot, runtimeId, trustedKeys, { allowLegacy = true } = {}) {
+  const root = allowLegacy ? installedReleaseRoot(stateRoot, runtimeId) : releaseRoot(stateRoot, runtimeId);
   const manifest = validateManifest(JSON.parse(readFileSync(join(root, "RUNTIME.json"), "utf8")), trustedKeys);
   if (manifest.runtime_id !== runtimeId) fail("runtime_identity_invalid", "Runtime directory and manifest differ");
   await verifyTree(root, manifest);
@@ -2186,6 +2530,9 @@ export async function startHost({ home = null, stateRoot, pluginStateRoot, liveS
     if (services.mode !== null) refresh(services.mode);
     return { alreadyRunning: true, runtimeId: manifest.runtime_id };
   }
+  // A launcher can still own the service task after its Python Host has exited.
+  // End that task before starting, or the new start is ignored while the old one sleeps.
+  services.stop("host");
   rotateHostLog(join(stateRoot, "logs", "host.log"));
   services.ensureRunning("host");
   refresh(services.mode);
@@ -2300,7 +2647,7 @@ export async function uninstallRuntime({ stateRoot, pluginStateRoot, liveStateRo
   const trading = product === "live" ? await tradingdCommand(home, ["--status"]) : null;
   if (trading?.work_open) fail("trading_work_open", "Stop the running strategies before uninstalling");
   const releases = join(stateRoot, "releases");
-  const executables = existsSync(releases) ? readdirSync(releases).filter((name) => /^[0-9a-f]{64}$/u.test(name)).flatMap((name) => {
+  const executables = existsSync(releases) ? readdirSync(releases).filter((name) => RELEASE_DIRECTORY.test(name) || LEGACY_RELEASE_DIRECTORY.test(name)).flatMap((name) => {
     try {
       const manifest = validateManifest(JSON.parse(readFileSync(join(releases, name, "RUNTIME.json"), "utf8")), null, { enforcePlatform: false });
       return [safeDestination(join(releases, name), manifest.payload.python.executable)];
@@ -2546,6 +2893,7 @@ async function cliUnlocked(arguments_) {
 
     if ((expectedProductVersion !== null && !isSemver(expectedProductVersion)) || expectedRuntimeIds.some((id) => !isDigest(id))) fail("usage", "plugin Runtime binding is invalid");
     if (channelUrl === null) fail("usage", `${command} requires --channel-url`);
+    ensureWindowsLongPaths();
     let active = null;
     try { active = await activeRuntime(stateRoot, null); } catch { /* missing or damaged install needs preparation */ }
     if (active !== null && manifestProduct(active.manifest) !== product) fail("runtime_product_incompatible", "installed Runtime belongs to another product");
@@ -2585,14 +2933,31 @@ async function cliUnlocked(arguments_) {
 
 function fail(code, message) { throw new BootstrapError(code, message); }
 
+export function formatBootstrapError(error) {
+  const code = /^[a-z][a-z0-9_]{0,100}$/.test(error?.code) ? error.code : "bootstrap_internal_failure";
+  const lines = [`EdgePilot bootstrap: ${code}`];
+  if (code === "windows_long_paths_denied") {
+    lines.push("EdgePilot bootstrap: approve the administrator prompt to set LongPathsEnabled=1");
+  }
+  if (code === "runtime_path_too_long" && error instanceof BootstrapError && error.details !== null) {
+    const { length, limit, required_reduction, runtime_id, directory, path } = error.details;
+    lines.push(`EdgePilot bootstrap path budget: ${JSON.stringify({ length, limit, required_reduction })}`,
+      `EdgePilot bootstrap Runtime ID: ${runtime_id}`,
+      `EdgePilot bootstrap directory: ${directory}`,
+      `EdgePilot bootstrap file: ${path}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 const invokedPath = process.argv[1] ? realpathSync(resolve(process.argv[1])) : null;
 if (invokedPath === realpathSync(fileURLToPath(import.meta.url))) {
   const startedAt = Date.now();
   cli(process.argv.slice(2)).then(
     (result) => process.stdout.write(`${canonical({ ...result, duration_ms: Date.now() - startedAt })}\n`),
     (error) => {
-      const code = /^[a-z][a-z0-9_]{0,100}$/.test(error?.code) ? error.code : "bootstrap_internal_failure";
-      process.stderr.write(`EdgePilot bootstrap: ${code}\n`);
+      for (const line of formatBootstrapError(error).split("\n")) {
+        if (line !== "") bootstrapNote(line);
+      }
       process.exitCode = 1;
     },
   );

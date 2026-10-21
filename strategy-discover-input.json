@@ -149,6 +149,9 @@
       },
       "type": "object"
     },
+    "include_access": {
+      "type": "boolean"
+    },
     "limit": {
       "default": 10,
       "maximum": 25,

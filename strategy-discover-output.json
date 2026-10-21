@@ -418,6 +418,33 @@
       "items": {
         "additionalProperties": false,
         "properties": {
+          "access": {
+            "additionalProperties": false,
+            "properties": {
+              "entitled": {
+                "anyOf": [
+                  {
+                    "type": "boolean"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "mode": {
+                "enum": [
+                  "open",
+                  "redeem_code"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "entitled"
+            ],
+            "type": "object"
+          },
           "compatibility": {
             "additionalProperties": false,
             "properties": {
