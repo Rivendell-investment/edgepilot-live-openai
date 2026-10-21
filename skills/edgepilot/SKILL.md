@@ -72,10 +72,14 @@ user follow or decide, not for every call:
 - `task` with `{}` when the user asks where things stand; it shows this conversation's stages
   from needs to a running strategy and the references to continue with.
 - `leaderboard` with `{sort, query?, locale}` for "top strategies by return / Sharpe /
-  drawdown"; add `access: "redeem_code"` when the user asks which strategies need a redeem
-  code (and `access: "open"` for the ones that do not; see Agent redeem codes below);
-  `installed` with `{locale}` for "what do I have"; `glossary` with `{metrics, locale}` when
-  the user asks what a metric means.
+  drawdown" (sort `return`, `drawdown`, `sharpe` or `published`); add `access: "redeem_code"`
+  when the user asks which strategies need a redeem code (and `access: "open"` for the ones that
+  do not; see Agent redeem codes below); `installed` with `{locale}` for "what do I have";
+  `glossary` with `{metrics, locale}` when the user asks what a metric means. metrics uses
+  exactly these names (`max_drawdown_pct`, not `max_drawdown`): `return_pct`, `annualized_return_pct`, `max_drawdown_pct`, `sharpe`, `sortino`, `profit_factor`, `win_rate`, `realized_pnl`, `trades_per_30d`, `median_holding_minutes`, `max_consecutive_losses`, `worst_trade_pct`, `capacity_usd`, `match_score`, `order_fraction`, `max_total_exposure_fraction`, `max_equivalent_leverage`, `leverage`, `starting_balance`, `fee_bps`. locale is `en`, `zh-CN`,
+  `zh-TW` or `ko`.
+- When a card call answers an error naming a field and its valid values, correct that field and
+  call once more instead of answering without the card.
 
 A card's own actions (save, start a backtest, stop, page) are the user's; when the card later
 tells you what happened (it arrives with the user's next message), continue from that and do
