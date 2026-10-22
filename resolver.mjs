@@ -18,20 +18,43 @@ const searchResultsResourceUri = (runtimeId) => `ui://edgepilot/strategy-search-
 // A release directory is named by the first 16 hex digits of the Runtime ID (Bootstrap
 // runtimeDirectory); its manifest's runtime_id stays the identity.
 const releaseDirectory = (runtimeId) => runtimeId.slice("sha256:".length, "sha256:".length + 16);
+// App-only tools: in-chat cards read and change their Host-owned state (ADR 0020); never listed to
+// the model. A card call never installs, updates or starts the Runtime: a card that mounts in an
+// old thread must not start EdgePilot, so these answer runtime_not_ready instead.
+const CARD_TOOL_NAMES = new Set([
+  "edgepilot_result_state",
+  "edgepilot_view_open",
+  "edgepilot_view_get",
+  "edgepilot_view_act",
+]);
 const HOST_TOOL_NAMES = new Set([
   "edgepilot_connection_list",
   "edgepilot_tool_search",
   "edgepilot_tool_get",
   "edgepilot_tool_execute",
   "edgepilot_result_present",
-  // App-only: the confirmation card submits through the host, never listed to the model.
-  "edgepilot_result_state",
+  "edgepilot_view_present",
+  ...CARD_TOOL_NAMES,
 ]);
+// Pages an old thread may ask for: any earlier Runtime's digest serves the installed page.
+const APP_RESOURCE_URI = /^ui:\/\/edgepilot\/([a-z0-9-]+)\/([0-9a-f]{64})\.html$/;
+const APP_RESOURCES = Object.freeze({
+  "strategy-onboarding-v1": { file: "onboarding.html", dashboardLinks: true },
+  "strategy-search-results-v1": { file: "search-results.html", dashboardLinks: true },
+  "runtime-confirmation-v1": { file: "confirmation.html", dashboardLinks: false },
+  "runtime-view-v1": { file: "view.html", dashboardLinks: true },
+});
 const profile = process.argv[2];
 if (!new Set(["research", "live"]).has(profile)) fatal("invalid_profile");
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DISCOVER_INPUT_SCHEMA = readDiscoverSchema();
+// What the model may pass: the discover request without include_access, which Live always adds itself
+// so result cards can mark redeem-code strategies (Research has no redeem codes).
+const SEARCH_INPUT_SCHEMA = (() => {
+  const { include_access: _includeAccess, ...properties } = DISCOVER_INPUT_SCHEMA.properties ?? {};
+  return Object.freeze({ ...DISCOVER_INPUT_SCHEMA, properties });
+})();
 const DISCOVER_OUTPUT_SCHEMA = readDiscoverOutputSchema();
 const pluginVersion = readPluginVersion();
 const productVersion = pluginVersion.split("+", 1)[0];
@@ -77,7 +100,7 @@ async function handleRequest(request) {
     if (typeof name !== "string" || argumentsValue === null || typeof argumentsValue !== "object" || Array.isArray(argumentsValue)) {
       return errorResponse(id, -32602, "invalid_tool_call");
     }
-    if (!(name in LIFECYCLE_HANDLERS) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open", "edgepilot_redeem_code_open"].includes(name))) {
+    if (!(name in LIFECYCLE_HANDLERS) && !CARD_TOOL_NAMES.has(name) && (HOST_TOOL_NAMES.has(name) || ["edgepilot_strategy_search", "edgepilot_strategy_recommend", "edgepilot_onboarding_open", "edgepilot_dashboard_open", "edgepilot_redeem_code_open"].includes(name))) {
       const ready = await ensureForUse();
       if (ready !== null) return resultResponse(id, toolResult(ready, true));
     }
@@ -94,10 +117,22 @@ async function handleRequest(request) {
     if (name === "edgepilot_onboarding_open") {
       const locale = argumentsValue.locale;
       if (!new Set(["en", "ko", "zh-CN", "zh-TW"]).has(locale)) throw new BridgeError("invalid_locale");
-      if (await healthyConnection() === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
+      const connection = await healthyConnection();
+      if (connection === null) return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "runtime_not_ready" }, true));
+      // The Host issues the view and keeps its answers and recommendation; the thread id in _meta
+      // (Codex) binds the view to this conversation.
+      const opened = await forward(connection, { jsonrpc: "2.0", id: "bridge-view-open", method: "tools/call", params: {
+        name: "edgepilot_view_open", arguments: { kind: "onboarding", params: { locale } },
+        ...(isPlainObject(request.params?._meta) ? { _meta: request.params._meta } : {}),
+      } });
+      const viewId = opened?.result?.structuredContent?.view_id;
+      if (opened?.result?.isError === true || typeof viewId !== "string" || !/^view_[0-9a-f]{32}$/.test(viewId)) {
+        return resultResponse(id, toolResult({ ...(await runtimeStatus()), message: "onboarding_unavailable" }, true));
+      }
       return resultResponse(id, {
-        ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0" }),
+        ...toolResult({ schema: "edgepilot-strategy-onboarding-v1", profile, locale, questionnaire_version: "2.0", view_id: viewId }),
         content: [{ type: "text", text: "Onboarding App requested. Let the user continue in the interactive card and end this turn without repeating questionnaire choices or opening another question tool. Rendering visibility is unknown to this tool; do not claim that the App failed to appear. Use text onboarding only if the host explicitly reports App rendering unsupported/failed, or the user reports the card unusable or explicitly requests text onboarding." }],
+        _meta: { "edgepilot/view": { view_id: viewId } },
       });
     }
     if (name === "edgepilot_dashboard_open") {
@@ -119,12 +154,19 @@ async function handleRequest(request) {
     return forward(connection, request);
   }
   if (request.method === "resources/read") {
-    const local = readSearchResultsResource(request.params?.uri);
+    // The running Host knows the Dashboard's actual port; the installed release still serves the
+    // page when the Runtime is stopped, so a card can say so instead of staying blank.
+    let hosted = null;
+    if ((await runtimeStatus()).state === "ready") {
+      const connection = await healthyConnection();
+      if (connection !== null) {
+        try { hosted = await forward(connection, request); } catch { hosted = null; }
+        if (hosted?.result) return hosted;
+      }
+    }
+    const local = readLocalAppResource(request.params?.uri);
     if (local !== null) return resultResponse(id, { contents: [local] });
-    if ((await runtimeStatus()).state !== "ready") return errorResponse(id, -32001, "runtime_not_ready");
-    const connection = await healthyConnection();
-    if (connection === null) return errorResponse(id, -32001, "runtime_not_ready");
-    return forward(connection, request);
+    return hosted ?? errorResponse(id, -32001, "runtime_not_ready");
   }
   return errorResponse(id, -32601, "method_not_found");
 }
@@ -162,7 +204,6 @@ function coldOnboardingRuntimeId() {
   if (installedId !== null) {
     const runtime = readInstalledRuntime(installedId);
     if (runtime === null || !supportsRuntimeContract(runtime.contractVersion)
-        || compareProductVersions(runtime.releaseVersion, productVersion) > 0
         || (admittedRuntimeId !== null && admittedRuntimeId !== installedId)) return null;
     // An older installation still needs the target URI in the client's first tool list.
     // This advertises presentation only; resource reads retain healthyConnection admission.
@@ -228,7 +269,7 @@ function lifecycleTools(runtimeId = null) {
     name: "edgepilot_onboarding_open", title: "Open Strategy Onboarding",
     description: `Open the interactive seven-question strategy onboarding and show its owner-computed recommendation in the same App.${profile === "live" ? " A Live plugin mention with no other message content requests this onboarding after Dashboard opens." : ""}`,
     inputSchema: { type: "object", properties: { locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] } }, required: ["locale"], additionalProperties: false },
-    outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" } }, required: ["schema", "profile", "locale", "questionnaire_version"], additionalProperties: false },
+    outputSchema: { type: "object", properties: { schema: { const: "edgepilot-strategy-onboarding-v1" }, profile: { enum: ["live", "research"] }, locale: { enum: ["en", "ko", "zh-CN", "zh-TW"] }, questionnaire_version: { const: "2.0" }, view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" } }, required: ["schema", "profile", "locale", "questionnaire_version", "view_id"], additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     ...(runtimeId === null ? {} : {
       _meta: {
@@ -253,6 +294,8 @@ function lifecycleTools(runtimeId = null) {
 }
 
 const REDEEM_TARGET_CODE = /^[0-9A-Za-z-]{16,32}$/;
+// Live Dashboard pages a card may open; the Host contract's own list.
+const DASHBOARD_PAGES = ["strategies", "live", "tasks"];
 
 function completedOutput(result, operationId) {
   const outcomes = result?.structuredContent?.outcomes;
@@ -357,12 +400,14 @@ function liveDashboardTargetSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    description: "Either {kind: \"strategy\", slug, version, content_sha256} or {kind: \"custom_strategy\", custom_id, revision (optional)}.",
+    description: "One of {kind: \"strategy\", slug, version, content_sha256}, {kind: \"custom_strategy\", custom_id, revision (optional)}, {kind: \"page\", page: \"strategies\" | \"live\" | \"tasks\"} or {kind: \"task\", view_id} (a conversation's task).",
     properties: {
       ...strategy.properties,
-      kind: { enum: ["strategy", "custom_strategy"] },
+      kind: { enum: ["strategy", "custom_strategy", "page", "task"] },
       custom_id: { type: "string", pattern: "^[a-z0-9]{6}$" },
       revision: { type: "integer", minimum: 1, maximum: 999999 },
+      page: { enum: DASHBOARD_PAGES },
+      view_id: { type: "string", pattern: "^view_[0-9a-f]{32}$" },
     },
     required: ["kind"],
   };
@@ -383,6 +428,16 @@ function dashboardArguments(value) {
   if (Object.keys(value).sort().join(",") !== "target" || value.target === null
       || typeof value.target !== "object" || Array.isArray(value.target)) throw new BridgeError("invalid_tool_call");
   const target = value.target;
+  // A Live page or a conversation's task: what in-chat cards hand over to (ADR 0022, ADR 0023).
+  if (target.kind === "page" && profile === "live") {
+    if (Object.keys(target).sort().join(",") !== "kind,page" || !DASHBOARD_PAGES.includes(target.page)) throw new BridgeError("invalid_tool_call");
+    return { target: { kind: "page", page: target.page } };
+  }
+  if (target.kind === "task" && profile === "live") {
+    if (Object.keys(target).sort().join(",") !== "kind,view_id" || typeof target.view_id !== "string"
+        || !/^view_[0-9a-f]{32}$/.test(target.view_id)) throw new BridgeError("invalid_tool_call");
+    return { target: { kind: "task", view_id: target.view_id } };
+  }
   if (target.kind === "custom_strategy" && profile === "live") {
     const keys = Object.keys(target).sort().join(",");
     if ((keys !== "custom_id,kind" && keys !== "custom_id,kind,revision")
@@ -431,7 +486,7 @@ function recommendationArguments(value) {
 }
 
 function searchSchema() {
-  return DISCOVER_INPUT_SCHEMA;
+  return SEARCH_INPUT_SCHEMA;
 }
 
 function searchOutputSchema() {
@@ -451,7 +506,10 @@ function searchOutputSchema() {
 function searchArguments(value) {
   const allowed = new Set(Object.keys(searchSchema().properties));
   if (Object.keys(value).some(key => !allowed.has(key))) throw new BridgeError("invalid_tool_call");
-  return { ...value, diversity: value.diversity ?? "none", limit: value.limit ?? 10 };
+  return {
+    ...value, diversity: value.diversity ?? "none", limit: value.limit ?? 10,
+    ...(profile === "live" ? { include_access: true } : {}),
+  };
 }
 
 function readDiscoverSchema() {
@@ -505,25 +563,43 @@ function searchFallback(payload) {
       : payload.request.locale === "ko" ? `${count}개의 검색 결과가 준비되었습니다`
         : `${count} search results are ready`;
   const identities = strategies
-    .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})`)
+    .map(strategy => `${strategy.name} (${strategy.slug}@${strategy.version})${redeemNote(strategy)}`)
     .join(", ");
   const notes = [...(payload.result.needs_clarification ?? []), ...(payload.result.unsupported_constraints ?? []), ...(payload.result.relaxed_filters ?? [])];
   return `${prefix}${identities ? `: ${identities}` : ""}${notes.length ? `. Notes: ${notes.join("; ")}` : ""}. Use the interactive strategy result cards to open a strategy in Dashboard.`;
 }
 
+// The text the model reads names redeem-code strategies like the cards do; redeeming stays in Dashboard.
+function redeemNote(strategy) {
+  if (strategy.access?.mode !== "redeem_code") return "";
+  return strategy.access.entitled === true ? " [redeem code, unlocked]"
+    : strategy.access.entitled === false ? " [needs a redeem code]" : " [redeem-code strategy]";
+}
+
 // 只读搜索卡必须绑定请求中的精确 Runtime release，但不应被 Host 会话准入状态阻断。
-function readSearchResultsResource(uri) {
+function readLocalAppResource(uri) {
   if (typeof uri !== "string") return null;
-  const match = /^ui:\/\/edgepilot\/strategy-search-results-v1\/([0-9a-f]{64})\.html$/.exec(uri);
-  if (match === null) return null;
-  const runtimeId = `sha256:${match[1]}`;
+  const match = APP_RESOURCE_URI.exec(uri);
+  if (match === null || !Object.hasOwn(APP_RESOURCES, match[1])) return null;
+  // The installed Runtime's page first, whatever Runtime the thread recorded; then the recorded
+  // Runtime's own page while that release is still on disk. Either must pass the same checks.
+  for (const runtimeId of new Set([readInstalledRuntimeId(), `sha256:${match[2]}`])) {
+    const content = readReleaseAppResource(runtimeId, APP_RESOURCES[match[1]], uri);
+    if (content !== null) return content;
+  }
+  return null;
+}
+
+function readReleaseAppResource(runtimeId, resource, uri) {
+  if (typeof runtimeId !== "string" || !/^sha256:[0-9a-f]{64}$/.test(runtimeId)) return null;
+  const digest = runtimeId.slice("sha256:".length);
   const runtimeRoot = join(runtimeHome, "runtime");
   const releasesRoot = join(runtimeRoot, "releases");
   const currentRelease = join(releasesRoot, releaseDirectory(runtimeId));
-  const release = existsSync(currentRelease) ? currentRelease : join(releasesRoot, match[1]);
+  const release = existsSync(currentRelease) ? currentRelease : join(releasesRoot, digest);
   const appsRoot = join(release, "apps");
   const appRoot = join(release, "apps", "mcp-app");
-  const path = join(appRoot, "search-results.html");
+  const path = join(appRoot, resource.file);
   try {
     const runtimeMetadata = lstatSync(runtimeRoot);
     const releasesMetadata = lstatSync(releasesRoot);
@@ -554,7 +630,7 @@ function readSearchResultsResource(uri) {
         || !supportsRuntimeContract(runtime.contractVersion) || !matchesRelease(runtimeId, runtime)) return null;
     const entries = manifest.payload.files;
     const expected = Array.isArray(entries)
-      ? entries.filter(entry => entry?.path === "apps/mcp-app/search-results.html")
+      ? entries.filter(entry => entry?.path === `apps/mcp-app/${resource.file}`)
       : [];
     if (expected.length !== 1 || expected[0].kind !== "file" || expected[0].executable !== false
         || expected[0].size !== metadata.size || !/^sha256:[0-9a-f]{64}$/.test(expected[0].sha256)) return null;
@@ -564,6 +640,7 @@ function readSearchResultsResource(uri) {
     const port = process.env[profile === "live" ? "EDGEPILOT_LIVE_DASHBOARD_PORT" : "EDGEPILOT_RESEARCH_DASHBOARD_PORT"]
       ?? (profile === "live" ? "8787" : "8686");
     if (!/^[1-9][0-9]{0,4}$/.test(port) || Number(port) > 65535) return null;
+    // Without a running Host the actual port is unknown; the default is a known limitation (ADR 0020).
     const origin = `http://127.0.0.1:${port}`;
     return {
       uri,
@@ -578,7 +655,7 @@ function readSearchResultsResource(uri) {
         "openai/widgetCSP": {
           connect_domains: [],
           resource_domains: [],
-          redirect_domains: [origin],
+          ...(resource.dashboardLinks ? { redirect_domains: [origin] } : {}),
         },
       },
     };
@@ -817,7 +894,6 @@ async function runtimeStatus() {
   const bootstrap = configuredBootstrapPath();
   const runtime = readInstalledRuntime(runtimeId);
   const incompatible = runtime !== null && !supportsRuntimeContract(runtime.contractVersion);
-  const newerThanPlugin = runtime !== null && compareProductVersions(runtime.releaseVersion, productVersion) > 0;
   const executing = lifecycleExecution();
   const connection = incompatible || executing !== null ? null : await healthyConnection(runtimeId, runtime);
   const base = {
@@ -834,7 +910,7 @@ async function runtimeStatus() {
   };
   if (bindingFailure !== null) return { ...base, state: "stale_session", connection_ready: false,
     repair_allowed: false, required_action: "update_plugin_and_reload", message: bindingFailure };
-  if (incompatible || newerThanPlugin || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
+  if (incompatible || (admittedRuntimeId !== null && runtimeId !== admittedRuntimeId)) return staleSession(base);
   if (executing !== null) return { ...base, state: executing === "running" ? "stopped" : "error", connection_ready: false,
     repair_allowed: false, required_action: executing === "running" ? "wait_for_runtime_status" : "inspect_runtime_status",
     message: executing === "running" ? "runtime_operation_pending" : "runtime_operation_identity_unverified" };
@@ -851,7 +927,7 @@ async function runtimeStatus() {
   return {
     ...base,
     state: connection === null ? (runtimeId === null ? "not_installed" : "stopped") : "ready",
-    repair_allowed: !newerThanPlugin,
+    repair_allowed: true,
     required_action: null,
     message: runtimeId !== null && runtime === null ? "runtime_manifest_invalid" : null,
   };
@@ -890,15 +966,6 @@ function supportsRuntimeContract(value) {
 
 function runtimeContractLabel(value) {
   return value === null ? null : `${value.major}.${value.minor}`;
-}
-
-function compareProductVersions(left, right) {
-  const parse = (value) => /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)/.exec(value)?.slice(1).map(Number) ?? null;
-  const a = parse(left);
-  const b = parse(right);
-  if (a === null || b === null) return 0;
-  for (let index = 0; index < 3; index += 1) if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
-  return 0;
 }
 
 async function forwardHost(request) {
@@ -1069,6 +1136,7 @@ function recentOperationEvidence(limit = 4) {
   return lines.slice(-limit);
 }
 
+function isPlainObject(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
 function resultResponse(id, result) { return { jsonrpc: "2.0", id, result }; }
 function errorResponse(id, code, message) { return { jsonrpc: "2.0", id, error: { code, message } }; }
 function writeResponse(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }

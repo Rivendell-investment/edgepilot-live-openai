@@ -635,7 +635,7 @@ export const RUNTIME_PROBE_TIMEOUT_MS = 300_000;
 // writes its connection; 60s was below measured verify_tree cost (~66s).
 export const HOST_START_TIMEOUT_MS = 90_000;
 const DEFAULT_HOST_PORT = 0;
-const BOOTSTRAP_PRODUCT_VERSION = "1.3.18";
+const BOOTSTRAP_PRODUCT_VERSION = "1.3.20";
 const BOOTSTRAP_COMPATIBILITY_VERSION = "1.0.0";
 const SUPPORTED_CONTRACT_VERSION = "1.0.0";
 const PRODUCTION_MARKETPLACE_ORIGIN = "https://api.edgepilotai.io";
@@ -1635,9 +1635,6 @@ export async function installRuntime({ archivePath, manifestPath, stateRoot, tru
         fail("runtime_identity_invalid", "installed Runtime manifest is invalid");
       }
       if (current.runtime_id !== previous.current_runtime_id) fail("runtime_identity_invalid", "installed Runtime identity differs from its pointer");
-      if (compareSemver(manifest.payload.release_version, current.payload.release_version) < 0) {
-        fail("runtime_downgrade_forbidden", "Runtime installation cannot implicitly downgrade the active release");
-      }
     }
     let reused = existsSync(final) && !repair;
     let activated = false;
@@ -2899,16 +2896,15 @@ async function cliUnlocked(arguments_) {
     if (active !== null && manifestProduct(active.manifest) !== product) fail("runtime_product_incompatible", "installed Runtime belongs to another product");
     const pending = readLifecycleState(stateRoot);
     if (pending && expectedProductVersion !== null && compareSemver(pending.target_version, expectedProductVersion) > 0) {
-      // Preparation failure never removed the old service's right to run; reuse it
-      // without allowing its launcher to overwrite the newer transaction.
+      // This plugin still matches the active Runtime, so start it while another release is
+      // only prepared. A different bound release replaces that transaction, including when
+      // its version number is lower.
       const preparationOnly = !pending.cutover_started && ["prepare", "inspect"].includes(pending.interrupted_phase ?? pending.phase);
       if (command === "ensure-start" && preparationOnly && active !== null && expectedRuntimeIds.includes(active.manifest.runtime_id)) {
         const host = await startHost({ stateRoot, pluginStateRoot, liveStateRoot, researchStateRoot, trustedKeys: null, trustedKeyArguments: [], marketplaceOrigin, environmentName, selectedRuntime: active });
         return { schema: "edgepilot-bootstrap-result-v1", runtime_id: active.manifest.runtime_id, reused: true, offline: true, host, lifecycle: pending };
       }
-      fail("plugin_session_stale", "An older plugin cannot replace a newer lifecycle transaction");
     }
-    if (active !== null && expectedProductVersion !== null && compareSemver(active.manifest.payload.release_version, expectedProductVersion) > 0) fail("plugin_session_stale", "older plugin cannot alter the active Runtime");
     const ordinaryStart = command !== "repair" && !pending?.cutover_started;
     const currentHost = active === null ? null : await switchHostIdentity(pluginStateRoot, product);
     if (active !== null && choice?.action !== "defer" && active.manifest.payload.release_version === expectedProductVersion

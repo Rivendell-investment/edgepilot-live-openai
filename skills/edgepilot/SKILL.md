@@ -8,13 +8,14 @@ description: Route strategy discovery, configuration, custom strategies (changin
 The Node Ready Bridge always exposes `edgepilot_runtime_status`,
 `edgepilot_runtime_start`, `edgepilot_runtime_update` and `edgepilot_runtime_repair`, even
 before Runtime exists. The bridge automatically prepares the release-bound Runtime before first business use; never treat an older compatible Runtime as ready. Call status when Host tools are unavailable, then start once. When
-Runtime is ready, use the five Host meta tools:
+Runtime is ready, use the six Host meta tools:
 
 1. `edgepilot_connection_list`
 2. `edgepilot_tool_search`
 3. `edgepilot_tool_get`
 4. `edgepilot_tool_execute`
 5. `edgepilot_result_present`
+6. `edgepilot_view_present` (in-chat cards, below)
 
 Search for an operation, fetch its exact current descriptor, then execute with the returned
 `schema_revision`. Do not invent dynamic MCP tools or cache operation schemas in the
@@ -49,6 +50,41 @@ options or multiple candidates. For “open”, “start” or “launch EdgePil
 call `edgepilot_dashboard_open`; present its URL as a link (Dashboard links below) and never
 spawn a legacy Dashboard directly.
 
+## In-chat cards
+
+`edgepilot_view_present` shows one EdgePilot card in the conversation. The Runtime keeps the
+card's state, so it survives reloads and updates itself; its text result is what you tell the
+user, briefly, without repeating every number the card shows. Show a card when it helps the
+user follow or decide, not for every call:
+
+- `backtest` with `{job_ref}` right after `backtest.run.start` (it follows the job to the
+  result), or `{run_ref}` when the user asks about a saved run.
+- `configuration` with `{strategy_slug, strategy_version}` (and `configuration` when not
+  `default`) when the user wants to review or change panel settings; the user can edit and
+  start a backtest there. Order fraction and max total exposure are locked to the strategy
+  version.
+- `monitor` with `{venue, mode, instance_id}` after a start resolves, or when the user asks how
+  a running strategy is doing. The user can stop it in the card; the stop is the same attended
+  confirmation, so never also call `trading.instance.stop` for that request.
+- `incident` with `{reference}` (a `job_`, `req_`, `diag_` reference, a run ID or an
+  instance) for a failure, or `{}` to list recent ones. It is read-only like the diagnosis
+  below.
+- `task` with `{}` when the user asks where things stand; it shows this conversation's stages
+  from needs to a running strategy and the references to continue with.
+- `leaderboard` with `{sort, query?, locale}` for "top strategies by return / Sharpe /
+  drawdown" (sort `return`, `drawdown`, `sharpe` or `published`); add `access: "redeem_code"`
+  when the user asks which strategies need a redeem code (and `access: "open"` for the ones that
+  do not; see Agent redeem codes below); `installed` with `{locale}` for "what do I have";
+  `glossary` with `{metrics, locale}` when the user asks what a metric means. metrics uses
+  exactly these names (`max_drawdown_pct`, not `max_drawdown`): `return_pct`, `annualized_return_pct`, `max_drawdown_pct`, `sharpe`, `sortino`, `profit_factor`, `win_rate`, `realized_pnl`, `trades_per_30d`, `median_holding_minutes`, `max_consecutive_losses`, `worst_trade_pct`, `capacity_usd`, `match_score`, `order_fraction`, `max_total_exposure_fraction`, `max_equivalent_leverage`, `leverage`, `starting_balance`, `fee_bps`. locale is `en`, `zh-CN`,
+  `zh-TW` or `ko`.
+- When a card call answers an error naming a field and its valid values, correct that field and
+  call once more instead of answering without the card.
+
+A card's own actions (save, start a backtest, stop, page) are the user's; when the card later
+tells you what happened (it arrives with the user's next message), continue from that and do
+not repeat the action.
+
 ## Dashboard links
 
 Show a Dashboard URL as one Markdown link with a short label in the user's language, never as
@@ -70,10 +106,10 @@ and version `0.0.<N>`; backtest and deploy them like any other installed strateg
 
 Where a change goes:
 
-- Panel settings (target exchange, starting balance, fees, leverage, order fraction, max
-  equivalent leverage) of any strategy: `workspace.configuration.get`, then
-  `workspace.configuration.save` on that strategy's directory name. No custom strategy, no
-  question.
+- Panel settings (target exchange, starting balance, fees, leverage, max equivalent leverage)
+  of any strategy: `workspace.configuration.get`, then `workspace.configuration.save` on that
+  strategy's directory name. No custom strategy, no question. Order fraction and max total
+  exposure are locked to the strategy version: changing them is a custom strategy.
 - Anything else on an original Marketplace strategy (strategy parameters, even "just backtest
   it with length 20", instruments, bars, indicators, entries, exits, sizing, code): ask first,
   in the user's language: "This change goes beyond the panel settings, so it is saved as a
@@ -159,10 +195,17 @@ that code, even when the user only pasted it.
 - The link works for about 10 minutes; when it expires, ask the user to send the code again.
 - An install that fails with `entitlement_required` means the strategy needs a redeem code:
   ask the user for the code their agent gave them instead of retrying.
+- "哪些策略需要兑换码 / 兑换码策略有哪些 / which strategies need a code": show
+  `edgepilot_view_present` `leaderboard` with `{access: "redeem_code", locale}` (add `query`
+  for a topic such as "需要兑换码的趋势策略"); for "哪些不需要兑换码" use `access: "open"`.
+  The card marks each strategy as locked or unlocked for this account; say so from its text
+  and never claim an unlock it does not report. Search results mark redeem-code strategies
+  too (`access` on each result; "[needs a redeem code]" in the text).
+- Listing these strategies never asks for or uses a code; the user redeems in the Dashboard.
 
 ## Upgrade recovery
 
-Runtime upgrades are forward-only. Trading runs in the separate local trading service, which
+This plugin's bound release replaces the installed Runtime even when its version number is lower. An interrupted switch of that same release still resumes forward. Trading runs in the separate local trading service, which
 the upgrade drains (instances keep their desired state and resume after the upgrade). Never
 edit or delete trading service files, and never recommend repeated repair to clear a
 failure; inspect `trading.service.status` and the diagnostics operations instead.
@@ -238,7 +281,7 @@ must go directly to that outcome and must not force the questionnaire.
    snapshot requires a fresh choice. On `deferred`, end this target
    startup request and leave the old environment alone; do not open old onboarding as
    target success. Report other failures and their script-provided recovery action.
-   For `stale_session`, reload the plugin session rather than attempting a downgrade.
+   For `stale_session`, reload the plugin session. A lower version number is not stale: `edgepilot_runtime_start` installs this plugin's bound release.
    For `host_start_timeout`, tell the user that reloading or restarting Cursor does not
    restart the Host. The Host is a separate sign-in task. Do not invent a shell command
    to end it, and do not ask the user to end it in Task Scheduler. Call
@@ -252,6 +295,10 @@ must go directly to that outcome and must not force the questionnaire.
    that interactive card and end the turn. A brief instruction to continue in the card is
    enough; do not repeat questionnaire choices in chat or call another question/selection
    tool. Keep all seven choices, review and recommendation inside that one App.
+   EdgePilot keeps the questionnaire and its recommendation, and the card passes you their
+   state. When the user later refers to a recommendation by position or role ("the first
+   one", "the safer one"), use exactly the strategy versions that card context names, in the
+   left-to-right order it gives; do not search again or substitute a newer version.
    The tool does not report rendering visibility. Missing model-visible HTML, missing
    acknowledgement or delayed rendering is unknown, not evidence of failure. Never claim
    the card did not appear based on that absence and never automatically start text onboarding
@@ -274,7 +321,7 @@ must go directly to that outcome and must not force the questionnaire.
 5. After the last answer, use a separate assistant turn to summarize the selected values
    and ask only for explicit confirmation. Do not combine that confirmation request with
    another question and do not call recommendation before confirmation.
-6. Only in this explicitly requested textual onboarding fallback, call the hidden App/fallback
+6. Only in this explicitly requested textual onboarding fallback, call the hidden fallback
    handler `edgepilot_strategy_recommend` once with `questionnaire_version="2.0"`, the seven
    confirmed values and the matching locale. Present exactly the three owner-ranked choices:
    best fit, relatively steadier and more aggressive, preserving versions, evidence,
